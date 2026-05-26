@@ -47,7 +47,7 @@ polymarketv2/
 ├── main.py                  # Entrypoint dell'Orchestratore Live/Paper Trading
 ├── run_backtest.py          # Script CLI per avviare il Backtester Storico Temporale
 ├── pyproject.toml           # Gestione dipendenze e configurazione del progetto Python (uv)
-└── verify_*.py              # Suite di test e script di convalida delle fasi di sviluppo
+└── tests/                   # Suite di test e script di convalida delle fasi di sviluppo (verify_*.py)
 ```
 
 ---
@@ -117,9 +117,9 @@ A completamento, verranno stampati a terminale i KPI della simulazione:
 
 Per garantire la massima correttezza del codice ad ogni modifica, puoi eseguire gli script di verifica dedicati:
 
-- Convalida Modulo Dati e Logging: `uv run python verify_phase1.py`
-- Convalida Slug e Strike Resolution: `uv run python verify_phase2.py`
-- Convalida Modello Matematico Merton: `uv run python verify_phase3.py`
-- Convalida Esecuzioni e Shadow Book: `uv run python verify_phase4.py`
-- Convalida Connessioni e Endpoints Web Server: `uv run python verify_web_server.py`
-- Convalida Calcolo delle Probabilità in Tempo Reale: `uv run python verify_live_data_and_pricing.py`
+- Convalida Modulo Dati e Logging: `uv run python tests/verify_phase1.py`
+- Convalida Slug e Strike Resolution: `uv run python tests/verify_phase2.py`
+- Convalida Modello Matematico Merton: `uv run python tests/verify_phase3.py`
+- Convalida Esecuzioni e Shadow Book: `uv run python tests/verify_phase4.py`
+- Convalida Connessioni e Endpoints Web Server: `uv run python tests/verify_web_server.py`
+- Convalida Calcolo delle Probabilità in Tempo Reale: `uv run python tests/verify_live_data_and_pricing.py`
