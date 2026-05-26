@@ -111,6 +111,14 @@ class ExecutionEngine:
                 "size": 0.0
             }
             
+        # 1.5. Block trading if strike price is unresolved or zero
+        if context.strike_price is None or context.strike_price <= 0.0:
+            return {
+                "side": "HOLD",
+                "reason": "WAITING_FOR_STRIKE_RESOLUTION",
+                "size": 0.0
+            }
+            
         t_now = context.timestamp
         self.spot_history.append((t_now, context.spot_price))
         # Keep spot history pruned to 60s
