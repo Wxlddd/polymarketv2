@@ -38,7 +38,7 @@ $$b = \mu - \lambda\kappa - \frac{1}{2}\sigma^2$$
 ### 3. Soluzione di Gil-Pelaez con Riduzione della Varianza
 La probabilità teorica $P(S_T > K)$ che l'opzione YES scada in-the-money (cioè che lo spot alla scadenza superi il prezzo strike $K$) viene espressa tramite l'inversione di Fourier di Gil-Pelaez:
 
-$$P(S_T > K) = \frac{1}{2} + \frac{1}{\pi} \int_0^\infty \text{Im}\left[ \frac{e^{-i u \ln K} \phi(u)}{u} \right] du$$
+$$P(S_T > K) = \frac{1}{2} + \frac{1}{\\pi} \int_0^\infty \text{Im}\left[ \frac{e^{-i u \ln K} \phi(u)}{u} \right] du$$
 
 Per eliminare le instabilità numeriche ad alta frequenza in prossimità della scadenza ($\tau \to 0$), il sistema applica una tecnica di riduzione della varianza basata su Black-Scholes come variata di controllo (Control Variate):
 
@@ -63,9 +63,11 @@ $$\Delta \text{Bid}_t = \begin{cases} I(P^{\text{bid}}_t > P^{\text{bid}}_{t-1})
 
 $$\Delta \text{Ask}_t = \begin{cases} I(P^{\text{ask}}_t < P^{\text{ask}}_{t-1}) \cdot Q^{\text{ask}}_t \\ I(P^{\text{ask}}_t = P^{\text{ask}}_{t-1}) \cdot (Q^{\text{ask}}_t - Q^{\text{ask}}_{t-1}) \\ 0 \end{cases}$$
 
-Il drift istantaneo annualizzato è ottenuto riscalando l'OFI livellato tramite un moltiplicatore $\gamma$:
+Il drift istantaneo annualizzato è ottenuto riscalando l'OFI livellato tramite un moltiplicatore $\gamma$ (valore corrente: `-1e-7`, segno negativo validato empiricamente):
 
 $$\mu_t = \mu_{\text{default}} + \text{OFI}_{\text{smoothed}} \cdot \gamma \cdot (365.25 \times 24 \times 3600)$$
+
+La probabilità Merton risultante è stabilizzata con un filtro EMA a $\alpha = 0.05$ (~30s di memoria a 1 tick/s).
 
 ### 2. Sizing Frazionario di Kelly
 L'esposizione ottimale in percentuale del capitale di portafoglio sul book YES/NO viene calibrata applicando la formula di Kelly frazionaria:
@@ -76,6 +78,28 @@ Dove:
 - $P$ è la probabilità corretta stimata dal modello teorico di Merton.
 - $b$ rappresenta le quote del mercato (odds), calcolate come $b = \frac{1 - P_{\text{market}}}{P_{\text{market}}}$.
 - $f_{\text{Kelly}}$ indica il fattore frazionario di Kelly per limitare l'over-betting in contesti con rischi di modello o latenza.
+
+---
+
+## Architettura del Shadow Order Book
+
+Il `ShadowOrderBook` mantiene due rappresentazioni distinte e indipendenti del book L2:
+
+| Book | Struttura dati | Scopo |
+|---|---|---|
+| **Real Book** (`q_real_bids/asks`) | Aggiornato da ogni tick CLOB | Calcolo di `p_mkt` (probabilità implicita di mercato) |
+| **Shadow Book** (`q_shadow_bids/asks`) | Stesso del Real Book, ma depleto da `paper_execute` | Calcolo VWAP, sizing Kelly, filtri di rischio |
+
+Il `paper_execute` depleta solo il Shadow Book, mai il Real Book. Questo garantisce che la probabilità di mercato visualizzata nella dashboard rifletta sempre la vera liquidità disponibile, indipendentemente dalle fill simulate.
+
+### Risoluzione dello Strike in Tempo Reale
+Se la Gamma API non fornisce lo strike price $K$ all'avvio, il sistema cattura il **primo tick Chainlink** generato immediatamente dopo l'inizio del ciclo (`cycle_start = expiry - 300s`) e lo utilizza come strike di riferimento dell'opzione attiva.
+
+### Prevenzione del Double Trade
+Il callback CLOB (`_clob_callback`) è una coroutine `async` che esegue `await client.execute_trade(...)` prima di restituire il controllo al loop. Questo garantisce che `paper_execute` abbia già depleto il Shadow Book prima dell'arrivo del tick successivo, prevenendo segnali duplicati sulla stessa opportunità.
+
+### Keep-Awake Windows
+Il sistema esegue un loop asincrono `_keep_awake_loop` che aggiorna ogni 30 secondi il `SetThreadExecutionState` di Windows con i flag `ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED`, prevenendo lo standby durante le sessioni di trading prolungate.
 
 ---
 
@@ -93,13 +117,13 @@ polymarketv2/
 │   │   ├── market_context.py# Modello dati unificato MarketContext
 │   │   └── strike_manager.py# Gestore dello Strike Price K
 │   ├── ingestion/
-│   │   ├── live_feeds.py    # WebSocket Chainlink Spot Feed & CLOB L2 Orderbook Feed
+│   │   ├── live_feeds.py    # WebSocket Chainlink Spot Feed & CLOB L2 Orderbook Feed (YES-only)
 │   │   └── market_manager.py# Dynamic discovery dei mercati Gamma API & Rollover
 │   ├── strategies/
 │   │   └── merton_strategy.py# Caratteristica Merton, Gil-Pelaez e calibrazione Vol/OFI
 │   ├── execution/
-│   │   ├── shadow_book.py   # Riconciliazione L2 e proxy virtuale del book post-trade
-│   │   ├── engine.py        # walks del book L2, Kelly sizing e filtri di rischio (Pin, Desync, PoF)
+│   │   ├── shadow_book.py   # Dual-book L2 (Real + Shadow) con get_market_top_of_book()
+│   │   ├── engine.py        # Walk del book L2, Kelly sizing e filtri di rischio (Pin, Desync, PoF)
 │   │   └── clients.py       # Mock/Simulated Execution Client per paper trading e backtest
 │   ├── logging/
 │   │   └── recorder.py      # Scrittura Parquet (ticks) e CSV (segnali/esecuzioni) ad alte prestazioni
@@ -123,6 +147,22 @@ polymarketv2/
 
 ---
 
+## Parametri Chiave (.env)
+
+| Parametro | Valore corrente | Descrizione |
+|---|---|---|
+| `OFI_DRIFT_MULTIPLIER` | `-1e-7` | Scala OFI → drift annualizzato (segno negativo validato empiricamente) |
+| `DEFAULT_LAMBDA` | `4000` | Intensità di salto Poisson (salti/anno) |
+| `DEFAULT_MU_J` | `0.0001` | Media log-normale del salto |
+| `DEFAULT_SIGMA_J` | `0.0015` | Deviazione standard del salto |
+| `DEFAULT_SIGMA` | `0.25` | Volatilità implicita di default |
+| `KELLY_FRACTION` | `0.1` | Fattore frazionario di Kelly |
+| `MIN_EXPECTED_VALUE` | `0.015` | Soglia minima di EV per eseguire un trade |
+| `EMA_ALPHA` (Merton) | `0.05` | Smoothing EMA sulla probabilità Merton (~30s memoria) |
+| `EMA_ALPHA` (OFI) | `0.1` | Smoothing EMA sull'Order Flow Imbalance |
+
+---
+
 ## Installazione e Utilizzo
 
 Il sistema utilizza lo strumento `uv` per la gestione rapida dell'ambiente virtuale e delle librerie.
@@ -133,10 +173,7 @@ Il sistema utilizza lo strumento `uv` per la gestione rapida dell'ambiente virtu
    cp .env.example .env
    ```
 
-2. **Risoluzione dello Strike in Tempo Reale**:
-   Se la Gamma API non fornisce lo strike price $K$ all'avvio, il sistema applica una logica asincrona: monitora il feed di Chainlink e cattura il secondo tick generato immediatamente dopo l'inizio del ciclo per impostarlo come strike di riferimento dell'opzione attiva.
-
-3. **Esecuzione dell'Orchestratore Live**:
+2. **Esecuzione dell'Orchestratore Live**:
    - **Rich CLI Dashboard (Console)**:
      ```bash
      uv run python main.py
@@ -145,11 +182,10 @@ Il sistema utilizza lo strumento `uv` per la gestione rapida dell'ambiente virtu
      ```bash
      uv run python main.py --no-term
      ```
-     La console mostrerà log di esecuzione puliti a intervalli regolari. La dashboard interattiva ad alte prestazioni (senza overhead GPU) sarà accessibile all'indirizzo **`http://localhost:8080`**.
+     La dashboard interattiva sarà accessibile all'indirizzo **`http://localhost:8080`**.
 
-4. **Avvio del Backtest Replayer**:
+3. **Avvio del Backtest Replayer**:
    - **Con Finestra Temporale**:
-     Filtra e concatena i dati Parquet storici presenti in `data/raw` compresi nell'intervallo temporale specificato:
      ```bash
      uv run python run_backtest.py --start "2026-05-23 20:51:00" --end "2026-05-23 21:51:00"
      ```
@@ -158,13 +194,12 @@ Il sistema utilizza lo strumento `uv` per la gestione rapida dell'ambiente virtu
      uv run python run_backtest.py --file "c:/percorso/del/tuo/file.parquet"
      ```
 
-5. **Suite di Validazione Interna**:
-   Gli script all'interno della cartella `tests/` consentono di testare individualmente i moduli core dell'applicazione:
+4. **Suite di Validazione Interna**:
    ```bash
+   uv run python tests/verify_live_data_and_pricing.py
    uv run python tests/verify_phase1.py
    uv run python tests/verify_phase2.py
    uv run python tests/verify_phase3.py
    uv run python tests/verify_phase4.py
    uv run python tests/verify_web_server.py
-   uv run python tests/verify_live_data_and_pricing.py
    ```

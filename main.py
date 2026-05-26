@@ -59,6 +59,7 @@ class LiveOrchestrator:
         self.client = MockExecutionClient(config, self.recorder, self.shadow_book)
         self.engine = ExecutionEngine(config)
         self.strike_manager: Optional[StrikeManager] = None
+        self.waiting_for_first_rollover = False
         self.total_trades = 0
         self._last_console_log_time = 0.0
         
@@ -80,16 +81,9 @@ class LiveOrchestrator:
         self.is_running = True
         self.log_message("info", "Initializing Live Orchestrator...")
         
-        # Prevent Windows PC from going to sleep while running
+        # 1. Start keep-awake loop to prevent Windows from sleeping
         if os.name == 'nt':
-            try:
-                import ctypes
-                ES_CONTINUOUS = 0x80000000
-                ES_SYSTEM_REQUIRED = 0x00000001
-                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
-                self.log_message("info", "Windows Thread Execution State set to prevent system sleep.")
-            except Exception as e:
-                logger.warning(f"Failed to set Windows thread execution state: {e}")
+            self._tasks.append(asyncio.create_task(self._keep_awake_loop()))
         
         # 1. Start Spot Feed Websocket (runs in background)
         await self.spot_feed.start()
@@ -108,11 +102,22 @@ class LiveOrchestrator:
         t_now = time.time()
         await self.market_manager.update_market_cycle(t_now)
         
-        # Create initial StrikeManager (using Gamma REST strike, fallback to None)
-        self.strike_manager = StrikeManager(
-            presumed_strike=self.market_manager.strike_price,
-            expiration_timestamp=self.market_manager.current_expiry
-        )
+        # Check if started mid-cycle (rollover start is current_expiry - 300)
+        if self.market_manager.current_expiry is not None:
+            cycle_start_time = self.market_manager.current_expiry - 300
+            if t_now - cycle_start_time > 10.0:
+                self.waiting_for_first_rollover = True
+                self.strike_manager = None
+                self.log_message("info", "Ok, aspetto il prossimo ciclo...")
+            else:
+                self.waiting_for_first_rollover = False
+                self.strike_manager = StrikeManager(
+                    presumed_strike=self.market_manager.strike_price,
+                    expiration_timestamp=self.market_manager.current_expiry
+                )
+        else:
+            self.waiting_for_first_rollover = True
+            self.strike_manager = None
         
         # 3. Start CLOB Order Book WebSocket Feed
         await self._restart_clob_feed()
@@ -158,7 +163,7 @@ class LiveOrchestrator:
                 ES_CONTINUOUS = 0x80000000
                 ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
                 logger.info("Windows Thread Execution State reset to default sleep behavior.")
-            except Exception as e:
+            except Exception:
                 pass
         
         # Stop Web Server
@@ -177,6 +182,30 @@ class LiveOrchestrator:
         # Final buffer flushes
         self.recorder.flush()
         logger.info("Orchestrator stopped cleanly.")
+
+    async def _keep_awake_loop(self) -> None:
+        """
+        Periodically refreshes the Windows thread execution state every 30 seconds
+        to prevent the system from sleeping while the bot is running.
+        A single SetThreadExecutionState call is not sufficient — Windows resets
+        the state if it is not refreshed by the calling thread.
+        """
+        try:
+            import ctypes
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ES_DISPLAY_REQUIRED = 0x00000002
+            flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        except Exception:
+            return  # Not on Windows or ctypes unavailable
+
+        while self.is_running:
+            try:
+                ctypes.windll.kernel32.SetThreadExecutionState(flags)
+                logger.debug("[KeepAwake] Windows execution state refreshed.")
+            except Exception as e:
+                logger.warning(f"[KeepAwake] Failed to refresh execution state: {e}")
+            await asyncio.sleep(30.0)
 
     async def _restart_clob_feed(self) -> None:
         """Starts or restarts the CLOB WS feed, subscribing to the newly active token IDs."""
@@ -233,7 +262,7 @@ class LiveOrchestrator:
             )
             p_yes = self.strategy.get_probability(dummy_context)
             
-        top_b, top_a = self.shadow_book.get_top_of_book()
+        top_b, top_a = self.shadow_book.get_market_top_of_book()
         bid_price_yes = top_b[0] if top_b else 0.5
         pos_qty_yes = self.client.get_position_size("YES")
         pos_qty_no = self.client.get_position_size("NO")
@@ -242,7 +271,7 @@ class LiveOrchestrator:
         equity = cash + pos_val
         pnl = equity - self.config.arbitrage.INITIAL_CAPITAL
         
-        p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+        p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else None
         edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
         
         if decision is None:
@@ -301,12 +330,18 @@ class LiveOrchestrator:
                 "message": message
             })
 
-    def _clob_callback(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], is_snapshot: bool) -> None:
+    async def _clob_callback(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], is_snapshot: bool) -> None:
         """Callback triggered on each CLOB Order book tick arrival."""
         if not self.is_running:
             return
             
         t_now = time.time()
+        
+        if self.waiting_for_first_rollover:
+            if t_now - getattr(self, "_last_wait_log_time", 0.0) >= 15.0:
+                self._last_wait_log_time = t_now
+                self.log_message("info", "Ok, aspetto il prossimo ciclo...")
+            return
         
         # Periodic diagnostic warnings if we are missing critical feeds to proceed
         if self.spot_feed.price is None or self.strike_manager is None:
@@ -328,13 +363,13 @@ class LiveOrchestrator:
         if self.strike_manager and (self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0):
             if self.market_manager.current_expiry is not None:
                 cycle_start_time = self.market_manager.current_expiry - 300
-                strike_tick = self.spot_feed.get_second_tick_after(cycle_start_time)
+                strike_tick = self.spot_feed.get_first_tick_after(cycle_start_time)
                 if strike_tick is not None:
                     _, strike_price_val = strike_tick
                     self.strike_manager.presumed_strike = strike_price_val
                     self.log_message(
                         "info",
-                        f"[StrikeManager] Active Strike resolved via 2nd Chainlink tick after cycle start: ${strike_price_val:,.2f}"
+                        f"[StrikeManager] Active Strike resolved via 1st Chainlink tick after cycle start: ${strike_price_val:,.2f}"
                     )
                     
         active_strike = self.strike_manager.get_strike(t_now, spot)
@@ -359,7 +394,18 @@ class LiveOrchestrator:
         )
         
         # Calculate Merton probability
-        p_yes = self.strategy.get_probability(context)
+        p_yes_raw = self.strategy.get_probability(context)
+        
+        # Apply EMA smoothing to p_yes — alpha=0.05 gives ~30s memory at 1 tick/s
+        if p_yes_raw is not None:
+            if not hasattr(self, "_smoothed_p_yes") or self._smoothed_p_yes is None:
+                self._smoothed_p_yes = p_yes_raw
+            else:
+                alpha = 0.05
+                self._smoothed_p_yes = alpha * p_yes_raw + (1.0 - alpha) * self._smoothed_p_yes
+            p_yes = self._smoothed_p_yes
+        else:
+            p_yes = None
         
         # Record tick in Parquet database
         self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks)
@@ -368,9 +414,9 @@ class LiveOrchestrator:
         decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
         self.latest_decision_ref[0] = decision
         
-        # Get Implied Market price and Edge
-        top_b, top_a = self.shadow_book.get_top_of_book()
-        p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+        # Get Implied Market price and Edge — use REAL market book (q_real), never depleted
+        top_b, top_a = self.shadow_book.get_market_top_of_book()
+        p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else None
         edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
         
         # Throttled console logger for pure console mode
@@ -392,7 +438,7 @@ class LiveOrchestrator:
         if decision["side"] != "HOLD":
             self.total_trades += 1
             # Record strategy signal
-            top_b, top_a = self.shadow_book.get_top_of_book()
+            top_b, top_a = self.shadow_book.get_market_top_of_book()
             p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
             
             self.recorder.record_signal(
@@ -418,16 +464,15 @@ class LiveOrchestrator:
                 })
             self.log_message("info", f"Executing trade: {decision['side']} | Size: {decision['size']:.2f} | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}")
             
-            # Route simulated trade asynchronously
-            asyncio.create_task(
-                self.client.execute_trade(
-                    side=decision["side"],
-                    qty=decision["size"],
-                    price=decision["vwap"],
-                    ev=decision["ev"],
-                    expected_slippage_bps=decision["expected_slippage_bps"],
-                    context_state={"timestamp": t_now, "strike_price": active_strike}
-                )
+            # Execute trade synchronously (awaited) so shadow book is depleted
+            # BEFORE the next CLOB tick arrives — prevents duplicate signals.
+            await self.client.execute_trade(
+                side=decision["side"],
+                qty=decision["size"],
+                price=decision["vwap"],
+                ev=decision["ev"],
+                expected_slippage_bps=decision["expected_slippage_bps"],
+                context_state={"timestamp": t_now, "strike_price": active_strike}
             )
 
     async def _market_discovery_loop(self) -> None:
@@ -438,6 +483,7 @@ class LiveOrchestrator:
                 # If a rollover boundary is crossed
                 rollover = await self.market_manager.update_market_cycle(t_now)
                 if rollover:
+                    self.waiting_for_first_rollover = False
                     self.log_message(
                         "info",
                         f"Market Rollover detected. New active cycle expiry: {self.market_manager.current_expiry} | "
@@ -474,6 +520,7 @@ class LiveOrchestrator:
                         presumed_strike=self.market_manager.strike_price,
                         expiration_timestamp=self.market_manager.current_expiry
                     )
+                    self._smoothed_p_yes = None
                     
                     # 3. Restart CLOB feed to subscribe to new tokens
                     await self._restart_clob_feed()
@@ -491,6 +538,10 @@ class LiveOrchestrator:
         """Periodically checks if expiration is crossed to lock the Strike Price via spot tick."""
         while self.is_running:
             try:
+                if self.waiting_for_first_rollover:
+                    await asyncio.sleep(0.5)
+                    continue
+                    
                 if self.strike_manager and self.spot_feed.price is not None:
                     t_now = time.time()
                     spot = self.spot_feed.price
@@ -499,7 +550,7 @@ class LiveOrchestrator:
                     if self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0:
                         if self.market_manager.current_expiry is not None:
                             cycle_start_time = self.market_manager.current_expiry - 300
-                            strike_tick = self.spot_feed.get_second_tick_after(cycle_start_time)
+                            strike_tick = self.spot_feed.get_first_tick_after(cycle_start_time)
                             if strike_tick is not None:
                                 _, strike_price_val = strike_tick
                                 self.strike_manager.presumed_strike = strike_price_val

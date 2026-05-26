@@ -67,6 +67,18 @@ class LiveDataVerifier:
         t_now = time.time()
         await self.market_manager.update_market_cycle(t_now)
         
+        cycle_start_time = self.market_manager.current_expiry - 300
+        if t_now - cycle_start_time > 10.0:
+            print("Ok, aspetto il prossimo ciclo...")
+            print(f"Current time: {datetime.fromtimestamp(t_now).strftime('%Y-%m-%d %H:%M:%S')} (mid-cycle). Waiting for rollover at {datetime.fromtimestamp(self.market_manager.current_expiry).strftime('%H:%M:%S')}...")
+            while time.time() < self.market_manager.current_expiry:
+                await asyncio.sleep(1.0)
+            
+            # Now update to the new cycle
+            t_now = time.time()
+            await self.market_manager.update_market_cycle(t_now)
+            print("\nRollover reached! Running Market Discovery for the new cycle...")
+            
         print(f"  - Active Slug:  {self.market_manager.current_slug}")
         print(f"  - Expiry Time:  {datetime.fromtimestamp(self.market_manager.current_expiry).strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"  - YES Token ID: {self.market_manager.yes_token_id}")
@@ -132,7 +144,7 @@ class LiveDataVerifier:
         if self.strike_manager and (self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0):
             if self.market_manager.current_expiry is not None:
                 cycle_start_time = self.market_manager.current_expiry - 300
-                strike_tick = self.spot_feed.get_second_tick_after(cycle_start_time)
+                strike_tick = self.spot_feed.get_first_tick_after(cycle_start_time)
                 if strike_tick is not None:
                     _, strike_price_val = strike_tick
                     self.strike_manager.presumed_strike = strike_price_val

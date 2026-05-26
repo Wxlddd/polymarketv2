@@ -121,6 +121,26 @@ class ShadowOrderBook(IOrderBook):
         best_ask = sorted_asks[0] if sorted_asks else None
         return best_bid, best_ask
 
+    def get_market_top_of_book(self) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
+        """
+        Returns best (bid, ask) from the REAL market book (q_real), which is never
+        depleted by paper_execute fills. Use this for p_mkt display so that simulated
+        trades do not corrupt the displayed market-implied probability.
+        """
+        sorted_bids = sorted(
+            [(p, q) for p, q in self.q_real_bids.items() if q > 1e-9],
+            key=lambda x: x[0],
+            reverse=True
+        )
+        sorted_asks = sorted(
+            [(p, q) for p, q in self.q_real_asks.items() if q > 1e-9],
+            key=lambda x: x[0]
+        )
+        best_bid = sorted_bids[0] if sorted_bids else None
+        best_ask = sorted_asks[0] if sorted_asks else None
+        return best_bid, best_ask
+
+
     def _calculate_ofi(self) -> float:
         """Calculates Order Flow Imbalance (OFI) for the top level changes."""
         best_bid, best_ask = self.get_top_of_book()

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import random
@@ -155,32 +156,23 @@ class ChainlinkSpotFeed(ISpotFeed):
         cutoff = self.ticks[-1][0] - self.max_ticks_age_sec
         self.ticks = [t for t in self.ticks if t[0] >= cutoff]
 
-    def get_second_tick_after(self, target_timestamp: float, add_variability: bool = True) -> Optional[Tuple[float, float]]:
+    def get_first_tick_after(self, target_timestamp: float) -> Optional[Tuple[float, float]]:
         """
-        Retrieves the (timestamp, price) of the second tick whose payload timestamp is >= target_timestamp.
-        Also introduces a minor random variability (std dev of 0.02 BPS) if configured.
+        Retrieves the (timestamp, price) of the FIRST Chainlink tick whose payload timestamp
+        is >= target_timestamp. This is the settlement price at the rollover boundary.
         """
-        matching_ticks = []
         for ts, val in self.ticks:
             if ts >= target_timestamp:
-                matching_ticks.append((ts, val))
-                if len(matching_ticks) >= 2:
-                    tick_ts, price = matching_ticks[1]  # Return the second tick
-                    if add_variability:
-                        # Introduce a tiny random variability (standard deviation of 0.02 BPS)
-                        jitter_pct = random.normalvariate(0.0, 0.000002)
-                        price *= (1.0 + jitter_pct)
-                    return tick_ts, price
-                    
-        # Fallbacks if history is too short (e.g. startup)
-        if len(matching_ticks) == 1:
-            logger.warning(f"[{self.ticker} SpotFeed] Only one tick >= {target_timestamp} found. Using as fallback.")
-            return matching_ticks[0]
-            
+                return ts, val
+
+        # Fallback: if no tick found yet, return current price with wall-clock timestamp
         if self._price is not None:
-            logger.warning(f"[{self.ticker} SpotFeed] No ticks >= {target_timestamp} found in cache. Using current price: {self._price}")
+            logger.warning(
+                f"[{self.ticker} SpotFeed] No tick >= {target_timestamp} found in cache. "
+                f"Using current price as fallback: {self._price}"
+            )
             return target_timestamp, self._price
-            
+
         return None
 
 
@@ -229,13 +221,16 @@ class ClobOrderBookFeed:
                     self._is_connected = True
                     delay = base_delay
                     
-                    # Subscribe to L2 books for YES and NO
+                    # Subscribe to L2 book for YES token ONLY.
+                    # NO prices are derived as (1 - YES_price) — subscribing to both
+                    # tokens would mix NO bids (~0.84) into the shadow book top-of-book,
+                    # causing p_mkt to spuriously read 50% regardless of actual market.
                     sub_message = {
                         "type": "market",
-                        "assets_ids": [self.yes_token, self.no_token]
+                        "assets_ids": [self.yes_token]
                     }
                     await ws.send(json.dumps(sub_message))
-                    logger.info("[CLOB Feed] Subscribed to YES/NO books.")
+                    logger.info("[CLOB Feed] Subscribed to YES-only book.")
                     
                     while self._is_running:
                         msg = await ws.recv()
@@ -260,22 +255,28 @@ class ClobOrderBookFeed:
                 # 1. Snapshot book event
                 if "bids" in ev or "asks" in ev or ev.get("event_type") == "book":
                     asset_id = ev.get("asset_id") or ev.get("token_id")
-                    if asset_id == self.yes_token:
+                    # Accept the snapshot if it explicitly belongs to YES token,
+                    # OR if there is no asset_id field at all (bare book snapshot
+                    # sent by Polymarket CLOB without per-token discrimination).
+                    if asset_id == self.yes_token or asset_id is None:
                         bids = []
                         for b in ev.get("bids", []):
                             if isinstance(b, dict):
                                 bids.append((float(b.get("price", b.get("p", 0.0))), float(b.get("size", b.get("qty", 0.0)))))
                             else:
                                 bids.append((float(b[0]), float(b[1])))
-                        
+
                         asks = []
                         for a in ev.get("asks", []):
                             if isinstance(a, dict):
                                 asks.append((float(a.get("price", a.get("p", 0.0))), float(a.get("size", a.get("qty", 0.0)))))
                             else:
                                 asks.append((float(a[0]), float(a[1])))
-                                
-                        self.book_callback(bids, asks, is_snapshot=True)
+
+                        if bids or asks:
+                            result = self.book_callback(bids, asks, is_snapshot=True)
+                            if inspect.iscoroutine(result):
+                                await result
                 
                 # 2. Incremental L2 delta updates
                 elif ev.get("event_type") == "price_change":
@@ -295,6 +296,8 @@ class ClobOrderBookFeed:
                                 yes_asks.append((price, qty))
                                 
                     if yes_bids or yes_asks:
-                        self.book_callback(yes_bids, yes_asks, is_snapshot=False)
+                        result = self.book_callback(yes_bids, yes_asks, is_snapshot=False)
+                        if inspect.iscoroutine(result):
+                            await result
         except Exception as e:
             logger.warning(f"[CLOB Feed] Error processing message: {e}", exc_info=True)
