@@ -1,22 +1,85 @@
 # Polymarket V2: High-Frequency Options Pricing & Execution Engine
 
-Polymarket V2 è un'architettura ultra-modulare ad alte prestazioni (HFT) progettata per il pricing quantitativo e l'esecuzione automatizzata sui mercati binari a 5 minuti di Polymarket (Up/Down). Il sistema implementa il modello a salti di Merton (MJD) risolto tramite inversione di Fourier (Gil-Pelaez) ed esegue ordini simulati tramite un motore di sizing frazionario Kelly con rigorosi filtri di rischio.
+Polymarket V2 è un'architettura ultra-modulare ad alte prestazioni progettata per il pricing quantitativo e l'esecuzione automatizzata sui mercati opzionali binari a 5 minuti di Polymarket (Up/Down). Il sistema implementa il modello a salti di Merton (MJD) risolto nello spazio delle frequenze tramite inversione di Fourier (Gil-Pelaez) con tecniche di riduzione della varianza, integrando un motore di sizing Kelly frazionario e controlli di rischio per contesti High-Frequency Trading (HFT).
 
 ---
 
-## Indice delle Funzionalità
+## Modello Matematico e Pricing
 
-- **Data Ingestion Infallibile**: WebSocket nativo per il feed Spot medianizzato (oracoli Chainlink di Polymarket) e feed L2 CLOB per il book YES/NO con riconnessione automatica.
-- **Scoperta Dinamica dei Mercati (MarketManager)**: Risoluzione deterministica degli slug del ciclo a 5 minuti e recupero asincrono di Token ID, Condition ID e Strike Price tramiteGamma API.
-- **Pricing Merton con Variate di Controllo**: Calcolo della probabilità di esercizio dell'opzione binaria integrando la funzione caratteristica Merton tramite Gil-Pelaez e utilizzando Black-Scholes come variata di controllo per la massima stabilità ad alta frequenza.
-- **Calibrazione Volatilità e Drift**: Monitoraggio continuo della volatilità realizzata (con filtri di rendimento ed eliminazione degli spike da salti) e stima del drift istantaneo tramite OFI (Order Flow Imbalance) lisciato.
-- **Motore di Esecuzione e Shadow Book**: Tracciamento dello stato di profondità reale vs. virtuale (post-trade shadow depth) con arrotondamento dei prezzi a 6 decimali.
-- **Bloomberg Terminal Dashboard (Web Server)**: Server web `aiohttp` integrato con WebSocket a trasmissione parzializzata (cap a 4Hz) per azzerare il sovraccarico GPU del browser, mantenendo l'engine HFT sottostante a frequenza illimitata.
-- **Backtester Storico Temporale**: Simulazione event-driven che riproduce la pipeline di trading reale analizzando più file Parquet/CSV concatenati e filtrati per una precisa finestra temporale.
+### 1. Dinamica del Sottostante: Merton Jump-Diffusion
+Il prezzo del sottostante $S_t$ segue un processo di diffusione con salti governato dalla seguente equazione differenziale stocastica (SDE):
+
+$$dS_t = \mu S_t dt + \sigma S_t dW_t + S_t d\left( \sum_{i=1}^{N_t} (V_i - 1) \right)$$
+
+Dove:
+- $\mu$ rappresenta il tasso di drift istantaneo continuo.
+- $\sigma$ rappresenta il coefficiente di diffusione continuo (volatilità realizzata).
+- $W_t$ rappresenta un moto browniano standard su uno spazio di probabilità filtrato.
+- $N_t$ rappresenta un processo di Poisson omogeneo con intensità di salto $\lambda$, indipendente da $W_t$.
+- $V_i$ rappresenta l'ampiezza del salto stocastico $i$-esimo, con $Y_i = \ln(V_i) \sim \mathcal{N}(\mu_j, \sigma_j^2)$.
+
+Il log-prezzo $x_t = \ln(S_t)$ segue la dinamica differenziale stocastica:
+
+$$dx_t = \left( \mu - \frac{1}{2}\sigma^2 - \lambda \kappa \right)dt + \sigma dW_t + \sum_{i=1}^{dN_t} Y_i$$
+
+Con il correttore di deriva definito da:
+
+$$\kappa = \mathbb{E}[e^{Y_i}] - 1 = \exp\left(\mu_j + \frac{1}{2}\sigma_j^2\right) - 1$$
+
+### 2. Funzione Caratteristica dell'Asset
+La funzione caratteristica $\phi(u)$ di $x_T = \ln(S_T)$ al tempo di scadenza $\tau = T - t$ è definita in forma chiusa come:
+
+$$\phi(u) = \exp\left( i u x_t + i u b \tau - \frac{1}{2}\sigma^2 u^2 \tau + \lambda \tau \left( e^{i u \mu_j - \frac{1}{2}\sigma_j^2 u^2} - 1 \right) \right)$$
+
+Dove la deriva complessiva corretta per la martingala è definita da:
+
+$$b = \mu - \lambda\kappa - \frac{1}{2}\sigma^2$$
+
+### 3. Soluzione di Gil-Pelaez con Riduzione della Varianza
+La probabilità teorica $P(S_T > K)$ che l'opzione YES scada in-the-money (cioè che lo spot alla scadenza superi il prezzo strike $K$) viene espressa tramite l'inversione di Fourier di Gil-Pelaez:
+
+$$P(S_T > K) = \frac{1}{2} + \frac{1}{\pi} \int_0^\infty \text{Im}\left[ \frac{e^{-i u \ln K} \phi(u)}{u} \right] du$$
+
+Per eliminare le instabilità numeriche ad alta frequenza in prossimità della scadenza ($\tau \to 0$), il sistema applica una tecnica di riduzione della varianza basata su Black-Scholes come variata di controllo (Control Variate):
+
+$$P(S_T > K) = P_{\text{BS}}(S_T > K) + \frac{1}{\pi} \int_0^\infty \text{Im}\left[ \frac{e^{-i u \ln K} \left( \phi(u) - \phi_{\text{BS}}(u) \right)}{u} \right] du$$
+
+Dove:
+- $P_{\text{BS}}(S_T > K) = \Phi(d_2)$ indica la probabilità analitica del modello geometrico browniano continuo.
+- $\phi_{\text{BS}}(u)$ rappresenta la funzione caratteristica di Black-Scholes con i medesimi parametri continui di deriva e volatilità.
 
 ---
 
-## Struttura del Progetto
+## Modulo di Microstruttura ed Esecuzione
+
+### 1. Stima del Drift Istantaneo tramite OFI
+Il drift di breve termine $\mu$ viene stimato in tempo reale a partire dall'Order Flow Imbalance (OFI) estratto dal book L2 delle quotazioni:
+
+$$\text{OFI}_t = \Delta \text{Bid}_t - \Delta \text{Ask}_t$$
+
+Le variazioni di liquidità ai migliori livelli del book sono formalizzate come:
+
+$$\Delta \text{Bid}_t = \begin{cases} I(P^{\text{bid}}_t > P^{\text{bid}}_{t-1}) \cdot Q^{\text{bid}}_t \\ I(P^{\text{bid}}_t = P^{\text{bid}}_{t-1}) \cdot (Q^{\text{bid}}_t - Q^{\text{bid}}_{t-1}) \\ 0 \end{cases}$$
+
+$$\Delta \text{Ask}_t = \begin{cases} I(P^{\text{ask}}_t < P^{\text{ask}}_{t-1}) \cdot Q^{\text{ask}}_t \\ I(P^{\text{ask}}_t = P^{\text{ask}}_{t-1}) \cdot (Q^{\text{ask}}_t - Q^{\text{ask}}_{t-1}) \\ 0 \end{cases}$$
+
+Il drift istantaneo annualizzato è ottenuto riscalando l'OFI livellato tramite un moltiplicatore $\gamma$:
+
+$$\mu_t = \mu_{\text{default}} + \text{OFI}_{\text{smoothed}} \cdot \gamma \cdot (365.25 \times 24 \times 3600)$$
+
+### 2. Sizing Frazionario di Kelly
+L'esposizione ottimale in percentuale del capitale di portafoglio sul book YES/NO viene calibrata applicando la formula di Kelly frazionaria:
+
+$$f^* = \frac{P \cdot (b + 1) - 1}{b} \cdot f_{\text{Kelly}}$$
+
+Dove:
+- $P$ è la probabilità corretta stimata dal modello teorico di Merton.
+- $b$ rappresenta le quote del mercato (odds), calcolate come $b = \frac{1 - P_{\text{market}}}{P_{\text{market}}}$.
+- $f_{\text{Kelly}}$ indica il fattore frazionario di Kelly per limitare l'over-betting in contesti con rischi di modello o latenza.
+
+---
+
+## Struttura del Repository
 
 ```
 polymarketv2/
@@ -28,7 +91,7 @@ polymarketv2/
 │   │   ├── events.py        # Eventi di log e segnali HFT disaccoppiati
 │   │   ├── interfaces.py    # Interfacce astratte per feed dati, esecuzione e log
 │   │   ├── market_context.py# Modello dati unificato MarketContext
-│   │   └── strike_manager.py# Gestore dello Strike Price K (con fallback su primo spot tick)
+│   │   └── strike_manager.py# Gestore dello Strike Price K
 │   ├── ingestion/
 │   │   ├── live_feeds.py    # WebSocket Chainlink Spot Feed & CLOB L2 Orderbook Feed
 │   │   └── market_manager.py# Dynamic discovery dei mercati Gamma API & Rollover
@@ -44,82 +107,64 @@ polymarketv2/
 │       ├── dashboard.py     # Terminal Dashboard Rich CLI (locale)
 │       ├── web_server.py    # Integrated HTTP/WS Server (Bloomberg Web Dashboard)
 │       └── dashboard.html   # Bloomberg Stark Terminal UI (Flat black, no shadows, 2D canvases)
+├── tests/
+│   ├── verify_dashboard.py            # Convalida terminal CLI Rich Dashboard
+│   ├── verify_live_data_and_pricing.py# Convalida della pipeline dei prezzi in tempo reale
+│   ├── verify_phase1.py               # Convalida dei log Parquet e modulo dati
+│   ├── verify_phase2.py               # Convalida slug e risoluzione strike
+│   ├── verify_phase3.py               # Convalida pricing Merton e calibrazione vol
+│   ├── verify_phase4.py               # Convalida shadow book ed esecuzione ordini
+│   └── verify_web_server.py           # Convalida degli endpoint HTTP/WS del web server
 ├── main.py                  # Entrypoint dell'Orchestratore Live/Paper Trading
 ├── run_backtest.py          # Script CLI per avviare il Backtester Storico Temporale
 ├── pyproject.toml           # Gestione dipendenze e configurazione del progetto Python (uv)
-└── tests/                   # Suite di test e script di convalida delle fasi di sviluppo (verify_*.py)
+└── uv.lock                  # Lockfile di riproducibilità ambientale
 ```
 
 ---
 
-## Installazione e Avvio
+## Installazione e Utilizzo
 
-Il progetto utilizza `uv` per la gestione ultra-rapida dei pacchetti Python. Assicurati che `uv` sia installato sul sistema.
+Il sistema utilizza lo strumento `uv` per la gestione rapida dell'ambiente virtuale e delle librerie.
 
-1. **Configurazione ambiente**:
-   Crea il file `.env` a partire dal template ed inserisci le variabili necessarie (es. URL WebSocket, ID dei token di default, capitale iniziale):
+1. **Predisposizione dell'ambiente**:
+   Generare il file di configurazione locale a partire dal template:
    ```bash
    cp .env.example .env
    ```
 
-2. **Avviare il Live Trading / Paper Trading**:
-   È possibile avviare il sistema in due modalità:
-   
-   - **Modalità CLI Terminale (Rich)**:
+2. **Risoluzione dello Strike in Tempo Reale**:
+   Se la Gamma API non fornisce lo strike price $K$ all'avvio, il sistema applica una logica asincrona: monitora il feed di Chainlink e cattura il secondo tick generato immediatamente dopo l'inizio del ciclo per impostarlo come strike di riferimento dell'opzione attiva.
+
+3. **Esecuzione dell'Orchestratore Live**:
+   - **Rich CLI Dashboard (Console)**:
      ```bash
      uv run python main.py
      ```
-     Mostra una dashboard interattiva Rich CLI direttamente sul terminale per monitorare il book locale e il portafoglio.
-     
-   - **Modalità Web Server (Bloomberg UI)**:
+   - **Bloomberg Web Dashboard (Interfaccia Web)**:
      ```bash
      uv run python main.py --no-term
      ```
-     Disabilita la CLI a schermo intero e stampa a terminale log puliti ad intervalli di 2 secondi, avviando contemporaneamente la dashboard Bloomberg all'indirizzo **`http://localhost:8080`**.
-     
-     La dashboard web include:
-     * Ticker correntemente attivo, tempo rimanente alla scadenza del ciclo e status dell'oracolo.
-     * KPI finanziari (Equity Totale, Saldo Cash, Valore Posizioni, P&L Cumulativo, Trade Totali).
-     * Tabella con metriche core e spread bid-ask reali del token YES.
-     * Grafici canvas 2D ultra-leggeri per l'andamento Spot vs. Strike e Merton P_YES vs. Market Implied P_YES.
-     * Pannello **Historical Backtester** con finestre temporali d'avvio per simulazioni storiche.
-     * Finestra di log interattiva `REAL-TIME EXECUTION LOGS` alimentata dal server.
+     La console mostrerà log di esecuzione puliti a intervalli regolari. La dashboard interattiva ad alte prestazioni (senza overhead GPU) sarà accessibile all'indirizzo **`http://localhost:8080`**.
 
----
+4. **Avvio del Backtest Replayer**:
+   - **Con Finestra Temporale**:
+     Filtra e concatena i dati Parquet storici presenti in `data/raw` compresi nell'intervallo temporale specificato:
+     ```bash
+     uv run python run_backtest.py --start "2026-05-23 20:51:00" --end "2026-05-23 21:51:00"
+     ```
+   - **Con File Singolo**:
+     ```bash
+     uv run python run_backtest.py --file "c:/percorso/del/tuo/file.parquet"
+     ```
 
-## Eseguire un Backtest Storico
-
-Lo script `run_backtest.py` permette di simulare la strategia Merton su dati storici registrati. È possibile eseguirlo in due modi:
-
-1. **Finestra Temporale (Consigliato)**:
-   Specifica un intervallo temporale utilizzando le date nel formato `YYYY-MM-DD HH:MM:SS` (o timestamp numerici). Lo script scansionerà la directory `data/raw`, caricherà tutti i file Parquet/CSV sovrapposti, li allineerà allo schema V2 ed eseguirà la simulazione:
+5. **Suite di Validazione Interna**:
+   Gli script all'interno della cartella `tests/` consentono di testare individualmente i moduli core dell'applicazione:
    ```bash
-   uv run python run_backtest.py --start "2026-05-23 20:51:00" --end "2026-05-23 21:51:00"
+   uv run python tests/verify_phase1.py
+   uv run python tests/verify_phase2.py
+   uv run python tests/verify_phase3.py
+   uv run python tests/verify_phase4.py
+   uv run python tests/verify_web_server.py
+   uv run python tests/verify_live_data_and_pricing.py
    ```
-
-2. **File Singolo**:
-   Esegui la simulazione puntando ad un singolo file Parquet di tick storici:
-   ```bash
-   uv run python run_backtest.py --file "c:/percorso/del/tuo/file.parquet"
-   ```
-
-A completamento, verranno stampati a terminale i KPI della simulazione:
-* Patrimonio iniziale vs finale.
-* Profitto/Perdita Netto in USD.
-* Tasso di Ritorno (Return Rate %).
-* Drawdown Massimo (Max Drawdown %).
-* Numero totale di trade effettuati.
-* Percorso dei log storici salvati in formato Parquet/CSV.
-
----
-
-## Verifica e Test di Qualità
-
-Per garantire la massima correttezza del codice ad ogni modifica, puoi eseguire gli script di verifica dedicati:
-
-- Convalida Modulo Dati e Logging: `uv run python tests/verify_phase1.py`
-- Convalida Slug e Strike Resolution: `uv run python tests/verify_phase2.py`
-- Convalida Modello Matematico Merton: `uv run python tests/verify_phase3.py`
-- Convalida Esecuzioni e Shadow Book: `uv run python tests/verify_phase4.py`
-- Convalida Connessioni e Endpoints Web Server: `uv run python tests/verify_web_server.py`
-- Convalida Calcolo delle Probabilità in Tempo Reale: `uv run python tests/verify_live_data_and_pricing.py`

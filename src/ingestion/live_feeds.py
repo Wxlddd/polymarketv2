@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import time
 from typing import Dict, List, Tuple, Any, Optional
 import websockets
@@ -153,6 +154,34 @@ class ChainlinkSpotFeed(ISpotFeed):
             return
         cutoff = self.ticks[-1][0] - self.max_ticks_age_sec
         self.ticks = [t for t in self.ticks if t[0] >= cutoff]
+
+    def get_second_tick_after(self, target_timestamp: float, add_variability: bool = True) -> Optional[Tuple[float, float]]:
+        """
+        Retrieves the (timestamp, price) of the second tick whose payload timestamp is >= target_timestamp.
+        Also introduces a minor random variability (std dev of 0.02 BPS) if configured.
+        """
+        matching_ticks = []
+        for ts, val in self.ticks:
+            if ts >= target_timestamp:
+                matching_ticks.append((ts, val))
+                if len(matching_ticks) >= 2:
+                    tick_ts, price = matching_ticks[1]  # Return the second tick
+                    if add_variability:
+                        # Introduce a tiny random variability (standard deviation of 0.02 BPS)
+                        jitter_pct = random.normalvariate(0.0, 0.000002)
+                        price *= (1.0 + jitter_pct)
+                    return tick_ts, price
+                    
+        # Fallbacks if history is too short (e.g. startup)
+        if len(matching_ticks) == 1:
+            logger.warning(f"[{self.ticker} SpotFeed] Only one tick >= {target_timestamp} found. Using as fallback.")
+            return matching_ticks[0]
+            
+        if self._price is not None:
+            logger.warning(f"[{self.ticker} SpotFeed] No ticks >= {target_timestamp} found in cache. Using current price: {self._price}")
+            return target_timestamp, self._price
+            
+        return None
 
 
 class ClobOrderBookFeed:

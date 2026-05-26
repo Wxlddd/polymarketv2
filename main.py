@@ -304,6 +304,18 @@ class LiveOrchestrator:
         ofi = self.shadow_book.update_book(bids, asks, is_snapshot)
         
         # Resolve active Strike Price
+        if self.strike_manager and (self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0):
+            if self.market_manager.current_expiry is not None:
+                cycle_start_time = self.market_manager.current_expiry - 300
+                strike_tick = self.spot_feed.get_second_tick_after(cycle_start_time)
+                if strike_tick is not None:
+                    _, strike_price_val = strike_tick
+                    self.strike_manager.presumed_strike = strike_price_val
+                    self.log_message(
+                        "info",
+                        f"[StrikeManager] Active Strike resolved via 2nd Chainlink tick after cycle start: ${strike_price_val:,.2f}"
+                    )
+                    
         active_strike = self.strike_manager.get_strike(t_now, spot)
         
         # Calculate time remaining
@@ -461,6 +473,20 @@ class LiveOrchestrator:
                 if self.strike_manager and self.spot_feed.price is not None:
                     t_now = time.time()
                     spot = self.spot_feed.price
+                    
+                    # Try to resolve presumed strike during active cycle if not already resolved
+                    if self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0:
+                        if self.market_manager.current_expiry is not None:
+                            cycle_start_time = self.market_manager.current_expiry - 300
+                            strike_tick = self.spot_feed.get_second_tick_after(cycle_start_time)
+                            if strike_tick is not None:
+                                _, strike_price_val = strike_tick
+                                self.strike_manager.presumed_strike = strike_price_val
+                                self.log_message(
+                                    "info",
+                                    f"[StrikeManager] Active Strike resolved via 2nd Chainlink tick after cycle start: ${strike_price_val:,.2f}"
+                                )
+                                
                     # Updates resolved strike if t_now >= expiration_timestamp
                     resolved_strike = self.strike_manager.get_strike(t_now, spot)
                     
