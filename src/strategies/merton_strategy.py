@@ -198,12 +198,20 @@ class MertonStrategy(BaseStrategy):
             window_size=config.merton.VOL_ROLLING_WINDOW_SEC
         )
         
-    def estimate_drift(self, ofi: float, default_drift: float = 0.0) -> float:
-        """Scales Order Flow Imbalance (OFI) into an annualized short-term drift value."""
+    def estimate_drift(self, ofi: float, tau_seconds: float, default_drift: float = 0.0) -> float:
+        """Scales Order Flow Imbalance (OFI) into an annualized short-term drift value, diluted over tau."""
         micro_drift = ofi * self.config.merton.OFI_DRIFT_MULTIPLIER
         # Annualize the drift for model compatibility
-        annualized_micro_drift = micro_drift * (365.25 * 24 * 3600)
-        return default_drift + annualized_micro_drift
+        annualized_micro_drift = micro_drift * (365.25 * 24 * 3600.0)
+        
+        # Dilute the drift over the remaining option lifetime (tau) using OFI_HORIZON_SEC (dt)
+        dt = self.config.merton.OFI_HORIZON_SEC
+        if tau_seconds > 0.0:
+            dilution_factor = min(dt, tau_seconds) / tau_seconds
+        else:
+            dilution_factor = 1.0
+            
+        return default_drift + dilution_factor * (annualized_micro_drift - default_drift)
 
     def get_probability(self, context: MarketContext) -> Optional[float]:
         # Enforce zero-assumptions rule: if strike price is None, cannot price option
@@ -215,7 +223,7 @@ class MertonStrategy(BaseStrategy):
         
         # Calculate parameters
         sigma = self.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
-        mu = self.estimate_drift(context.ofi)
+        mu = self.estimate_drift(context.ofi, context.tau_seconds)
         
         # Run Fourier Gil-Pelaez solver
         p_yes = self.integrator.calculate_probability(

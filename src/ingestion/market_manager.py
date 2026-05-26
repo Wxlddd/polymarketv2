@@ -35,13 +35,15 @@ class MarketManager:
         """
         Calculates the UNIX expiration timestamp of the next 5-minute window 
         using modular arithmetic. Expirations are multiples of 300 seconds.
+        Preempts the rollover by 15 seconds so the bot subscribes to the next cycle early.
         """
-        t_int = int(current_time)
+        t_int = int(current_time + 15.0)
         return t_int - (t_int % 300) + 300
 
     def get_slug_for_expiry(self, expiry: int) -> str:
         """Generates the deterministic Polymarket event slug for the target expiration."""
-        return f"{self.ticker}-updown-5m-{expiry}"
+        # Polymarket 5-minute event slugs use the start time of the cycle (expiry - 300)
+        return f"{self.ticker}-updown-5m-{expiry - 300}"
 
     async def update_market_cycle(self, current_time: float) -> bool:
         """
@@ -80,64 +82,72 @@ class MarketManager:
         self.no_token_id = None
         self.strike_price = None
         
-        async with aiohttp.ClientSession() as session:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            try:
-                async with session.get(url, headers=headers, timeout=10.0) as resp:
-                    if resp.status == 200:
-                        events = await resp.json()
-                        # Gamma events can return a single dict or a list of event dicts
-                        if isinstance(events, dict):
-                            events = [events]
-                            
-                        if not events or not isinstance(events, list):
-                            logger.warning(f"[MarketManager] Empty or invalid response format from Gamma API for slug {self.current_slug}")
-                            return
-                            
-                        for event in events:
-                            markets = event.get("markets", [])
-                            if not markets:
-                                continue
+        max_retries = 5
+        retry_delay = 2.0
+        
+        for attempt in range(max_retries):
+            async with aiohttp.ClientSession() as session:
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                try:
+                    async with session.get(url, headers=headers, timeout=10.0) as resp:
+                        if resp.status == 200:
+                            events = await resp.json()
+                            # Gamma events can return a single dict or a list of event dicts
+                            if isinstance(events, dict):
+                                events = [events]
                                 
-                            for m in markets:
-                                # We only focus on Yes/No binary LOB pairs (has clobTokenIds)
-                                clob_tokens_raw = m.get("clobTokenIds")
-                                if clob_tokens_raw:
-                                    if isinstance(clob_tokens_raw, str):
-                                        clob_tokens = json.loads(clob_tokens_raw)
-                                    else:
-                                        clob_tokens = clob_tokens_raw
-                                        
-                                    if isinstance(clob_tokens, list) and len(clob_tokens) >= 2:
-                                        self.yes_token_id = clob_tokens[0]
-                                        self.no_token_id = clob_tokens[1]
-                                        self.condition_id = m.get("conditionId")
-                                        
-                                        # Extract priceToBeat (Strike K)
-                                        for field in ("priceToBeat", "price_to_beat", "strikePrice", "strike_price"):
-                                            val = m.get(field)
-                                            if val is not None:
-                                                try:
-                                                    self.strike_price = float(val)
-                                                    logger.info(f"[MarketManager] Extracted Strike price (K) from Gamma API: ${self.strike_price:,.2f}")
-                                                    break
-                                                except (ValueError, TypeError):
-                                                    pass
-                                        
-                                        logger.info(
-                                            f"[MarketManager] Successfully resolved active market parameters:\n"
-                                            f"  - Condition ID: {self.condition_id}\n"
-                                            f"  - YES Token: {self.yes_token_id}\n"
-                                            f"  - NO Token: {self.no_token_id}\n"
-                                            f"  - Strike K: {self.strike_price}"
-                                        )
-                                        return
-                        
-                        logger.warning(f"[MarketManager] No matching market structure found in events list for slug {self.current_slug}")
-                    else:
-                        logger.warning(f"[MarketManager] Gamma API returned HTTP status {resp.status} for slug {self.current_slug}")
-            except Exception as e:
-                logger.error(f"[MarketManager] Failed to query Gamma API: {e}")
+                            if not events or not isinstance(events, list):
+                                logger.warning(f"[MarketManager] Empty or invalid response format from Gamma API for slug {self.current_slug}")
+                                return
+                                
+                            for event in events:
+                                markets = event.get("markets", [])
+                                if not markets:
+                                    continue
+                                    
+                                for m in markets:
+                                    # We only focus on Yes/No binary LOB pairs (has clobTokenIds)
+                                    clob_tokens_raw = m.get("clobTokenIds")
+                                    if clob_tokens_raw:
+                                        if isinstance(clob_tokens_raw, str):
+                                            clob_tokens = json.loads(clob_tokens_raw)
+                                        else:
+                                            clob_tokens = clob_tokens_raw
+                                            
+                                        if isinstance(clob_tokens, list) and len(clob_tokens) >= 2:
+                                            self.yes_token_id = clob_tokens[0]
+                                            self.no_token_id = clob_tokens[1]
+                                            self.condition_id = m.get("conditionId")
+                                            
+                                            # Extract priceToBeat (Strike K)
+                                            for field in ("priceToBeat", "price_to_beat", "strikePrice", "strike_price"):
+                                                val = m.get(field)
+                                                if val is not None:
+                                                    try:
+                                                        self.strike_price = float(val)
+                                                        logger.info(f"[MarketManager] Extracted Strike price (K) from Gamma API: ${self.strike_price:,.2f}")
+                                                        break
+                                                    except (ValueError, TypeError):
+                                                        pass
+                                            
+                                            logger.info(
+                                                f"[MarketManager] Successfully resolved active market parameters:\n"
+                                                f"  - Condition ID: {self.condition_id}\n"
+                                                f"  - YES Token: {self.yes_token_id}\n"
+                                                f"  - NO Token: {self.no_token_id}\n"
+                                                f"  - Strike K: {self.strike_price}"
+                                            )
+                                            return
+                            
+                            logger.warning(f"[MarketManager] No matching market structure found in events list for slug {self.current_slug}")
+                            break  # Successful request but no matching market structure - don't retry
+                        else:
+                            logger.warning(f"[MarketManager] Gamma API returned HTTP status {resp.status} for slug {self.current_slug} (Attempt {attempt+1}/{max_retries})")
+                except Exception as e:
+                    logger.error(f"[MarketManager] Failed to query Gamma API (Attempt {attempt+1}/{max_retries}): {e}")
+                    
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
                 
         # If strike price is not resolved from REST, it remains None (which forces waiting for rollover spot tick)
         if self.strike_price is None:

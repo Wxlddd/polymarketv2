@@ -72,9 +72,13 @@ class MockExecutionClient(IExecutionClient):
         realized_pnl = 0.0
         total_usd = qty * price
         
+        # Calculate dynamic taker fee: shares * 0.072 * p * (1 - p)
+        taker_fee_multiplier = self.config.arbitrage.TAKER_FEE_MULTIPLIER
+        taker_fee = qty * taker_fee_multiplier * price * (1.0 - price)
+        
         # Bookkeeping based on trade side
         if side == "BUY_YES":
-            cost = total_usd + gas
+            cost = total_usd + gas + taker_fee
             if cost > self._cash_balance:
                 logger.warning(f"[MockClient] BUY_YES rejected: Insufficient cash balance. Needed ${cost:.2f}, Balance: ${self._cash_balance:.2f}")
                 return {"success": False, "reason": "INSUFFICIENT_FUNDS"}
@@ -92,7 +96,7 @@ class MockExecutionClient(IExecutionClient):
             self.shadow_book.paper_execute(price, qty, is_bid=False)
             
         elif side == "BUY_NO":
-            cost = total_usd + gas
+            cost = total_usd + gas + taker_fee
             if cost > self._cash_balance:
                 logger.warning(f"[MockClient] BUY_NO rejected: Insufficient cash. Needed ${cost:.2f}")
                 return {"success": False, "reason": "INSUFFICIENT_FUNDS"}
@@ -112,7 +116,7 @@ class MockExecutionClient(IExecutionClient):
                 logger.warning(f"[MockClient] SELL_YES rejected: Selling size {qty} exceeds YES holdings {self.positions['YES']}")
                 return {"success": False, "reason": "INSUFFICIENT_POSITION"}
                 
-            revenue = total_usd - gas
+            revenue = total_usd - gas - taker_fee
             self._cash_balance += revenue
             
             # Calculate realized PnL
@@ -133,7 +137,7 @@ class MockExecutionClient(IExecutionClient):
                 logger.warning(f"[MockClient] SELL_NO rejected: Selling size {qty} exceeds NO holdings {self.positions['NO']}")
                 return {"success": False, "reason": "INSUFFICIENT_POSITION"}
                 
-            revenue = total_usd - gas
+            revenue = total_usd - gas - taker_fee
             self._cash_balance += revenue
             
             purchase_cost = qty * self.entry_prices["NO"]
@@ -148,6 +152,7 @@ class MockExecutionClient(IExecutionClient):
             self.shadow_book.paper_execute(1.0 - price, qty, is_bid=False)
             
         # Log trade event
+        current_yes_price = p_market if "YES" in side else (1.0 - p_market)
         self.recorder.record_trade(
             timestamp=context_state.get("timestamp", time.time()),
             side=side,
@@ -160,7 +165,7 @@ class MockExecutionClient(IExecutionClient):
             strike=context_state.get("strike_price", 0.0),
             resolved_won=bool(realized_pnl > 0.0),
             pnl=realized_pnl,
-            capital=self._cash_balance + self.get_portfolio_value(p_market)
+            capital=self._cash_balance + self.get_portfolio_value(current_yes_price)
         )
         
         logger.info(

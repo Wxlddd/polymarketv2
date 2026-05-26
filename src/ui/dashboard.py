@@ -173,8 +173,8 @@ def build_dashboard(
     mkt_table.add_column("Active Ticker", justify="left")
     mkt_table.add_column("Spot Price", justify="right", style="gold1")
     mkt_table.add_column("Strike Price (K)", justify="right")
-    mkt_table.add_column("Merton P_YES", justify="right", style="bold blue")
-    mkt_table.add_column("Market P_YES", justify="right", style="magenta")
+    mkt_table.add_column("YES", justify="right", style="bold blue")
+    mkt_table.add_column("Market YES", justify="right", style="magenta")
     mkt_table.add_column("Expected Edge", justify="right")
     mkt_table.add_column("Smooth OFI", justify="right", style="dim")
     

@@ -98,6 +98,12 @@ Se la Gamma API non fornisce lo strike price $K$ all'avvio, il sistema cattura i
 ### Prevenzione del Double Trade
 Il callback CLOB (`_clob_callback`) è una coroutine `async` che esegue `await client.execute_trade(...)` prima di restituire il controllo al loop. Questo garantisce che `paper_execute` abbia già depleto il Shadow Book prima dell'arrivo del tick successivo, prevenendo segnali duplicati sulla stessa opportunità.
 
+### Mitigazione del "Ghost Token" (Bug Fix)
+In precedenza, se la query delle API di Gamma per i nuovi token ID falliva durante il rollover, il sistema manteneva i token del ciclo precedente. Questo portava ad arbitraggi falsi su contratti morti (scambiati a $0.01) con payoff simulati errati.
+- **Risoluzione Robustezza Gamma API**: È stato implementato un ciclo di retry con backoff fino a 5 tentativi se le chiamate API falliscono.
+- **Gestione Token Stale**: Se i token falliscono del tutto la risoluzione, `YES_TOKEN_ID` e `NO_TOKEN_ID` vengono impostati a `None` e il feed CLOB viene disattivato, prevenendo trading su contratti scaduti.
+- **Mid-Cycle Auto-Recovery**: Il loop di discovery riprova periodicamente a risolvere i token mancanti ogni 10 secondi durante il ciclo, riavviando il feed e ripristinando il trading appena l'API ritorna disponibile.
+
 ### Keep-Awake Windows
 Il sistema esegue un loop asincrono `_keep_awake_loop` che aggiorna ogni 30 secondi il `SetThreadExecutionState` di Windows con i flag `ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED`, prevenendo lo standby durante le sessioni di trading prolungate.
 

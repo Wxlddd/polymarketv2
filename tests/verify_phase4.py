@@ -121,14 +121,15 @@ async def main():
     print(f"Final Client Cash Balance: ${client.cash_balance:.2f}")
     print(f"YES position size (expected 0): {client.get_position_size('YES')}")
     
-    # Cash should be initial capital + qty * (1.0 - entry_price) - gas
-    expected_cash = config.arbitrage.INITIAL_CAPITAL + qty * (1.0 - price) - config.arbitrage.GAS_FEE_USD
+    # Cash should be initial capital + qty * (1.0 - entry_price) - gas - taker_fee
+    taker_fee = qty * config.arbitrage.TAKER_FEE_MULTIPLIER * price * (1.0 - price)
+    expected_cash = config.arbitrage.INITIAL_CAPITAL + qty * (1.0 - price) - config.arbitrage.GAS_FEE_USD - taker_fee
     print(f"Expected final cash: ${expected_cash:.2f}")
     
     if abs(client.cash_balance - expected_cash) < 1e-9 and client.get_position_size("YES") == 0.0:
         print("[OK] Position settlement and cash balances are mathematically exact.")
     else:
-        print("[FAIL] Settlement calculations mismatch!")
+        print(f"[FAIL] Settlement calculations mismatch! Actual cash: ${client.cash_balance:.6f}, Expected cash: ${expected_cash:.6f}")
 
     # Flush recorder
     recorder.flush()

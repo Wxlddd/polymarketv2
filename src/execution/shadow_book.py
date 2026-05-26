@@ -83,19 +83,36 @@ class ShadowOrderBook(IOrderBook):
 
     def paper_execute(self, price: float, qty_executed: float, is_bid: bool) -> None:
         """
-        Deducts filled quantity from the shadow state to simulate book depletion.
+        Deducts filled quantity from the shadow state to simulate book depletion by sweeping level-by-level.
         If is_bid is True, we deduct from bids (selling to bid); else we deduct from asks (buying from ask).
         """
-        price_key = round(price, 6)
-        target_dict = self.q_shadow_bids if is_bid else self.q_shadow_asks
-        
-        if price_key in target_dict:
-            target_dict[price_key] = max(0.0, target_dict[price_key] - qty_executed)
-            if target_dict[price_key] <= 1e-9:
-                target_dict.pop(price_key, None)
+        remaining = qty_executed
+        if is_bid:
+            # Sort bids descending (highest bid first)
+            sorted_bids = self.get_sorted_bids()
+            for p, q in sorted_bids:
+                price_key = round(p, 6)
+                fill = min(remaining, q)
+                if price_key in self.q_shadow_bids:
+                    self.q_shadow_bids[price_key] = max(0.0, self.q_shadow_bids[price_key] - fill)
+                    if self.q_shadow_bids[price_key] <= 1e-9:
+                        self.q_shadow_bids.pop(price_key, None)
+                remaining -= fill
+                if remaining <= 1e-9:
+                    break
         else:
-            # Fallback if executing at a price that isn't currently at top level (HFT latency gap)
-            logger.debug(f"[ShadowOrderBook] Paper execute failed to locate level: {price_key}")
+            # Sort asks ascending (lowest ask first)
+            sorted_asks = self.get_sorted_asks()
+            for p, q in sorted_asks:
+                price_key = round(p, 6)
+                fill = min(remaining, q)
+                if price_key in self.q_shadow_asks:
+                    self.q_shadow_asks[price_key] = max(0.0, self.q_shadow_asks[price_key] - fill)
+                    if self.q_shadow_asks[price_key] <= 1e-9:
+                        self.q_shadow_asks.pop(price_key, None)
+                remaining -= fill
+                if remaining <= 1e-9:
+                    break
 
     def get_sorted_bids(self) -> List[Tuple[float, float]]:
         """Returns shadow bids sorted descending (highest bid first)."""

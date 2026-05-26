@@ -184,32 +184,52 @@ class ExecutionEngine:
         # Best prices on shadow book
         p_bid_yes = best_bid[0] if best_bid[0] else 0.5
         p_ask_yes = best_ask[0] if best_ask[0] else 0.5
+        p_ask_no = 1.0 - p_bid_yes
         
         # Retrieve current position counts
         qty_yes = client.get_position_size("YES")
         qty_no = client.get_position_size("NO")
         
-        # Target sizing calculations
-        # Option A: BUY YES (Edge exists on YES)
-        f_star_yes = 0.0
-        if p_yes > p_ask_yes:
-            # f* = p - (1-p) * P / (1-P) = (p - P) / (1-P)
-            f_star_yes = gamma * (p_yes - p_ask_yes) / (1.0 - p_ask_yes)
-            
-        # Option B: BUY NO (Edge exists on NO)
-        p_no = 1.0 - p_yes
-        p_ask_no = 1.0 - p_bid_yes
-        f_star_no = 0.0
-        if p_no > p_ask_no:
-            f_star_no = gamma * (p_no - p_ask_no) / (1.0 - p_ask_no)
-            
-        # Clip fractional Kelly allocations to standard safety bounds [0, 50%]
-        f_star_yes = float(np.clip(f_star_yes, 0.0, 0.50))
-        f_star_no = float(np.clip(f_star_no, 0.0, 0.50))
+        # Calculate current total portfolio wealth/equity
+        wealth = W + (qty_yes * p_ask_yes) + (qty_no * p_ask_no)
         
-        # Convert Kelly fractions to contract target holdings
-        target_qty_yes = (f_star_yes * W) / p_ask_yes if p_ask_yes > 0.0 else 0.0
-        target_qty_no = (f_star_no * W) / p_ask_no if p_ask_no > 0.0 else 0.0
+        # Current weights as fraction of wealth
+        w_current_yes = (qty_yes * p_ask_yes) / wealth if wealth > 0.0 else 0.0
+        w_current_no = (qty_no * p_ask_no) / wealth if wealth > 0.0 else 0.0
+        
+        # Raw unconstrained Kelly targets (can be negative if overvalued)
+        f_star_yes = gamma * (p_yes - p_ask_yes) / (1.0 - p_ask_yes) if p_ask_yes < 1.0 else 0.0
+        
+        p_no = 1.0 - p_yes
+        f_star_no = gamma * (p_no - p_ask_no) / (1.0 - p_ask_no) if p_ask_no < 1.0 else 0.0
+        
+        # Apply 2026 Polymarket taker fee regularization buffer delta = taker_fee_multiplier * gamma
+        taker_fee_multiplier = self.config.arbitrage.TAKER_FEE_MULTIPLIER
+        delta_buffer = taker_fee_multiplier * gamma
+        
+        # YES regularized target weight
+        if f_star_yes > w_current_yes + delta_buffer:
+            target_w_yes = f_star_yes - delta_buffer
+        elif f_star_yes < w_current_yes - delta_buffer:
+            target_w_yes = f_star_yes + delta_buffer
+        else:
+            target_w_yes = w_current_yes
+            
+        # NO regularized target weight
+        if f_star_no > w_current_no + delta_buffer:
+            target_w_no = f_star_no - delta_buffer
+        elif f_star_no < w_current_no - delta_buffer:
+            target_w_no = f_star_no + delta_buffer
+        else:
+            target_w_no = w_current_no
+            
+        # Clip regularized target weights to standard safety bounds [0, 50%]
+        target_w_yes = float(np.clip(target_w_yes, 0.0, 0.50))
+        target_w_no = float(np.clip(target_w_no, 0.0, 0.50))
+        
+        # Convert Kelly weights to contract target holdings
+        target_qty_yes = (target_w_yes * wealth) / p_ask_yes if p_ask_yes > 0.0 else 0.0
+        target_qty_no = (target_w_no * wealth) / p_ask_no if p_ask_no > 0.0 else 0.0
         
         # Calculate dynamic transaction costs in bps
         costi_rete_bps = (gas / min_order_usd) * 10000.0

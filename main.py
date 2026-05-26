@@ -213,14 +213,16 @@ class LiveOrchestrator:
             await self.clob_feed.stop()
             
         # Dynamically inject YES/NO tokens resolved by MarketManager into configuration settings
-        if self.market_manager.yes_token_id and self.market_manager.no_token_id:
-            # Modify config settings dynamically
-            self.config.polymarket.__dict__["YES_TOKEN_ID"] = self.market_manager.yes_token_id
-            self.config.polymarket.__dict__["NO_TOKEN_ID"] = self.market_manager.no_token_id
+        self.config.polymarket.__dict__["YES_TOKEN_ID"] = self.market_manager.yes_token_id
+        self.config.polymarket.__dict__["NO_TOKEN_ID"] = self.market_manager.no_token_id
             
-        # Re-initialize CLOB Order book feed
-        self.clob_feed = ClobOrderBookFeed(self.config, self._clob_callback)
-        await self.clob_feed.start()
+        # Re-initialize CLOB Order book feed only if tokens are valid
+        if self.market_manager.yes_token_id and self.market_manager.no_token_id:
+            self.clob_feed = ClobOrderBookFeed(self.config, self._clob_callback)
+            await self.clob_feed.start()
+        else:
+            self.clob_feed = None
+            self.log_message("warning", "[Orchestrator] CLOB feed not started: YES/NO Token IDs are unresolved or missing.")
 
     def _update_web_state(
         self, 
@@ -427,7 +429,7 @@ class LiveOrchestrator:
             edge_str = f"{edge * 100:+.2f}%" if edge is not None else "—"
             msg = (
                 f"[TICK] Spot: ${spot:,.2f} | Strike: ${active_strike or 0.0:,.2f} | "
-                f"Merton: {p_yes_str} | Market: {p_mkt_str} | Edge: {edge_str} | OFI: {ofi:+.1f}"
+                f"YES: {p_yes_str} | Market YES: {p_mkt_str} | Edge: {edge_str} | OFI: {ofi:+.1f}"
             )
             self.log_message("info", msg)
             
@@ -474,6 +476,10 @@ class LiveOrchestrator:
                 expected_slippage_bps=decision["expected_slippage_bps"],
                 context_state={"timestamp": t_now, "strike_price": active_strike}
             )
+            
+            # Immediately update the web state so that the UI shows the depleted shadow book
+            if self.web_server:
+                self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
 
     async def _market_discovery_loop(self) -> None:
         """Periodically evaluates clock to trigger dynamic market Discovery and Rollovers."""
@@ -527,6 +533,21 @@ class LiveOrchestrator:
                     
                     # 4. Update web server immediately
                     self._update_web_state()
+                else:
+                    # If we are in an active cycle but token IDs are missing, try to resolve them mid-cycle!
+                    if self.market_manager.yes_token_id is None or self.market_manager.no_token_id is None:
+                        if t_now - getattr(self, "_last_api_retry_time", 0.0) >= 10.0:
+                            self._last_api_retry_time = t_now
+                            self.log_message("info", "[Orchestrator] Token IDs are missing. Retrying Gamma API discovery...")
+                            await self.market_manager.fetch_market_context()
+                            if self.market_manager.yes_token_id and self.market_manager.no_token_id:
+                                if not self.strike_manager:
+                                    self.strike_manager = StrikeManager(
+                                        presumed_strike=self.market_manager.strike_price,
+                                        expiration_timestamp=self.market_manager.current_expiry
+                                    )
+                                await self._restart_clob_feed()
+                                self._update_web_state()
                     
             except asyncio.CancelledError:
                 break

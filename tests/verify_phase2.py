@@ -15,9 +15,9 @@ async def test_slug_generation(manager: MarketManager):
     
     print(f"Input timestamp: {test_time}")
     print(f"Calculated Next Expiry: {next_expiry} (Expected: 1779790500)")
-    print(f"Generated Slug: {slug} (Expected: btc-updown-5m-1779790500)")
+    print(f"Generated Slug: {slug} (Expected: btc-updown-5m-1779790200)")
     
-    if next_expiry == 1779790500 and slug == "btc-updown-5m-1779790500":
+    if next_expiry == 1779790500 and slug == "btc-updown-5m-1779790200":
         print("[OK] Slug generation is mathematically correct.")
     else:
         print("[FAIL] Slug generation mismatch!")

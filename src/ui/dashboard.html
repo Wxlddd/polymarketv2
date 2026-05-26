@@ -361,8 +361,8 @@
                 <th>Ticker</th>
                 <th class="num">Spot Price</th>
                 <th class="num">Strike Price (K)</th>
-                <th class="num">Merton P_YES</th>
-                <th class="num">Market P_YES</th>
+                <th class="num">YES</th>
+                <th class="num">Market YES</th>
                 <th class="num">Expected Edge</th>
                 <th class="num">Realized Vol</th>
                 <th class="num">OFI</th>
@@ -397,7 +397,7 @@
         </div>
         <!-- Merton vs Market Implied -->
         <div class="panel chart-box">
-          <div class="panel-header">MERTON P_YES VS MARKET P_YES</div>
+          <div class="panel-header">YES VS MARKET YES</div>
           <canvas id="chart-prob" height="150"></canvas>
         </div>
       </div>
@@ -851,9 +851,9 @@
     // Legend
     ctx.font = '9px monospace';
     ctx.fillStyle = '#00ff00';
-    ctx.fillText('Merton P_YES', pad.left + 8, pad.top + 10);
+    ctx.fillText('YES', pad.left + 8, pad.top + 10);
     ctx.fillStyle = '#ff00ff';
-    ctx.fillText('Market P_YES', pad.left + 90, pad.top + 10);
+    ctx.fillText('Market YES', pad.left + 60, pad.top + 10);
   }
 
   // ── HISTORICAL RANGE ACQUISITION FOR BACKTESTING ──

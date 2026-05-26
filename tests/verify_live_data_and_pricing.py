@@ -119,7 +119,7 @@ class LiveDataVerifier:
                     await asyncio.sleep(0.2)
                     live.update(self._generate_table())
         else:
-            print("Timestamp           | Spot Price   | Strike K     | Merton P_YES | Market P_YES | OFI   | Volatility")
+            print("Timestamp           | Spot Price   | Strike K     | YES          | Market YES   | OFI   | Volatility")
             print("-" * 105)
             while not self.stop_event.is_set() and self.tick_count < self.max_ticks:
                 await asyncio.sleep(0.5)
@@ -201,8 +201,8 @@ class LiveDataVerifier:
         table.add_column("Timestamp", style="cyan")
         table.add_column("Spot Price", justify="right", style="gold1")
         table.add_column("Strike K", justify="right", style="white")
-        table.add_column("Merton P_YES", justify="right", style="bold green")
-        table.add_column("Market P_YES", justify="right", style="magenta")
+        table.add_column("YES", justify="right", style="bold green")
+        table.add_column("Market YES", justify="right", style="magenta")
         table.add_column("OFI", justify="right")
         table.add_column("Volatility", justify="right", style="dim")
         

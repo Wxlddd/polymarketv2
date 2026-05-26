@@ -34,6 +34,7 @@ class MertonJumpDiffusionConfig:
     DEFAULT_SIGMA: float = field(default_factory=lambda: float(os.getenv("DEFAULT_SIGMA", "0.25")))
     VOL_ROLLING_WINDOW_SEC: int = field(default_factory=lambda: int(os.getenv("VOL_ROLLING_WINDOW_SEC", "300")))
     OFI_DRIFT_MULTIPLIER: float = field(default_factory=lambda: float(os.getenv("OFI_DRIFT_MULTIPLIER", "-1e-6")))
+    OFI_HORIZON_SEC: float = field(default_factory=lambda: float(os.getenv("OFI_HORIZON_SEC", "5.0")))
 
 @dataclass(frozen=True)
 class ArbitrageConfig:
@@ -41,6 +42,7 @@ class ArbitrageConfig:
     INITIAL_CAPITAL: float = field(default_factory=lambda: float(os.getenv("INITIAL_CAPITAL", "10000.0")))
     KELLY_FRACTION: float = field(default_factory=lambda: float(os.getenv("KELLY_FRACTION", "0.15")))
     GAS_FEE_USD: float = field(default_factory=lambda: float(os.getenv("GAS_FEE_USD", "0.03")))
+    TAKER_FEE_MULTIPLIER: float = field(default_factory=lambda: float(os.getenv("TAKER_FEE_MULTIPLIER", "0.072")))
     MIN_EXPECTED_VALUE: float = field(default_factory=lambda: float(os.getenv("MIN_EXPECTED_VALUE", "0.005")))
     MIN_ACCEPTABLE_MARGIN_BPS: float = field(default_factory=lambda: float(os.getenv("MIN_ACCEPTABLE_MARGIN_BPS", "5.0")))
     ABSOLUTE_MAX_SLIPPAGE_BPS: float = field(default_factory=lambda: float(os.getenv("ABSOLUTE_MAX_SLIPPAGE_BPS", "150.0")))
