@@ -80,6 +80,17 @@ class LiveOrchestrator:
         self.is_running = True
         self.log_message("info", "Initializing Live Orchestrator...")
         
+        # Prevent Windows PC from going to sleep while running
+        if os.name == 'nt':
+            try:
+                import ctypes
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+                self.log_message("info", "Windows Thread Execution State set to prevent system sleep.")
+            except Exception as e:
+                logger.warning(f"Failed to set Windows thread execution state: {e}")
+        
         # 1. Start Spot Feed Websocket (runs in background)
         await self.spot_feed.start()
         
@@ -139,6 +150,16 @@ class LiveOrchestrator:
     async def stop(self) -> None:
         self.is_running = False
         self._stop_event.set()
+        
+        # Restore default sleep behavior on Windows
+        if os.name == 'nt':
+            try:
+                import ctypes
+                ES_CONTINUOUS = 0x80000000
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+                logger.info("Windows Thread Execution State reset to default sleep behavior.")
+            except Exception as e:
+                pass
         
         # Stop Web Server
         if self.web_server:
