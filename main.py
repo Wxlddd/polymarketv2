@@ -541,7 +541,8 @@ class LiveOrchestrator:
                     )
                     self._smoothed_p_yes = None
                     self._smoothed_p_yes_ts = 0.0
-                    
+                    self.strategy.reset()
+
                     # 3. Restart CLOB feed to subscribe to new tokens
                     await self._restart_clob_feed()
                     

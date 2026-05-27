@@ -118,6 +118,10 @@ class ExecutionEngine:
                 "reason": "WAITING_FOR_STRIKE_RESOLUTION",
                 "size": 0.0
             }
+
+        # 1.6. Block trading if the order book has no executable levels on either side
+        if not context.bids_l2 or not context.asks_l2:
+            return {"side": "HOLD", "reason": "NO_BOOK_DATA", "size": 0.0}
             
         t_now = context.timestamp
 

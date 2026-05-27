@@ -1014,8 +1014,11 @@
     else if (type === 'system') color = '#888888';
 
     div.innerHTML = `<span class="log-time">${ts}</span><span style="color:${color}">${escapeHtml(msg)}</span>`;
+    const isAtBottom = els.logsBox.scrollHeight - els.logsBox.scrollTop - els.logsBox.clientHeight < 20;
     els.logsBox.appendChild(div);
-    els.logsBox.scrollTop = els.logsBox.scrollHeight;
+    if (isAtBottom) {
+      els.logsBox.scrollTop = els.logsBox.scrollHeight;
+    }
 
     // Prune oldest elements
     while (els.logsBox.childElementCount > 50) {

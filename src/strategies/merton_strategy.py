@@ -237,6 +237,10 @@ class MertonStrategy(BaseStrategy):
     Merton + Gil-Pelaez prices the pure diffusion/jump component (μ=0).
     OFI enters separately as a logit-space shift via OFILogitShifter, keeping
     the two signals orthogonal and preventing annualization artifacts.
+
+    An internal time-based EMA smooths the raw Gil-Pelaez output before the OFI
+    shift, stabilizing the base probability against numerical noise and rapid
+    volatility-calibrator updates without blunting the OFI signal layer.
     """
 
     def __init__(self, config):
@@ -249,6 +253,14 @@ class MertonStrategy(BaseStrategy):
             beta=config.merton.OFI_LOGIT_BETA,
             ema_alpha=config.merton.OFI_NORM_EMA_ALPHA
         )
+        self._p_merton_ema: Optional[float] = None
+        self._p_merton_ema_ts: float = 0.0
+
+    def reset(self) -> None:
+        """Clears internal EMA state. Call on cycle rollover so the new ATM strike
+        doesn't get blended with the previous cycle's probability."""
+        self._p_merton_ema = None
+        self._p_merton_ema_ts = 0.0
 
     def get_probability(self, context: MarketContext) -> Optional[float]:
         if context.strike_price is None:
@@ -258,7 +270,7 @@ class MertonStrategy(BaseStrategy):
         sigma = self.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
 
         # Merton runs with μ=0: drift contribution is purely from the logit shift below.
-        p_merton = self.integrator.calculate_probability(
+        p_merton_raw = self.integrator.calculate_probability(
             S_t=context.spot_price,
             K=context.strike_price,
             tau_seconds=context.tau_seconds,
@@ -269,5 +281,17 @@ class MertonStrategy(BaseStrategy):
             sigma_j=self.config.merton.DEFAULT_SIGMA_J
         )
 
-        p_final = self.ofi_shifter.shift(p_merton, context.ofi)
+        # Internal time-based EMA on the Merton base probability.
+        # Stabilizes Gil-Pelaez output before the OFI logit shift is applied.
+        if self._p_merton_ema is None:
+            self._p_merton_ema = p_merton_raw
+            self._p_merton_ema_ts = context.timestamp
+        else:
+            halflife = self.config.merton.MERTON_EMA_HALFLIFE_SEC
+            dt = context.timestamp - self._p_merton_ema_ts
+            alpha = 1.0 - np.exp(-dt / halflife) if halflife > 0.0 else 1.0
+            self._p_merton_ema = alpha * p_merton_raw + (1.0 - alpha) * self._p_merton_ema
+            self._p_merton_ema_ts = context.timestamp
+
+        p_final = self.ofi_shifter.shift(self._p_merton_ema, context.ofi)
         return float(np.clip(p_final, 0.01, 0.99))

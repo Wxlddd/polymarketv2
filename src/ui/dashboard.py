@@ -104,8 +104,8 @@ def build_dashboard(
     qty_yes = client.get_position_size("YES")
     qty_no = client.get_position_size("NO")
     
-    # Get reference price to evaluate MTM portfolio value
-    top_bid, top_ask = shadow_book.get_top_of_book()
+    # Get reference price from the real book (never depleted by paper fills)
+    top_bid, top_ask = shadow_book.get_market_top_of_book()
     bid_price_yes = top_bid[0] if top_bid else 0.5
     
     # Evaluate position portfolio value (mock client)
@@ -148,7 +148,6 @@ def build_dashboard(
     
     # Model option probability
     vol = strategy.vol_calibrator.calculate_volatility(config.merton.DEFAULT_SIGMA)
-    drift = strategy.estimate_drift(shadow_book.smoothed_ofi)
     
     # Dummy mock MarketContext to run get_probability (zero-assumptions safe)
     dummy_context = MarketContext(
@@ -195,7 +194,7 @@ def build_dashboard(
     status_text = Text()
     status_text.append(f"  Active Slug: {market_manager.current_slug or '—'}\n", style="dim")
     status_text.append(f"  Active Condition: {market_manager.condition_id or '—'}\n", style="dim")
-    status_text.append(f"  Calibrated Volatility: {vol:.2%}  |  Annualized OFI Drift: {drift:+.1f}\n", style="dim")
+    status_text.append(f"  Calibrated Volatility: {vol:.2%}  |  Smoothed OFI: {shadow_book.smoothed_ofi:+.1f}\n", style="dim")
     
     body_layout = Layout()
     body_layout.split_column(

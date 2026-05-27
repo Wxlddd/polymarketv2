@@ -128,6 +128,7 @@ class BacktestRunner:
                 cycle_snapshot_sent = False
                 p_yes_ema = None
                 p_yes_ema_ts = 0.0
+                strategy.reset()
 
             # 3. Update shadow order book proxy.
             # First tick of each cycle: full snapshot (clears stale residuals from old cycle).
