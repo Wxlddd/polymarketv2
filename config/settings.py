@@ -42,10 +42,6 @@ class MertonJumpDiffusionConfig:
     # OFI_NORM_EMA_ALPHA: EMA decay for the rolling variance used to normalize OFI.
     OFI_LOGIT_BETA: float = field(default_factory=lambda: float(os.getenv("OFI_LOGIT_BETA", "0.5")))
     OFI_NORM_EMA_ALPHA: float = field(default_factory=lambda: float(os.getenv("OFI_NORM_EMA_ALPHA", "0.1")))
-    # Half-life (seconds) for the internal time-based EMA on the raw Merton base probability
-    # (applied inside MertonStrategy before the OFI logit shift).  Shorter than EMA_HALFLIFE_SEC
-    # so the Gil-Pelaez output is stable while OFI still provides a faster correction layer.
-    MERTON_EMA_HALFLIFE_SEC: float = field(default_factory=lambda: float(os.getenv("MERTON_EMA_HALFLIFE_SEC", "15.0")))
     # Half-life (seconds) for the time-based EMA applied to raw p_yes before the engine.
     # Time-based EMA ensures consistent smoothing regardless of CLOB tick rate.
     EMA_HALFLIFE_SEC: float = field(default_factory=lambda: float(os.getenv("EMA_HALFLIFE_SEC", "30.0")))
