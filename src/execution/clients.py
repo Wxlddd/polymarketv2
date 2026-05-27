@@ -151,8 +151,20 @@ class MockExecutionClient(IExecutionClient):
             # Paper execution (SELL_NO depletes asks on the book at price 1.0 - price)
             self.shadow_book.paper_execute(1.0 - price, qty, is_bid=False)
             
-        # Log trade event
-        current_yes_price = p_market if "YES" in side else (1.0 - p_market)
+        # Compute mid-price for consistent portfolio MTM, independent of which
+        # side triggered the call.  Using the execution-side price (p_market) as the
+        # YES reference caused the MTM to flip between bid and ask depending on
+        # whether the trade was on YES or NO, producing artificial capital swings.
+        top_bid_mtm, top_ask_mtm = self.shadow_book.get_market_top_of_book()
+        if top_bid_mtm and top_ask_mtm:
+            current_yes_price = 0.5 * (top_bid_mtm[0] + top_ask_mtm[0])
+        elif top_bid_mtm:
+            current_yes_price = top_bid_mtm[0]
+        elif top_ask_mtm:
+            current_yes_price = top_ask_mtm[0]
+        else:
+            current_yes_price = p_market if "YES" in side else (1.0 - p_market)
+
         self.recorder.record_trade(
             timestamp=context_state.get("timestamp", time.time()),
             side=side,

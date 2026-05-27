@@ -33,8 +33,18 @@ class MertonJumpDiffusionConfig:
     DEFAULT_SIGMA_J: float = field(default_factory=lambda: float(os.getenv("DEFAULT_SIGMA_J", "0.0015")))
     DEFAULT_SIGMA: float = field(default_factory=lambda: float(os.getenv("DEFAULT_SIGMA", "0.25")))
     VOL_ROLLING_WINDOW_SEC: int = field(default_factory=lambda: int(os.getenv("VOL_ROLLING_WINDOW_SEC", "300")))
-    OFI_DRIFT_MULTIPLIER: float = field(default_factory=lambda: float(os.getenv("OFI_DRIFT_MULTIPLIER", "-1e-6")))
-    OFI_HORIZON_SEC: float = field(default_factory=lambda: float(os.getenv("OFI_HORIZON_SEC", "5.0")))
+    # OFI logit-shift parameters.
+    # OFI enters the model as: p_final = sigmoid(logit(p_merton) + beta * ofi_z)
+    # where ofi_z = smoothed_ofi / rolling_std(ofi) is the z-score of the smoothed OFI.
+    # OFI_LOGIT_BETA: sensitivity — at p=0.5, a 1σ OFI event shifts p by ~beta/4 (small beta).
+    #   beta=0.5 → 1σ OFI shifts ATM probability by ~12pp.
+    #   beta=1.0 → 1σ OFI shifts ATM probability by ~23pp.
+    # OFI_NORM_EMA_ALPHA: EMA decay for the rolling variance used to normalize OFI.
+    OFI_LOGIT_BETA: float = field(default_factory=lambda: float(os.getenv("OFI_LOGIT_BETA", "0.5")))
+    OFI_NORM_EMA_ALPHA: float = field(default_factory=lambda: float(os.getenv("OFI_NORM_EMA_ALPHA", "0.1")))
+    # Half-life (seconds) for the time-based EMA applied to raw p_yes before the engine.
+    # Time-based EMA ensures consistent smoothing regardless of CLOB tick rate.
+    EMA_HALFLIFE_SEC: float = field(default_factory=lambda: float(os.getenv("EMA_HALFLIFE_SEC", "30.0")))
 
 @dataclass(frozen=True)
 class ArbitrageConfig:
