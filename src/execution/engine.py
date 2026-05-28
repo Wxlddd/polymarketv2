@@ -27,6 +27,7 @@ class ExecutionEngine:
         self.last_ask_price: Optional[float] = None
         self.last_ask_qty: Optional[float] = None
         self.last_ask_updated_at: float = 0.0
+        self._last_stale_log_time: float = 0.0
 
     def walk_order_book(
         self, 
@@ -264,7 +265,9 @@ class ExecutionEngine:
                 threshold_desync = max(z_score * context.spot_price * context.volatility * np.sqrt(dt_years), context.spot_price * 0.00005)
                 
                 if delta_S > threshold_desync:
-                    logger.warning(f"[STALENESS] Quote Stale (Age: {quote_age:.2f}s, dS: {delta_S:.2f} > th: {threshold_desync:.2f})")
+                    if t_now - self._last_stale_log_time >= 2.0:
+                        logger.warning(f"[STALENESS] Quote Stale (Age: {quote_age:.2f}s, dS: {delta_S:.2f} > th: {threshold_desync:.2f})")
+                        self._last_stale_log_time = t_now
                     return {
                         "side": "HOLD",
                         "reason": "REJECT_DESYNC_STALENESS",
