@@ -465,6 +465,11 @@ class LiveOrchestrator:
         
         # Evaluate Trade Sizing and Execution
         async with self._execution_lock:
+            # Apply a strict 1.0-second cooldown between trades to prevent rapid-fire 
+            # spamming when liquidity replenishes instantly in paper-trading.
+            if t_now - getattr(self, "_last_trade_exec_ts", 0.0) < 1.0:
+                return
+
             decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
             self.latest_decision_ref[0] = decision
             
@@ -513,7 +518,7 @@ class LiveOrchestrator:
                     f" | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}"
                 )
 
-                await self.client.execute_trade(
+                result = await self.client.execute_trade(
                     side=decision["side"],
                     qty=decision["size"],
                     price=decision["vwap"],
@@ -526,6 +531,22 @@ class LiveOrchestrator:
                         "limit_price": decision.get("limit_price", decision["vwap"])
                     }
                 )
+                
+                # Apply cooldown timestamp on any trade attempt
+                self._last_trade_exec_ts = t_now
+                
+                # Log execution result dynamically so it shows in the UI and console
+                if result.get("success"):
+                    self.log_message(
+                        "info",
+                        f"EXECUTED {result['side']} | Qty: {result['qty']:.2f} | Price: ${result['price']:.4f} "
+                        f"| PnL: ${result['pnl']:+.2f}"
+                    )
+                else:
+                    self.log_message(
+                        "warning", 
+                        f"TRADE REJECTED: {result.get('reason')}"
+                    )
 
                 # Update the web state immediately after the fill so the UI
                 # reflects the depleted shadow book before the next tick.
