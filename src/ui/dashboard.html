@@ -1012,14 +1012,6 @@
   }
 
   // ── CONSOLE LOG LISTENER ──
-  let isUserScrolling = false;
-  
-  els.logsBox.addEventListener('scroll', () => {
-    // If user is within 20px of the bottom, they are not manually scrolling up
-    const isBottom = els.logsBox.scrollHeight - els.logsBox.clientHeight <= Math.ceil(els.logsBox.scrollTop) + 20;
-    isUserScrolling = !isBottom;
-  });
-
   function addLog(type, msg) {
     const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
     const div = document.createElement('div');
@@ -1033,21 +1025,15 @@
 
     div.innerHTML = `<span class="log-time">${ts}</span><span style="color:${color}">${escapeHtml(msg)}</span>`;
     
-    // Prune oldest elements FIRST to ensure completely stable height and scroll position calculations
-    while (els.logsBox.childElementCount >= 250) {
-      const child = els.logsBox.firstChild;
-      const childHeight = child.offsetHeight || 15;
-      els.logsBox.removeChild(child);
-      if (isUserScrolling) {
-        els.logsBox.scrollTop -= childHeight;
-      }
+    const isAtBottom = els.logsBox.scrollHeight - els.logsBox.scrollTop - els.logsBox.clientHeight < 20;
+    els.logsBox.appendChild(div);
+    if (isAtBottom) {
+      els.logsBox.scrollTop = els.logsBox.scrollHeight;
     }
 
-    els.logsBox.appendChild(div);
-    
-    // Only auto-scroll if the user hasn't scrolled up
-    if (!isUserScrolling) {
-      els.logsBox.scrollTop = els.logsBox.scrollHeight;
+    // Prune oldest elements
+    while (els.logsBox.childElementCount > 250) {
+      els.logsBox.removeChild(els.logsBox.firstChild);
     }
   }
 
