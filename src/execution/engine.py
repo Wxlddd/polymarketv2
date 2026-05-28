@@ -108,7 +108,10 @@ class ExecutionEngine:
             return {
                 "side": "HOLD", 
                 "reason": "STRATEGY_UNRESOLVED_PROBABILITY", 
-                "size": 0.0
+                "size": 0.0,
+                "kelly_alloc": 0.0,
+                "vwap": 0.0,
+                "theoretical_edge_bps": 0.0
             }
             
         # 1.5. Block trading if strike price is unresolved or zero
@@ -116,7 +119,10 @@ class ExecutionEngine:
             return {
                 "side": "HOLD",
                 "reason": "WAITING_FOR_STRIKE_RESOLUTION",
-                "size": 0.0
+                "size": 0.0,
+                "kelly_alloc": 0.0,
+                "vwap": 0.0,
+                "theoretical_edge_bps": 0.0
             }
             
         t_now = context.timestamp
@@ -137,53 +143,7 @@ class ExecutionEngine:
             self.last_ask_qty = best_ask[1]
             self.last_ask_updated_at = t_now
 
-        # 2. Pin Risk (Oracle Jitter) Quantitative Protection
-        pin_risk_window = self.config.risk.PIN_RISK_SECONDS
-        if context.tau_seconds <= pin_risk_window and context.tau_seconds > 0.0:
-            # Noise margin: either standard BPS or empirical standard deviation of spot
-            noise_bps_usd = context.spot_price * (self.config.risk.ORACLE_NOISE_BPS / 10000.0)
-            recent_spots = [p for t, p in self.spot_history if t >= t_now - 10.0]
-            empirical_std = np.std(recent_spots) if len(recent_spots) > 1 else 0.0
-            
-            oracle_noise = max(noise_bps_usd, empirical_std)
-            distance_to_strike = abs(context.spot_price - context.strike_price)
-            
-            if distance_to_strike < oracle_noise:
-                logger.warning(
-                    f"[PIN RISK] Trade blocked: |S - K| = {distance_to_strike:.4f} < "
-                    f"noise = {oracle_noise:.4f} (tau: {context.tau_seconds:.1f}s)"
-                )
-                return {
-                    "side": "HOLD",
-                    "reason": "REJECT_PIN_RISK",
-                    "size": 0.0
-                }
-
-        # 3. Market Desync / Staleness Check
-        if self.last_ask_updated_at > 0.0 and self.last_bid_updated_at > 0.0:
-            # Let quote age be the age of the side we are interacting with
-            quote_age = t_now - min(self.last_ask_updated_at, self.last_bid_updated_at)
-            
-            # If quote is stale (older than 100ms) and spot has walked too far
-            if quote_age > 0.100 and self.spot_history:
-                t_lookup = t_now - quote_age
-                closest_spot = min(self.spot_history, key=lambda x: abs(x[0] - t_lookup))[1]
-                delta_S = abs(context.spot_price - closest_spot)
-                
-                # Check normal diffusion expected moves
-                dt_years = quote_age / (365.25 * 24 * 3600.0)
-                z_score = self.config.risk.DESYNC_Z_SCORE
-                threshold_desync = max(z_score * context.spot_price * context.volatility * np.sqrt(dt_years), context.spot_price * 0.00005)
-                
-                if delta_S > threshold_desync:
-                    logger.warning(f"[STALENESS] Quote Stale (Age: {quote_age:.2f}s, dS: {delta_S:.2f} > th: {threshold_desync:.2f})")
-                    return {
-                        "side": "HOLD",
-                        "reason": "REJECT_DESYNC_STALENESS",
-                        "size": 0.0
-                    }
-
-        # 4. Sizing Calculations via Fractional Kelly
+        # 4. Sizing Calculations via Fractional Kelly (Pre-computed for UI reporting on HOLD)
         gamma = self.config.arbitrage.KELLY_FRACTION
         W = client.cash_balance
         gas = self.config.arbitrage.GAS_FEE_USD
@@ -235,6 +195,85 @@ class ExecutionEngine:
         target_w_yes = float(np.clip(target_w_yes, 0.0, 0.50))
         target_w_no = float(np.clip(target_w_no, 0.0, 0.50))
         
+        # Determine active sizing metrics for UI reporting even on HOLD
+        edge_yes = p_yes - p_ask_yes
+        edge_no = p_no - p_ask_no
+        
+        if edge_yes > edge_no and edge_yes > 0.0:
+            theoretical_edge_bps = edge_yes * 10000.0
+            kelly_alloc = target_w_yes
+            target_price = p_yes
+        elif edge_no > edge_yes and edge_no > 0.0:
+            theoretical_edge_bps = edge_no * 10000.0
+            kelly_alloc = target_w_no
+            target_price = p_no
+        else:
+            if edge_yes > edge_no:
+                theoretical_edge_bps = max(0.0, edge_yes) * 10000.0
+                kelly_alloc = target_w_yes
+                target_price = p_yes
+            else:
+                theoretical_edge_bps = max(0.0, edge_no) * 10000.0
+                kelly_alloc = target_w_no
+                target_price = p_no
+
+        # 2. Pin Risk (Oracle Jitter) Quantitative Protection
+        pin_risk_window = self.config.risk.PIN_RISK_SECONDS
+        if context.tau_seconds <= pin_risk_window and context.tau_seconds > 0.0:
+            # Noise margin: either standard BPS or empirical standard deviation of spot
+            noise_bps_usd = context.spot_price * (self.config.risk.ORACLE_NOISE_BPS / 10000.0)
+            recent_spots = [p for t, p in self.spot_history if t >= t_now - 10.0]
+            empirical_std = np.std(recent_spots) if len(recent_spots) > 1 else 0.0
+            
+            oracle_noise = max(noise_bps_usd, empirical_std)
+            distance_to_strike = abs(context.spot_price - context.strike_price)
+            
+            if distance_to_strike < oracle_noise:
+                logger.warning(
+                    f"[PIN RISK] Trade blocked: |S - K| = {distance_to_strike:.4f} < "
+                    f"noise = {oracle_noise:.4f} (tau: {context.tau_seconds:.1f}s)"
+                )
+                return {
+                    "side": "HOLD",
+                    "reason": "REJECT_PIN_RISK",
+                    "size": 0.0,
+                    "kelly_alloc": kelly_alloc,
+                    "vwap": target_price,
+                    "theoretical_edge_bps": theoretical_edge_bps
+                }
+
+        # 3. Market Desync / Staleness Check
+        if self.last_ask_updated_at > 0.0 and self.last_bid_updated_at > 0.0:
+            # Let quote age be the age of the side we are interacting with
+            quote_age = t_now - min(self.last_ask_updated_at, self.last_bid_updated_at)
+            
+            # If quote is stale (older than 100ms) and spot has walked too far
+            if quote_age > 0.100 and self.spot_history:
+                t_lookup = t_now - quote_age
+                closest_spot = min(self.spot_history, key=lambda x: abs(x[0] - t_lookup))[1]
+                delta_S = abs(context.spot_price - closest_spot)
+                
+                # Check normal diffusion expected moves
+                dt_years = quote_age / (365.25 * 24 * 3600.0)
+                z_score = self.config.risk.DESYNC_Z_SCORE
+                threshold_desync = max(z_score * context.spot_price * context.volatility * np.sqrt(dt_years), context.spot_price * 0.00005)
+                
+                if delta_S > threshold_desync:
+                    logger.warning(f"[STALENESS] Quote Stale (Age: {quote_age:.2f}s, dS: {delta_S:.2f} > th: {threshold_desync:.2f})")
+                    return {
+                        "side": "HOLD",
+                        "reason": "REJECT_DESYNC_STALENESS",
+                        "size": 0.0,
+                        "kelly_alloc": kelly_alloc,
+                        "vwap": target_price,
+                        "theoretical_edge_bps": theoretical_edge_bps
+                    }
+
+
+        # Calculate age of each side of the book for Probability of Fill (PoF) scaling
+        age_ask = t_now - self.last_ask_updated_at if self.last_ask_updated_at > 0.0 else 0.0
+        age_bid = t_now - self.last_bid_updated_at if self.last_bid_updated_at > 0.0 else 0.0
+
         # Convert Kelly weights to contract target holdings
         target_qty_yes = (target_w_yes * wealth) / p_ask_yes if p_ask_yes > 0.0 else 0.0
         target_qty_no = (target_w_no * wealth) / p_ask_no if p_ask_no > 0.0 else 0.0
@@ -245,8 +284,80 @@ class ExecutionEngine:
         abs_max_slippage = self.config.arbitrage.ABSOLUTE_MAX_SLIPPAGE_BPS
         
         # Check decisions:
-        # A. BUY YES INCREMENTAL
-        if target_qty_yes > qty_yes:
+        # A. SELL YES (Exiting excess YES positions)
+        if qty_yes > target_qty_yes and qty_yes > 0.0:
+            excess_yes = qty_yes - target_qty_yes
+            
+            # Selling YES means walking YES bids
+            edge_bps = (p_bid_yes - p_yes) * 10000.0
+            max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)
+            
+            qty_exec, vwap, slippage_bps = self.walk_order_book(
+                levels=context.bids_l2,
+                fair_price=p_yes,
+                max_kelly_qty=excess_yes,
+                max_slippage_bps=max_slippage_bps,
+                is_buy=False
+            )
+            
+            if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
+                ev = vwap - p_yes
+                pof = self._calculate_pof(context.tau_seconds, age_bid)
+                ev_adjusted = ev * pof
+                
+                if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
+                    limit_price = max(0.0, p_bid_yes * (1.0 - max_slippage_bps / 10000.0))
+                    return {
+                        "side": "SELL_YES",
+                        "size": qty_exec,
+                        "limit_price": limit_price,
+                        "vwap": vwap,
+                        "ev": ev,
+                        "expected_slippage_bps": slippage_bps,
+                        "kelly_alloc": kelly_alloc,
+                        "theoretical_edge_bps": theoretical_edge_bps
+                    }
+
+        # B. SELL NO (Exiting excess NO positions)
+        if qty_no > target_qty_no and qty_no > 0.0:
+            excess_no = qty_no - target_qty_no
+            
+            # Selling NO corresponds to matching asks YES in reverse pricing: (1.0 - p, q) sorted descending
+            derived_bids_no = sorted([(1.0 - ask_p, ask_q) for ask_p, ask_q in context.asks_l2], key=lambda x: x[0], reverse=True)
+            
+            edge_bps = ((1.0 - p_ask_yes) - p_no) * 10000.0
+            max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)
+            
+            qty_exec, vwap, slippage_bps = self.walk_order_book(
+                levels=derived_bids_no,
+                fair_price=p_no,
+                max_kelly_qty=excess_no,
+                max_slippage_bps=max_slippage_bps,
+                is_buy=False
+            )
+            
+            if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
+                ev = vwap - p_no
+                pof = self._calculate_pof(context.tau_seconds, age_ask)
+                ev_adjusted = ev * pof
+                
+                if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
+                    best_bid_no = 1.0 - p_ask_yes
+                    limit_price_no = max(0.0, best_bid_no * (1.0 - max_slippage_bps / 10000.0))
+                    limit_price = 1.0 - limit_price_no # In YES terms
+                    return {
+                        "side": "SELL_NO",
+                        "size": qty_exec,
+                        "limit_price": limit_price,
+                        "vwap": vwap,
+                        "ev": ev,
+                        "expected_slippage_bps": slippage_bps,
+                        "kelly_alloc": kelly_alloc,
+                        "theoretical_edge_bps": theoretical_edge_bps
+                    }
+
+        # C. BUY YES INCREMENTAL
+        if target_qty_yes > qty_yes and qty_no <= 0.001:
             dq_yes = target_qty_yes - qty_yes
             
             # Sizing limit caps
@@ -269,20 +380,24 @@ class ExecutionEngine:
             if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
                 ev = p_yes - vwap
                 # Apply fill probability EV scaling (PoF)
-                pof = self._calculate_pof(context.tau_seconds)
+                pof = self._calculate_pof(context.tau_seconds, age_ask)
                 ev_adjusted = ev * pof
                 
                 if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
+                    limit_price = min(1.0, p_ask_yes * (1.0 + max_slippage_bps / 10000.0))
                     return {
                         "side": "BUY_YES",
                         "size": qty_exec,
+                        "limit_price": limit_price,
                         "vwap": vwap,
                         "ev": ev,
-                        "expected_slippage_bps": slippage_bps
+                        "expected_slippage_bps": slippage_bps,
+                        "kelly_alloc": kelly_alloc,
+                        "theoretical_edge_bps": theoretical_edge_bps
                     }
 
-        # B. BUY NO INCREMENTAL
-        if target_qty_no > qty_no:
+        # D. BUY NO INCREMENTAL
+        if target_qty_no > qty_no and qty_yes <= 0.001:
             dq_no = target_qty_no - qty_no
             
             q_max_by_cap = max(0.0, (W - gas) / p_ask_no) if p_ask_no > 0.0 else 0.0
@@ -305,78 +420,40 @@ class ExecutionEngine:
             
             if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
                 ev = p_no - vwap
-                pof = self._calculate_pof(context.tau_seconds)
+                pof = self._calculate_pof(context.tau_seconds, age_bid)
                 ev_adjusted = ev * pof
                 
                 if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
+                    limit_price_no = min(1.0, p_ask_no * (1.0 + max_slippage_bps / 10000.0))
+                    limit_price = 1.0 - limit_price_no # In YES terms
                     return {
                         "side": "BUY_NO",
                         "size": qty_exec,
+                        "limit_price": limit_price,
                         "vwap": vwap,
                         "ev": ev,
-                        "expected_slippage_bps": slippage_bps
+                        "expected_slippage_bps": slippage_bps,
+                        "kelly_alloc": kelly_alloc,
+                        "theoretical_edge_bps": theoretical_edge_bps
                     }
 
-        # C. SELL YES (Exiting excess YES positions)
-        if qty_yes > target_qty_yes and qty_yes > 0.0:
-            excess_yes = qty_yes - target_qty_yes
-            
-            # Selling YES means walking YES bids
-            edge_bps = (p_bid_yes - p_yes) * 10000.0
-            max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)
-            
-            qty_exec, vwap, slippage_bps = self.walk_order_book(
-                levels=context.bids_l2,
-                fair_price=p_yes,
-                max_kelly_qty=excess_yes,
-                max_slippage_bps=max_slippage_bps,
-                is_buy=False
-            )
-            
-            if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
-                ev = vwap - p_yes
-                if ev >= self.config.arbitrage.MIN_EXPECTED_VALUE:
-                    return {
-                        "side": "SELL_YES",
-                        "size": qty_exec,
-                        "vwap": vwap,
-                        "ev": ev,
-                        "expected_slippage_bps": slippage_bps
-                    }
+        return {
+            "side": "HOLD",
+            "reason": "NO_EV_OR_SIZE_OPPORTUNITY",
+            "size": 0.0,
+            "kelly_alloc": kelly_alloc,
+            "vwap": target_price,
+            "theoretical_edge_bps": theoretical_edge_bps
+        }
 
-        # D. SELL NO (Exiting excess NO positions)
-        if qty_no > target_qty_no and qty_no > 0.0:
-            excess_no = qty_no - target_qty_no
-            
-            # Selling NO corresponds to matching asks YES in reverse pricing: (1.0 - p, q) sorted descending
-            derived_bids_no = sorted([(1.0 - ask_p, ask_q) for ask_p, ask_q in context.asks_l2], key=lambda x: x[0], reverse=True)
-            
-            edge_bps = ((1.0 - p_ask_yes) - p_no) * 10000.0
-            max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)
-            
-            qty_exec, vwap, slippage_bps = self.walk_order_book(
-                levels=derived_bids_no,
-                fair_price=p_no,
-                max_kelly_qty=excess_no,
-                max_slippage_bps=max_slippage_bps,
-                is_buy=False
-            )
-            
-            if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
-                ev = vwap - p_no
-                if ev >= self.config.arbitrage.MIN_EXPECTED_VALUE:
-                    return {
-                        "side": "SELL_NO",
-                        "size": qty_exec,
-                        "vwap": vwap,
-                        "ev": ev,
-                        "expected_slippage_bps": slippage_bps
-                    }
-
-        return {"side": "HOLD", "reason": "NO_EV_OR_SIZE_OPPORTUNITY", "size": 0.0}
-
-    def _calculate_pof(self, tau_seconds: float) -> float:
-        """Calculates fill probability based on remaining lifetime to prevent latency risk near expiration."""
+    def _calculate_pof(self, tau_seconds: float, quote_age: float = 0.0) -> float:
+        """Calculates fill probability based on remaining lifetime and quote age."""
         tau_lim = self.config.risk.POF_LATENCY_TAU
         k_decay = self.config.risk.POF_DECAY_K
-        return 1.0 / (1.0 + np.exp(-k_decay * (tau_seconds - tau_lim)))
+        pof_tau = 1.0 / (1.0 + np.exp(-k_decay * (tau_seconds - tau_lim)))
+        
+        # Penalize staleness: if a quote is old, it's less likely to be filled.
+        # Uses an exponential decay (e.g. e^(-1.0 * age))
+        pof_age = np.exp(-quote_age * 1.0)
+        
+        return float(pof_tau * pof_age)

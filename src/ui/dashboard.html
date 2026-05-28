@@ -24,14 +24,19 @@
 
     /* Scrollbars */
     ::-webkit-scrollbar {
-      width: 6px;
-      height: 6px;
+      width: 8px;
+      height: 8px;
     }
     ::-webkit-scrollbar-track {
       background: #000000;
     }
     ::-webkit-scrollbar-thumb {
-      background: #333333;
+      background: #444444;
+      border-radius: 4px;
+      transition: background 0.2s ease;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #777777;
     }
 
     /* ── LAYOUT ── */
@@ -223,7 +228,8 @@
     /* Logs view */
     .logs-box {
       font-size: 11px;
-      height: 120px;
+      flex: 1;
+      min-height: 180px;
       overflow-y: auto;
       background-color: #020202;
       border: 1px solid #222222;
@@ -392,7 +398,7 @@
       <div class="chart-container">
         <!-- Spot vs Strike -->
         <div class="panel chart-box">
-          <div class="panel-header">SPOT PRICE VS STRIKE (300 TICK CACHE)</div>
+          <div class="panel-header">SPOT PRICE VS STRIKE (RECENT HISTORY)</div>
           <canvas id="chart-price" height="150"></canvas>
         </div>
         <!-- Merton vs Market Implied -->
@@ -403,9 +409,9 @@
       </div>
 
       <!-- Execution Logs -->
-      <div class="panel">
+      <div class="panel" style="flex: 1; display: flex; flex-direction: column;">
         <div class="panel-header">REAL-TIME EXECUTION LOGS</div>
-        <div class="panel-body">
+        <div class="panel-body" style="display: flex; flex-direction: column; overflow: hidden;">
           <div class="logs-box" id="logs-box"></div>
         </div>
       </div>
@@ -496,7 +502,7 @@
   // ── STATE VARIABLES ──
   let ws = null;
   let history = { prices: [], strikes: [], pfairs: [], pmarkets: [], times: [] };
-  const MAX_HIST = 300;
+  const MAX_HIST = 120;
   let dataRange = { min_time: 0, max_time: 0 };
 
   // Cache target nodes for DOM efficiency (prevent querySelector lookup overhead)
@@ -643,9 +649,9 @@
     els.engSide.textContent = dec.side || 'HOLD';
     els.engSide.className = 'bold ' + (dec.side === 'BUY_YES' ? 'green' : dec.side === 'BUY_NO' ? 'red' : 'dim');
     
-    els.engKelly.textContent = dec.size ? (dec.size * 100).toFixed(2) + '%' : '—';
-    els.engVwap.textContent = dec.vwap ? dec.vwap.toFixed(3) : '—';
-    els.engMargin.textContent = dec.theoretical_edge_bps ? dec.theoretical_edge_bps.toFixed(1) + ' bps' : '—';
+    els.engKelly.textContent = (dec.kelly_alloc !== undefined && dec.kelly_alloc !== null) ? (dec.kelly_alloc * 100).toFixed(2) + '%' : '—';
+    els.engVwap.textContent = (dec.vwap !== undefined && dec.vwap !== null && dec.vwap !== 0) ? dec.vwap.toFixed(3) : '—';
+    els.engMargin.textContent = (dec.theoretical_edge_bps !== undefined && dec.theoretical_edge_bps !== null) ? dec.theoretical_edge_bps.toFixed(1) + ' bps' : '—';
     els.engReason.textContent = dec.reason || 'NO_SIGNAL';
     els.engQtyYes.textContent = state.pos_qty_yes ? state.pos_qty_yes.toFixed(1) : '0.0';
     els.engQtyNo.textContent = state.pos_qty_no ? state.pos_qty_no.toFixed(1) : '0.0';
@@ -945,6 +951,10 @@
     }
   }
 
+  function updateBacktestProgress(pct) {
+    els.progressBar.style.width = pct + '%';
+  }
+
   function drawBacktestChart(capHistory) {
     const canvas = document.getElementById('chart-backtest');
     const ctx = canvas.getContext('2d');
@@ -1002,6 +1012,14 @@
   }
 
   // ── CONSOLE LOG LISTENER ──
+  let isUserScrolling = false;
+  
+  els.logsBox.addEventListener('scroll', () => {
+    // If user is within 20px of the bottom, they are not manually scrolling up
+    const isBottom = els.logsBox.scrollHeight - els.logsBox.clientHeight <= Math.ceil(els.logsBox.scrollTop) + 20;
+    isUserScrolling = !isBottom;
+  });
+
   function addLog(type, msg) {
     const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
     const div = document.createElement('div');
@@ -1014,12 +1032,22 @@
     else if (type === 'system') color = '#888888';
 
     div.innerHTML = `<span class="log-time">${ts}</span><span style="color:${color}">${escapeHtml(msg)}</span>`;
-    els.logsBox.appendChild(div);
-    els.logsBox.scrollTop = els.logsBox.scrollHeight;
+    
+    // Prune oldest elements FIRST to ensure completely stable height and scroll position calculations
+    while (els.logsBox.childElementCount >= 250) {
+      const child = els.logsBox.firstChild;
+      const childHeight = child.offsetHeight || 15;
+      els.logsBox.removeChild(child);
+      if (isUserScrolling) {
+        els.logsBox.scrollTop -= childHeight;
+      }
+    }
 
-    // Prune oldest elements
-    while (els.logsBox.childElementCount > 50) {
-      els.logsBox.removeChild(els.logsBox.firstChild);
+    els.logsBox.appendChild(div);
+    
+    // Only auto-scroll if the user hasn't scrolled up
+    if (!isUserScrolling) {
+      els.logsBox.scrollTop = els.logsBox.scrollHeight;
     }
   }
 

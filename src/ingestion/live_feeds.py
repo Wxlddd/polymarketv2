@@ -92,7 +92,12 @@ class ChainlinkSpotFeed(ISpotFeed):
         while self._is_running:
             try:
                 logger.info(f"[{self.ticker} SpotFeed] Connecting to {self.wss_url}")
-                async with websockets.connect(self.wss_url) as ws:
+                async with websockets.connect(
+                    self.wss_url,
+                    open_timeout=10, 
+                    ping_interval=15, 
+                    ping_timeout=15
+                ) as ws:
                     self._is_connected = True
                     delay = base_delay  # Reset delay on success
                     
@@ -165,14 +170,6 @@ class ChainlinkSpotFeed(ISpotFeed):
             if ts >= target_timestamp:
                 return ts, val
 
-        # Fallback: if no tick found yet, return current price with wall-clock timestamp
-        if self._price is not None:
-            logger.warning(
-                f"[{self.ticker} SpotFeed] No tick >= {target_timestamp} found in cache. "
-                f"Using current price as fallback: {self._price}"
-            )
-            return target_timestamp, self._price
-
         return None
 
 
@@ -217,7 +214,12 @@ class ClobOrderBookFeed:
         while self._is_running:
             try:
                 logger.info(f"[CLOB Feed] Connecting to {self.wss_url}")
-                async with websockets.connect(self.wss_url) as ws:
+                async with websockets.connect(
+                    self.wss_url, 
+                    open_timeout=10, 
+                    ping_interval=15, 
+                    ping_timeout=15
+                ) as ws:
                     self._is_connected = True
                     delay = base_delay
                     

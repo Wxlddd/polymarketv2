@@ -19,12 +19,12 @@ from src.ui.web_server import WebServer
 
 # Configure core console logging
 handlers = [logging.FileHandler("system_run.log", encoding="utf-8")]
-if "--no-term" in sys.argv:
-    # Print clean info logs to console when Rich dashboard is disabled
+if "--term" in sys.argv:
+    log_level = logging.WARNING
+else:
+    # Print clean info logs to console by default (Web UI is primary)
     handlers.append(logging.StreamHandler(sys.stdout))
     log_level = logging.INFO
-else:
-    log_level = logging.WARNING
 
 logging.basicConfig(
     level=log_level,
@@ -102,22 +102,10 @@ class LiveOrchestrator:
         t_now = time.time()
         await self.market_manager.update_market_cycle(t_now)
         
-        # Check if started mid-cycle (rollover start is current_expiry - 300)
-        if self.market_manager.current_expiry is not None:
-            cycle_start_time = self.market_manager.current_expiry - 300
-            if t_now - cycle_start_time > 10.0:
-                self.waiting_for_first_rollover = True
-                self.strike_manager = None
-                self.log_message("info", "Ok, aspetto il prossimo ciclo...")
-            else:
-                self.waiting_for_first_rollover = False
-                self.strike_manager = StrikeManager(
-                    presumed_strike=self.market_manager.strike_price,
-                    expiration_timestamp=self.market_manager.current_expiry
-                )
-        else:
-            self.waiting_for_first_rollover = True
-            self.strike_manager = None
+        # CRITICAL USER REQUIREMENT: Always wait for the next cycle when started
+        self.waiting_for_first_rollover = True
+        self.strike_manager = None
+        self.log_message("info", "[Special Startup Procedure] Avvio speciale attivo: attendo che sorga il prossimo ciclo prima di procedere...")
         
         # 3. Start CLOB Order Book WebSocket Feed
         await self._restart_clob_feed()
@@ -125,6 +113,7 @@ class LiveOrchestrator:
         # 4. Start background loops
         self._tasks.append(asyncio.create_task(self._market_discovery_loop()))
         self._tasks.append(asyncio.create_task(self._strike_resolution_loop()))
+        self._tasks.append(asyncio.create_task(self._ui_heartbeat_loop()))
         
         # 4.5. Start Web Server
         if self.web_server:
@@ -133,7 +122,7 @@ class LiveOrchestrator:
             self._update_web_state()
         
         # 5. Start CLI Terminal UI Task
-        if "--no-term" not in sys.argv:
+        if "--term" in sys.argv:
             self._tasks.append(asyncio.create_task(
                 run_terminal_dashboard(
                     config=self.config,
@@ -148,7 +137,7 @@ class LiveOrchestrator:
                 )
             ))
         else:
-            self.log_message("warning", "Terminal Dashboard disabled via --no-term. Running in pure console/web server mode.")
+            self.log_message("warning", "Terminal Dashboard disabled by default (Web UI active). Run with --term to enable.")
         
         self.log_message("info", "Live Orchestrator initialized successfully.")
 
@@ -376,6 +365,11 @@ class LiveOrchestrator:
                         )
                     
         active_strike = self.strike_manager.get_strike(t_now, spot)
+        if active_strike is None or active_strike <= 0.0:
+            if t_now - getattr(self, "_last_strike_wait_log_time", 0.0) >= 10.0:
+                self._last_strike_wait_log_time = t_now
+                self.log_message("warning", "[StrikeManager] Lo strike non è ancora conosciuto. Il bot non trada, aspetta...")
+            return
         
         # Calculate time remaining
         tau_sec = max(0.0, self.market_manager.current_expiry - t_now)
@@ -475,7 +469,12 @@ class LiveOrchestrator:
                 price=decision["vwap"],
                 ev=decision["ev"],
                 expected_slippage_bps=decision["expected_slippage_bps"],
-                context_state={"timestamp": t_now, "strike_price": active_strike}
+                context_state={
+                    "timestamp": t_now, 
+                    "strike_price": active_strike,
+                    "volatility": vol,
+                    "limit_price": decision.get("limit_price", decision["vwap"])
+                }
             )
             
             # Immediately update the web state so that the UI shows the depleted shadow book
@@ -497,34 +496,55 @@ class LiveOrchestrator:
                         f"Slug: {self.market_manager.current_slug}"
                     )
                     
-                    # 1. Settle old positions at current spot price
+                    # 1. Settle old positions at the actual expiration time (e.g. 01:30:00) instead of 15s early
                     if self.strike_manager and self.spot_feed.price is not None:
-                        settle_spot = self.spot_feed.price
-                        settlement_strike = self.strike_manager.get_strike(t_now, settle_spot)
-                        self.client.settle_positions(
-                            settlement_price=settle_spot,
-                            strike_price=settlement_strike,
-                            timestamp=t_now
-                        )
-                        resolved_yes = settle_spot >= settlement_strike
-                        if self.web_server:
-                            self.web_server.broadcast_message({
-                                "type": "settlement_update",
-                                "settlement": {
-                                    "settle_spot": settle_spot,
-                                    "strike": settlement_strike,
-                                    "resolved_yes": resolved_yes
-                                }
-                            })
-                        self.log_message(
-                            "info",
-                            f"Settling old positions at Expiry. Spot: ${settle_spot:,.2f} | "
-                            f"Strike: ${settlement_strike:,.2f} | YES resolved as {'WON' if resolved_yes else 'LOST'}"
-                        )
+                        old_strike_manager = self.strike_manager
+                        old_expiry = old_strike_manager.expiration_timestamp
                         
-                    # 2. Reset StrikeManager for the new cycle
+                        async def settle_at_expiry(sm: StrikeManager, expiry_time: float):
+                            # Sleep until actual expiration time is reached
+                            delay = max(0.0, expiry_time - time.time())
+                            if delay > 0.0:
+                                await asyncio.sleep(delay)
+                            
+                            # Wait a brief moment for the tick at/after expiry to be registered
+                            await asyncio.sleep(1.0)
+                            
+                            settle_spot = self.spot_feed.price
+                            t_settle = time.time()
+                            
+                            # Resolve the final settlement price (first tick at/after expiry)
+                            settle_tick = self.spot_feed.get_first_tick_after(expiry_time)
+                            if settle_tick is not None:
+                                _, settle_spot = settle_tick
+                                
+                            settlement_strike = sm.get_strike(t_settle, settle_spot)
+                            self.client.settle_positions(
+                                settlement_price=settle_spot,
+                                strike_price=settlement_strike,
+                                timestamp=t_settle
+                            )
+                            resolved_yes = settle_spot >= settlement_strike
+                            if self.web_server:
+                                self.web_server.broadcast_message({
+                                    "type": "settlement_update",
+                                    "settlement": {
+                                        "settle_spot": settle_spot,
+                                        "strike": settlement_strike,
+                                        "resolved_yes": resolved_yes
+                                    }
+                                })
+                            self.log_message(
+                                "info",
+                                f"Settling old positions at Expiry. Spot: ${settle_spot:,.2f} | "
+                                f"Strike: ${settlement_strike:,.2f} | YES resolved as {'WON' if resolved_yes else 'LOST'}"
+                            )
+                            
+                        self._tasks.append(asyncio.create_task(settle_at_expiry(old_strike_manager, old_expiry)))
+                        
+                    # 2. Reset StrikeManager for the new cycle (force presumed_strike to 0.0 to resolve it only via the first spot tick)
                     self.strike_manager = StrikeManager(
-                        presumed_strike=self.market_manager.strike_price,
+                        presumed_strike=0.0,
                         expiration_timestamp=self.market_manager.current_expiry
                     )
                     self._smoothed_p_yes = None
@@ -544,7 +564,7 @@ class LiveOrchestrator:
                             if self.market_manager.yes_token_id and self.market_manager.no_token_id:
                                 if not self.strike_manager:
                                     self.strike_manager = StrikeManager(
-                                        presumed_strike=self.market_manager.strike_price,
+                                        presumed_strike=0.0,
                                         expiration_timestamp=self.market_manager.current_expiry
                                     )
                                 await self._restart_clob_feed()
@@ -592,6 +612,18 @@ class LiveOrchestrator:
                 logger.error(f"Error in strike resolution loop: {e}")
             await asyncio.sleep(0.5)
 
+
+    async def _ui_heartbeat_loop(self) -> None:
+        """Periodically pushes state to the Web UI even if no market ticks arrive, preventing UI freeze."""
+        while self.is_running:
+            try:
+                if self.web_server:
+                    self._update_web_state()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"UI heartbeat error: {e}")
+            await asyncio.sleep(0.33)
 
 async def main_async():
     config = SystemConfig()

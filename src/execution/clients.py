@@ -46,118 +46,187 @@ class MockExecutionClient(IExecutionClient):
     ) -> Dict[str, Any]:
         """
         Simulates HFT execution, performs bookkeeping, deducts shadow liquidity,
-        and logs outcomes immediately.
+        and logs outcomes immediately. Now implements True L2 walking, IOC behavior, 
+        and stochastic rejection.
         """
+        import random
+        import math
+
         gas = self.config.arbitrage.GAS_FEE_USD
         top_bid, top_ask = self.shadow_book.get_top_of_book()
         
-        # Get market reference price (best bid/ask before execution slippage)
-        p_market = price
-        if side == "BUY_YES":
-            p_market = top_ask[0] if top_ask else price
-        elif side == "BUY_NO":
-            p_market = (1.0 - top_bid[0]) if top_bid else price
-        elif side == "SELL_YES":
-            p_market = top_bid[0] if top_bid else price
-        elif side == "SELL_NO":
-            p_market = (1.0 - top_ask[0]) if top_ask else price
+        # 1. Stochastic Rejection
+        vol = context_state.get("volatility", self.config.merton.DEFAULT_SIGMA)
+        # Beta coefficients for logistic rejection:
+        # Base failure rate (approx 5% base -> logit -2.94)
+        beta_0 = -3.0
+        # Impact of size (e.g. 1000 contracts adds +1.0)
+        beta_1 = 0.001
+        # Impact of vol (e.g. vol of 1.0 adds +2.0)
+        beta_2 = 2.0
+        
+        logit = beta_0 + beta_1 * qty + beta_2 * vol
+        p_reject = 1.0 / (1.0 + math.exp(-logit))
+        
+        if random.random() < p_reject:
+            logger.warning(f"[MockClient] Trade rejected stochastically (P_reject={p_reject:.2f})")
+            return {"success": False, "reason": "STOCHASTIC_REJECTION"}
+
+        limit_price = context_state.get("limit_price", price)
+        
+        if side == "SELL_YES" and qty > self.positions["YES"]:
+            qty = self.positions["YES"]
+        elif side == "SELL_NO" and qty > self.positions["NO"]:
+            qty = self.positions["NO"]
             
-        # Calculate actual slippage relative to market reference
+        if qty <= 1e-9:
+            return {"success": False, "reason": "INSUFFICIENT_POSITION"}
+            
+        # 2. L2 Book Walking for Fills (IOC)
+        taker_fee_multiplier = self.config.arbitrage.TAKER_FEE_MULTIPLIER
+        filled_qty = 0.0
+        total_usd = 0.0
+        total_taker_fee = 0.0
+        remaining_qty = qty
+        
+        if side == "BUY_YES":
+            levels = self.shadow_book.get_sorted_asks()
+            for p, q in levels:
+                if p > limit_price:
+                    break
+                fill = min(remaining_qty, q)
+                filled_qty += fill
+                total_usd += fill * p
+                total_taker_fee += fill * taker_fee_multiplier * p * (1.0 - p)
+                remaining_qty -= fill
+                if remaining_qty <= 1e-9:
+                    break
+                    
+        elif side == "BUY_NO":
+            levels = self.shadow_book.get_sorted_bids()
+            for p, q in levels:
+                if p < limit_price:
+                    break
+                fill = min(remaining_qty, q)
+                filled_qty += fill
+                total_usd += fill * (1.0 - p)
+                total_taker_fee += fill * taker_fee_multiplier * p * (1.0 - p)
+                remaining_qty -= fill
+                if remaining_qty <= 1e-9:
+                    break
+                    
+        elif side == "SELL_YES":
+            levels = self.shadow_book.get_sorted_bids()
+            for p, q in levels:
+                if p < limit_price:
+                    break
+                fill = min(remaining_qty, q)
+                filled_qty += fill
+                total_usd += fill * p
+                total_taker_fee += fill * taker_fee_multiplier * p * (1.0 - p)
+                remaining_qty -= fill
+                if remaining_qty <= 1e-9:
+                    break
+                    
+        elif side == "SELL_NO":
+            levels = self.shadow_book.get_sorted_asks()
+            for p, q in levels:
+                if p > limit_price:
+                    break
+                fill = min(remaining_qty, q)
+                filled_qty += fill
+                total_usd += fill * (1.0 - p)
+                total_taker_fee += fill * taker_fee_multiplier * p * (1.0 - p)
+                remaining_qty -= fill
+                if remaining_qty <= 1e-9:
+                    break
+
+        vwap_exec = total_usd / filled_qty if filled_qty > 0 else 0.0
+        
+        if (filled_qty * vwap_exec) < 50.0:
+            logger.warning(f"[MockClient] IOC fill too small: {filled_qty:.2f} at ${vwap_exec:.4f}")
+            return {"success": False, "reason": "IOC_FILL_TOO_SMALL"}
+
+        # Get market reference price
+        p_market = limit_price
+        if side == "BUY_YES":
+            p_market = top_ask[0] if top_ask else limit_price
+        elif side == "BUY_NO":
+            p_market = (1.0 - top_bid[0]) if top_bid else limit_price
+        elif side == "SELL_YES":
+            p_market = top_bid[0] if top_bid else limit_price
+        elif side == "SELL_NO":
+            p_market = (1.0 - top_ask[0]) if top_ask else limit_price
+            
         realized_slippage_bps = 0.0
         if side in ["BUY_YES", "BUY_NO"]:
-            realized_slippage_bps = ((price - p_market) / p_market) * 10000.0 if p_market > 0.0 else 0.0
+            realized_slippage_bps = ((vwap_exec - p_market) / p_market) * 10000.0 if p_market > 0.0 else 0.0
         else:
-            realized_slippage_bps = ((p_market - price) / p_market) * 10000.0 if p_market > 0.0 else 0.0
+            realized_slippage_bps = ((p_market - vwap_exec) / p_market) * 10000.0 if p_market > 0.0 else 0.0
             
         realized_pnl = 0.0
-        total_usd = qty * price
-        
-        # Calculate dynamic taker fee: shares * 0.072 * p * (1 - p)
-        taker_fee_multiplier = self.config.arbitrage.TAKER_FEE_MULTIPLIER
-        taker_fee = qty * taker_fee_multiplier * price * (1.0 - price)
         
         # Bookkeeping based on trade side
         if side == "BUY_YES":
-            cost = total_usd + gas + taker_fee
+            cost = total_usd + gas + total_taker_fee
             if cost > self._cash_balance:
                 logger.warning(f"[MockClient] BUY_YES rejected: Insufficient cash balance. Needed ${cost:.2f}, Balance: ${self._cash_balance:.2f}")
                 return {"success": False, "reason": "INSUFFICIENT_FUNDS"}
             
-            # Deduct funds
             self._cash_balance -= cost
-            # Update YES positions
             cur_qty = self.positions["YES"]
-            new_qty = cur_qty + qty
+            new_qty = cur_qty + filled_qty
             if new_qty > 0.0:
-                self.entry_prices["YES"] = (self.entry_prices["YES"] * cur_qty + price * qty) / new_qty
+                self.entry_prices["YES"] = (self.entry_prices["YES"] * cur_qty + total_usd) / new_qty
             self.positions["YES"] = new_qty
-            
-            # Paper execution (BUY_YES depletes asks on the book)
-            self.shadow_book.paper_execute(price, qty, is_bid=False)
+            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=False)
             
         elif side == "BUY_NO":
-            cost = total_usd + gas + taker_fee
+            cost = total_usd + gas + total_taker_fee
             if cost > self._cash_balance:
                 logger.warning(f"[MockClient] BUY_NO rejected: Insufficient cash. Needed ${cost:.2f}")
                 return {"success": False, "reason": "INSUFFICIENT_FUNDS"}
                 
             self._cash_balance -= cost
             cur_qty = self.positions["NO"]
-            new_qty = cur_qty + qty
+            new_qty = cur_qty + filled_qty
             if new_qty > 0.0:
-                self.entry_prices["NO"] = (self.entry_prices["NO"] * cur_qty + price * qty) / new_qty
+                self.entry_prices["NO"] = (self.entry_prices["NO"] * cur_qty + total_usd) / new_qty
             self.positions["NO"] = new_qty
-            
-            # Paper execution (BUY_NO depletes YES bids at price 1.0 - price)
-            self.shadow_book.paper_execute(1.0 - price, qty, is_bid=True)
+            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=True)
             
         elif side == "SELL_YES":
-            if qty > self.positions["YES"]:
-                logger.warning(f"[MockClient] SELL_YES rejected: Selling size {qty} exceeds YES holdings {self.positions['YES']}")
-                return {"success": False, "reason": "INSUFFICIENT_POSITION"}
-                
-            revenue = total_usd - gas - taker_fee
+            revenue = total_usd - gas - total_taker_fee
             self._cash_balance += revenue
-            
-            # Calculate realized PnL
-            purchase_cost = qty * self.entry_prices["YES"]
+            purchase_cost = filled_qty * self.entry_prices["YES"]
             realized_pnl = revenue - purchase_cost
             
-            # Reduce YES positions
-            self.positions["YES"] -= qty
+            self.positions["YES"] -= filled_qty
             if self.positions["YES"] <= 1e-9:
                 self.positions["YES"] = 0.0
                 self.entry_prices["YES"] = 0.0
                 
-            # Paper execution (SELL_YES depletes bids on the book)
-            self.shadow_book.paper_execute(price, qty, is_bid=True)
+            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=True)
             
         elif side == "SELL_NO":
-            if qty > self.positions["NO"]:
-                logger.warning(f"[MockClient] SELL_NO rejected: Selling size {qty} exceeds NO holdings {self.positions['NO']}")
-                return {"success": False, "reason": "INSUFFICIENT_POSITION"}
-                
-            revenue = total_usd - gas - taker_fee
+            revenue = total_usd - gas - total_taker_fee
             self._cash_balance += revenue
-            
-            purchase_cost = qty * self.entry_prices["NO"]
+            purchase_cost = filled_qty * self.entry_prices["NO"]
             realized_pnl = revenue - purchase_cost
             
-            self.positions["NO"] -= qty
+            self.positions["NO"] -= filled_qty
             if self.positions["NO"] <= 1e-9:
                 self.positions["NO"] = 0.0
                 self.entry_prices["NO"] = 0.0
                 
-            # Paper execution (SELL_NO depletes asks on the book at price 1.0 - price)
-            self.shadow_book.paper_execute(1.0 - price, qty, is_bid=False)
+            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=False)
             
-        # Log trade event
         current_yes_price = p_market if "YES" in side else (1.0 - p_market)
         self.recorder.record_trade(
             timestamp=context_state.get("timestamp", time.time()),
             side=side,
-            qty=qty,
-            vwap=price,
+            qty=filled_qty,
+            vwap=vwap_exec,
             p_market=p_market,
             expected_slippage_bps=expected_slippage_bps,
             realized_slippage_bps=realized_slippage_bps,
@@ -169,7 +238,7 @@ class MockExecutionClient(IExecutionClient):
         )
         
         logger.info(
-            f"[MockClient] Executed {side} | Qty: {qty:.2f} | Avg Price: ${price:.4f} | "
+            f"[MockClient] Executed {side} | Qty: {filled_qty:.2f} | Avg Price: ${vwap_exec:.4f} | "
             f"Slippage: {realized_slippage_bps:.2f} bps | realized PnL: ${realized_pnl:+.2f} | "
             f"Cash: ${self._cash_balance:.2f}"
         )
@@ -177,8 +246,8 @@ class MockExecutionClient(IExecutionClient):
         return {
             "success": True,
             "side": side,
-            "qty": qty,
-            "price": price,
+            "qty": filled_qty,
+            "price": vwap_exec,
             "realized_slippage_bps": realized_slippage_bps,
             "pnl": realized_pnl
         }

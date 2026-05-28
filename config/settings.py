@@ -52,10 +52,10 @@ class ArbitrageConfig:
 class RiskConfig:
     """Risk management parameters."""
     DESYNC_Z_SCORE: float = field(default_factory=lambda: float(os.getenv("DESYNC_Z_SCORE", "2.0")))
-    POF_LATENCY_TAU: float = field(default_factory=lambda: float(os.getenv("POF_LATENCY_TAU", "15.0")))
+    POF_LATENCY_TAU: float = field(default_factory=lambda: float(os.getenv("POF_LATENCY_TAU", "3.0")))
     POF_DECAY_K: float = field(default_factory=lambda: float(os.getenv("POF_DECAY_K", "0.25")))
     ORACLE_NOISE_BPS: float = field(default_factory=lambda: float(os.getenv("ORACLE_NOISE_BPS", "1.5")))
-    PIN_RISK_SECONDS: float = field(default_factory=lambda: float(os.getenv("PIN_RISK_SECONDS", "5.0")))
+    PIN_RISK_SECONDS: float = field(default_factory=lambda: float(os.getenv("PIN_RISK_SECONDS", "3.0")))
     COOLDOWN_PERIOD_SEC: int = field(default_factory=lambda: int(os.getenv("COOLDOWN_PERIOD_SEC", "10")))
 
 @dataclass(frozen=True)

@@ -252,11 +252,18 @@ class WebServer:
                 
                 # Filter files overlapping with [start_time, end_time]
                 selected_files = []
+                last_ts = None
                 for i in range(len(files_with_ts)):
                     ts, file_path = files_with_ts[i]
                     next_ts = files_with_ts[i+1][0] if i + 1 < len(files_with_ts) else float('inf')
+                    
                     if ts <= end_time and next_ts >= start_time:
+                        # If there is a gap > 10 minutes between this file and the last one we included, we truncate the backtest here
+                        if last_ts is not None and (ts - last_ts > 600):
+                            logger.warning(f"Backtest data gap detected (>10m). Truncating contiguous window.")
+                            break
                         selected_files.append(file_path)
+                        last_ts = ts
                         
                 if not selected_files:
                     raise ValueError(f"No tick data files found covering the range {start_time} to {end_time}")

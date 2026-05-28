@@ -79,6 +79,7 @@ class BacktestRunner:
         total_ticks = len(df)
         capital_history = []
         trade_count = 0
+        pending_orders = []
         
         # Simulation Loop (Chronological ticks stream)
         for i in range(total_ticks):
@@ -118,6 +119,22 @@ class BacktestRunner:
             # 3. Update shadow order book proxy (reconciliation)
             shadow_book.update_book(bids_l2, asks_l2, is_snapshot=True)
             
+            # 3.5 Execute pending orders that have reached their execution time
+            ready_orders = [o for o in pending_orders if o["exec_time"] <= t]
+            pending_orders = [o for o in pending_orders if o["exec_time"] > t]
+            
+            # Sort by execution time to ensure chronological processing
+            for order in sorted(ready_orders, key=lambda x: x["exec_time"]):
+                decision = order["decision"]
+                await client.execute_trade(
+                    side=decision["side"],
+                    qty=decision["size"],
+                    price=decision.get("limit_price", decision["vwap"]),
+                    ev=decision["ev"],
+                    expected_slippage_bps=decision["expected_slippage_bps"],
+                    context_state=order["context_state"]
+                )
+            
             # 4. Construct Context & evaluate Option Fair Value
             active_strike = strike_manager.get_strike(t, spot)
             tau_sec = max(0.0, current_expiry - t)
@@ -140,34 +157,39 @@ class BacktestRunner:
             recorder.record_tick(t, spot, ofi, vol, bids_l2, asks_l2)
             
             # 6. Engine Decisions & routing execution
-            decision = engine.evaluate_and_trade(p_yes, context, client)
-            
-            if decision["side"] != "HOLD":
-                trade_count += 1
-                # Compute implied market price
-                top_b, top_a = shadow_book.get_top_of_book()
-                p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+            # Prevent spamming fragmented orders while waiting for latency delay
+            if not pending_orders:
+                decision = engine.evaluate_and_trade(p_yes, context, client)
                 
-                # Log Signal event
-                recorder.record_signal(
-                    timestamp=t,
-                    spot_price=spot,
-                    strike=active_strike,
-                    model_prob=p_yes,
-                    implied_prob=p_mkt,
-                    kelly_size=decision["size"],
-                    status=decision["side"]
-                )
-                
-                # Execute simulated trade
-                await client.execute_trade(
-                    side=decision["side"],
-                    qty=decision["size"],
-                    price=decision["vwap"],
-                    ev=decision["ev"],
-                    expected_slippage_bps=decision["expected_slippage_bps"],
-                    context_state={"timestamp": t, "strike_price": active_strike}
-                )
+                if decision["side"] != "HOLD":
+                    trade_count += 1
+                    # Compute implied market price
+                    top_b, top_a = shadow_book.get_top_of_book()
+                    p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+                    
+                    # Log Signal event
+                    recorder.record_signal(
+                        timestamp=t,
+                        spot_price=spot,
+                        strike=active_strike,
+                        model_prob=p_yes,
+                        implied_prob=p_mkt,
+                        kelly_size=decision["size"],
+                        status=decision["side"]
+                    )
+                    
+                    # Queue simulated trade with stochastic latency
+                    delay = np.random.uniform(0.150, 0.300)
+                    pending_orders.append({
+                        "exec_time": t + delay,
+                        "decision": decision,
+                        "context_state": {
+                            "timestamp": t,
+                            "strike_price": active_strike,
+                            "volatility": vol,
+                            "limit_price": decision.get("limit_price", decision["vwap"])
+                        }
+                    })
                 
             # Track current equity
             top_b, top_a = shadow_book.get_top_of_book()

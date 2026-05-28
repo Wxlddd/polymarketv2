@@ -18,7 +18,7 @@ class StrikeManager:
         self.expiration_timestamp = expiration_timestamp
         self.resolved_strike: Optional[float] = None
 
-    def get_strike(self, current_time: float, current_spot: float) -> float:
+    def get_strike(self, current_time: float, current_spot: float) -> Optional[float]:
         """
         Retrieves the strike price based on time and spot price ticks.
         """
@@ -28,14 +28,20 @@ class StrikeManager:
             
         # Check if expiration has been reached or crossed
         if current_time >= self.expiration_timestamp and self.expiration_timestamp > 0.0:
-            self.resolved_strike = current_spot
-            logger.info(
-                f"[StrikeManager] Rollover occurred. Locked final Price to Beat (Strike K) "
-                f"at spot tick: ${self.resolved_strike:,.2f} (Timestamp: {current_time})"
-            )
+            if self.presumed_strike is None or self.presumed_strike == 0.0:
+                self.resolved_strike = current_spot
+                logger.info(
+                    f"[StrikeManager] Rollover occurred. Locked final Price to Beat (Strike K) "
+                    f"at spot tick: ${self.resolved_strike:,.2f} (Timestamp: {current_time})"
+                )
+            else:
+                self.resolved_strike = self.presumed_strike
             return self.resolved_strike
             
         # Default fallback during active option trading
+        if self.presumed_strike is None or self.presumed_strike == 0.0:
+            return None
+            
         return self.presumed_strike
 
     def reset(self, new_presumed_strike: float, new_expiration_timestamp: float) -> None:
