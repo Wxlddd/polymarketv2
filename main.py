@@ -68,6 +68,17 @@ class LiveOrchestrator:
         # Time-based EMA state for p_yes smoothing.
         # Timestamp of the previous p_yes update, needed to compute dt for alpha.
         self._smoothed_p_yes_ts: float = 0.0
+
+        # ── Trade execution guard ─────────────────────────────────────────────
+        # asyncio.Lock: when held, it means a full signal→evaluate→execute
+        # cycle is currently in progress.  Any CLOB tick that arrives while the
+        # lock is held is dropped at the TOP of _clob_callback — before any
+        # evaluation, EMA update, or SIGNAL log.  This guarantees:
+        #   • No SIGNAL is ever emitted without a corresponding execution.
+        #   • No execution starts until the previous one is fully resolved.
+        #   • No artificial time-based cooldown needed.
+        self._execution_lock: asyncio.Lock = asyncio.Lock()
+        # ─────────────────────────────────────────────────────────────────────
         
         # Shared decision pointer for the UI Dashboard
         self.latest_decision_ref: List[Dict[str, Any]] = [
@@ -82,6 +93,7 @@ class LiveOrchestrator:
         self.clob_feed: Optional[ClobOrderBookFeed] = None
         self._tasks: List[asyncio.Task] = []
         self._stop_event = asyncio.Event()
+
 
     async def start(self) -> None:
         self.is_running = True
@@ -310,17 +322,24 @@ class LiveOrchestrator:
             logger.warning(message)
         elif level == "error":
             logger.error(message)
+        elif level == "settle":
+            # Settlement messages are info-level in the file log but get their
+            # own UI type so the dashboard can render them with a distinct colour.
+            logger.info(message)
 
         # 2. WebSocket broadcast if WebServer is running
         if self.web_server:
-            ui_type = "system"
-            if level in ("warning", "error"):
+            if level == "settle":
+                ui_type = "settle"
+            elif level in ("warning", "error"):
                 ui_type = "warning"
             elif "signal" in message.lower() or "executing" in message.lower():
                 ui_type = "trade"
             elif "settle" in message.lower():
                 ui_type = "settle"
-                
+            else:
+                ui_type = "system"
+
             self.web_server.broadcast_message({
                 "type": "log_message",
                 "log_type": ui_type,
@@ -331,15 +350,22 @@ class LiveOrchestrator:
         """Callback triggered on each CLOB Order book tick arrival."""
         if not self.is_running:
             return
-            
+
         t_now = time.time()
-        
+
         if self.waiting_for_first_rollover:
             if t_now - getattr(self, "_last_wait_log_time", 0.0) >= 15.0:
                 self._last_wait_log_time = t_now
                 self.log_message("info", "Ok, aspetto il prossimo ciclo...")
             return
-        
+
+        # ── Execution guard — drop tick silently if a trade cycle is in flight ──
+        # This is checked BEFORE any evaluation, EMA update, or SIGNAL log.
+        # A SIGNAL must never be emitted unless we are ready to act on it.
+        if self._execution_lock.locked():
+            return
+        # ────────────────────────────────────────────────────────────────────────
+
         # Periodic diagnostic warnings if we are missing critical feeds to proceed
         if self.spot_feed.price is None or self.strike_manager is None:
             if t_now - getattr(self, "_last_feed_warning_time", 0.0) >= 5.0:
@@ -364,7 +390,7 @@ class LiveOrchestrator:
                 self._last_snapshot_ts = t_now
 
         # Reconcile local shadow order book
-        ofi = self.shadow_book.update_book(bids, asks, is_snapshot)
+        ofi = self.shadow_book.update_book(bids, asks, is_snapshot, timestamp=t_now)
         
         # Resolve active Strike Price only after the cycle has actually started
         if self.strike_manager and (self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0):
@@ -433,78 +459,74 @@ class LiveOrchestrator:
         self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks)
         
         # Evaluate Trade Sizing and Execution
-        decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
-        self.latest_decision_ref[0] = decision
-        
-        # Get Implied Market price and Edge — use REAL market book (q_real), never depleted
-        top_b, top_a = self.shadow_book.get_market_top_of_book()
-        p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else None
-        edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
-        
-        # Throttled console logger for pure console mode
-        if t_now - getattr(self, "_last_console_log_time", 0.0) >= 2.0:
-            self._last_console_log_time = t_now
-            p_yes_str = f"{p_yes * 100:.2f}%" if p_yes is not None else "—"
-            p_mkt_str = f"{p_mkt * 100:.2f}%" if p_mkt is not None else "—"
-            edge_str = f"{edge * 100:+.2f}%" if edge is not None else "—"
-            msg = (
-                f"[TICK] Spot: ${spot:,.2f} | Strike: ${active_strike or 0.0:,.2f} | "
-                f"YES: {p_yes_str} | Market YES: {p_mkt_str} | Edge: {edge_str} | OFI: {ofi:+.1f}"
-            )
-            self.log_message("info", msg)
+        async with self._execution_lock:
+            decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
+            self.latest_decision_ref[0] = decision
             
-        # Update Web Server state payload (non-blocking)
-        if self.web_server:
-            self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
-            
-        if decision["side"] != "HOLD":
-            self.total_trades += 1
-            # Record strategy signal
+            # Get Implied Market price and Edge — use REAL market book (q_real), never depleted
             top_b, top_a = self.shadow_book.get_market_top_of_book()
-            p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+            p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else None
+            edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
             
-            self.recorder.record_signal(
-                timestamp=t_now,
-                spot_price=spot,
-                strike=active_strike,
-                model_prob=p_yes,
-                implied_prob=p_mkt,
-                kelly_size=decision["size"],
-                status=decision["side"]
-            )
-            
-            # Broadcast signal immediately to UI
-            if self.web_server:
-                self.web_server.broadcast_message({
-                    "type": "trade_signal",
-                    "signal": {
-                        "side": decision["side"],
-                        "size": decision["size"],
-                        "vwap": decision["vwap"],
-                        "ev": decision["ev"]
-                    }
-                })
-            self.log_message("info", f"Executing trade: {decision['side']} | Size: {decision['size']:.2f} | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}")
-            
-            # Execute trade synchronously (awaited) so shadow book is depleted
-            # BEFORE the next CLOB tick arrives — prevents duplicate signals.
-            await self.client.execute_trade(
-                side=decision["side"],
-                qty=decision["size"],
-                price=decision["vwap"],
-                ev=decision["ev"],
-                expected_slippage_bps=decision["expected_slippage_bps"],
-                context_state={
-                    "timestamp": t_now, 
-                    "strike_price": active_strike,
-                    "volatility": vol,
-                    "limit_price": decision.get("limit_price", decision["vwap"])
-                }
-            )
-            
-            # Immediately update the web state so that the UI shows the depleted shadow book
+            # Throttled console logger for pure console mode
+            if t_now - getattr(self, "_last_console_log_time", 0.0) >= 2.0:
+                self._last_console_log_time = t_now
+                p_yes_str = f"{p_yes * 100:.2f}%" if p_yes is not None else "—"
+                p_mkt_str = f"{p_mkt * 100:.2f}%" if p_mkt is not None else "—"
+                edge_str = f"{edge * 100:+.2f}%" if edge is not None else "—"
+                msg = (
+                    f"[TICK] Spot: ${spot:,.2f} | Strike: ${active_strike or 0.0:,.2f} | "
+                    f"YES: {p_yes_str} | Market YES: {p_mkt_str} | Edge: {edge_str} | OFI: {ofi:+.1f}"
+                )
+                self.log_message("info", msg)
+                
+            # Update Web Server state payload (non-blocking)
             if self.web_server:
                 self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
+                
+            if decision["side"] != "HOLD":
+                self.total_trades += 1
+
+                # Record strategy signal
+                top_b, top_a = self.shadow_book.get_market_top_of_book()
+                p_mkt_signal = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+
+                self.recorder.record_signal(
+                    timestamp=t_now,
+                    spot_price=spot,
+                    strike=active_strike,
+                    model_prob=p_yes,
+                    implied_prob=p_mkt_signal,
+                    kelly_size=decision["size"],
+                    status=decision["side"]
+                )
+
+                # Log SIGNAL — single source of truth
+                self.log_message(
+                    "info",
+                    f"SIGNAL: {decision['side']} | Size: {decision['size']:.2f}"
+                    f" | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}"
+                )
+
+                await self.client.execute_trade(
+                    side=decision["side"],
+                    qty=decision["size"],
+                    price=decision["vwap"],
+                    ev=decision["ev"],
+                    expected_slippage_bps=decision["expected_slippage_bps"],
+                    context_state={
+                        "timestamp": t_now,
+                        "strike_price": active_strike,
+                        "volatility": vol,
+                        "limit_price": decision.get("limit_price", decision["vwap"])
+                    }
+                )
+
+                # Update the web state immediately after the fill so the UI
+                # reflects the depleted shadow book before the next tick.
+                if self.web_server:
+                    self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
+
 
     async def _market_discovery_loop(self) -> None:
         """Periodically evaluates clock to trigger dynamic market Discovery and Rollovers."""
@@ -531,39 +553,101 @@ class LiveOrchestrator:
                             delay = max(0.0, expiry_time - time.time())
                             if delay > 0.0:
                                 await asyncio.sleep(delay)
-                            
-                            # Wait a brief moment for the tick at/after expiry to be registered
+
+                            # Wait a brief moment to ensure all Chainlink ticks
+                            # up to expiry_time have been received and stored.
                             await asyncio.sleep(1.0)
-                            
-                            settle_spot = self.spot_feed.price
+
                             t_settle = time.time()
-                            
-                            # Resolve the final settlement price (first tick at/after expiry)
-                            settle_tick = self.spot_feed.get_first_tick_after(expiry_time)
+
+                            # ── Settlement price: LAST oracle tick BEFORE expiry ──────────
+                            # get_last_tick_before() gives the final confirmed Chainlink
+                            # price of the expiring cycle, uncontaminated by the first tick
+                            # of the new cycle (which may already reflect the new round).
+                            settle_tick = self.spot_feed.get_last_tick_before(expiry_time)
                             if settle_tick is not None:
-                                _, settle_spot = settle_tick
-                                
+                                settle_ts, settle_spot = settle_tick
+                            else:
+                                # Fallback: first tick at/after expiry if nothing before is cached
+                                fallback = self.spot_feed.get_first_tick_after(expiry_time)
+                                if fallback is not None:
+                                    settle_ts, settle_spot = fallback
+                                else:
+                                    settle_spot = self.spot_feed.price or 0.0
+                                    settle_ts = t_settle
+
                             settlement_strike = sm.get_strike(t_settle, settle_spot)
-                            self.client.settle_positions(
+
+                            # ── Snapshot open positions BEFORE settle_positions() zeroes them ──
+                            qty_yes_open = self.client.positions.get("YES", 0.0)
+                            qty_no_open  = self.client.positions.get("NO",  0.0)
+                            entry_yes    = self.client.entry_prices.get("YES", 0.0)
+                            entry_no     = self.client.entry_prices.get("NO",  0.0)
+                            has_position = qty_yes_open > 0.0 or qty_no_open > 0.0
+
+                            # ── Execute settlement ────────────────────────────────────────────
+                            result = self.client.settle_positions(
                                 settlement_price=settle_spot,
                                 strike_price=settlement_strike,
                                 timestamp=t_settle
                             )
+
                             resolved_yes = settle_spot >= settlement_strike
+
+                            # ── Build rich log message ────────────────────────────────────────
+                            verdict = "YES WON ✓" if resolved_yes else "YES LOST ✗"
+                            sep = "─" * 56
+
+                            if has_position:
+                                lines = [
+                                    f"[SETTLEMENT] {sep}",
+                                    f"  Expiry Tick : ${settle_spot:>10,.2f}  (ts: {settle_ts:.0f})",
+                                    f"  Strike      : ${settlement_strike:>10,.2f}",
+                                    f"  Outcome     : {verdict}",
+                                ]
+                                if qty_yes_open > 0.0:
+                                    yes = result["yes"]
+                                    lines.append(
+                                        f"  YES pos     : {qty_yes_open:.2f} contracts @ entry ${entry_yes:.4f}"
+                                        f"  →  payoff ${yes['gross_payoff']:.2f}"
+                                        f"  |  PnL {'+' if yes['pnl']>=0 else ''}{yes['pnl']:.2f} USD"
+                                        f"  ({'WON ✓' if yes['won'] else 'LOST ✗'})"
+                                    )
+                                if qty_no_open > 0.0:
+                                    no = result["no"]
+                                    lines.append(
+                                        f"  NO  pos     : {qty_no_open:.2f} contracts @ entry ${entry_no:.4f}"
+                                        f"  →  payoff ${no['gross_payoff']:.2f}"
+                                        f"  |  PnL {'+' if no['pnl']>=0 else ''}{no['pnl']:.2f} USD"
+                                        f"  ({'WON ✓' if no['won'] else 'LOST ✗'})"
+                                    )
+                                lines += [
+                                    f"  Net PnL     : ${result['net_pnl']:>+10.2f} USD",
+                                    f"  Cash after  : ${self.client.cash_balance:>10.2f} USD",
+                                    f"[SETTLEMENT] {sep}",
+                                ]
+                                self.log_message("settle", "\n".join(lines))
+                            else:
+                                # No open positions — log a brief notice
+                                self.log_message(
+                                    "info",
+                                    f"[SETTLEMENT] Expiry tick ${settle_spot:,.2f} | Strike ${settlement_strike:,.2f}"
+                                    f" | {verdict} | No open positions."
+                                )
+
                             if self.web_server:
                                 self.web_server.broadcast_message({
                                     "type": "settlement_update",
                                     "settlement": {
                                         "settle_spot": settle_spot,
                                         "strike": settlement_strike,
-                                        "resolved_yes": resolved_yes
+                                        "resolved_yes": resolved_yes,
+                                        "net_pnl": result["net_pnl"],
+                                        "yes_qty": qty_yes_open,
+                                        "no_qty": qty_no_open,
                                     }
                                 })
-                            self.log_message(
-                                "info",
-                                f"Settling old positions at Expiry. Spot: ${settle_spot:,.2f} | "
-                                f"Strike: ${settlement_strike:,.2f} | YES resolved as {'WON' if resolved_yes else 'LOST'}"
-                            )
+
                             
                         self._tasks.append(asyncio.create_task(settle_at_expiry(old_strike_manager, old_expiry)))
                         

@@ -83,57 +83,69 @@ class MockExecutionClient(IExecutionClient):
             return {"success": False, "reason": "INSUFFICIENT_POSITION"}
             
         # 2. L2 Book Walking for Fills (IOC)
+        # level_fills records exact (price, qty) consumed at each level so that
+        # paper_execute can register them precisely in the ConsumptionTracker.
         taker_fee_multiplier = self.config.arbitrage.TAKER_FEE_MULTIPLIER
         filled_qty = 0.0
         total_usd = 0.0
         total_taker_fee = 0.0
         remaining_qty = qty
-        
+        level_fills: list = []   # List[Tuple[float, float]] — (price, qty)
+        exec_is_bid: bool = False  # True → consumed bid side
+
         if side == "BUY_YES":
+            exec_is_bid = False  # consuming asks
             levels = self.shadow_book.get_sorted_asks()
             for p, q in levels:
                 if p > limit_price:
                     break
                 fill = min(remaining_qty, q)
+                level_fills.append((p, fill))
                 filled_qty += fill
                 total_usd += fill * p
                 total_taker_fee += fill * taker_fee_multiplier * p * (1.0 - p)
                 remaining_qty -= fill
                 if remaining_qty <= 1e-9:
                     break
-                    
+
         elif side == "BUY_NO":
+            exec_is_bid = True  # consuming bids
             levels = self.shadow_book.get_sorted_bids()
             for p, q in levels:
                 if p < limit_price:
                     break
                 fill = min(remaining_qty, q)
+                level_fills.append((p, fill))
                 filled_qty += fill
                 total_usd += fill * (1.0 - p)
                 total_taker_fee += fill * taker_fee_multiplier * p * (1.0 - p)
                 remaining_qty -= fill
                 if remaining_qty <= 1e-9:
                     break
-                    
+
         elif side == "SELL_YES":
+            exec_is_bid = True  # consuming bids
             levels = self.shadow_book.get_sorted_bids()
             for p, q in levels:
                 if p < limit_price:
                     break
                 fill = min(remaining_qty, q)
+                level_fills.append((p, fill))
                 filled_qty += fill
                 total_usd += fill * p
                 total_taker_fee += fill * taker_fee_multiplier * p * (1.0 - p)
                 remaining_qty -= fill
                 if remaining_qty <= 1e-9:
                     break
-                    
+
         elif side == "SELL_NO":
+            exec_is_bid = False  # consuming asks
             levels = self.shadow_book.get_sorted_asks()
             for p, q in levels:
                 if p > limit_price:
                     break
                 fill = min(remaining_qty, q)
+                level_fills.append((p, fill))
                 filled_qty += fill
                 total_usd += fill * (1.0 - p)
                 total_taker_fee += fill * taker_fee_multiplier * p * (1.0 - p)
@@ -167,59 +179,60 @@ class MockExecutionClient(IExecutionClient):
         realized_pnl = 0.0
         
         # Bookkeeping based on trade side
+        exec_ts = context_state.get("timestamp", 0.0)
+
         if side == "BUY_YES":
             cost = total_usd + gas + total_taker_fee
             if cost > self._cash_balance:
                 logger.warning(f"[MockClient] BUY_YES rejected: Insufficient cash balance. Needed ${cost:.2f}, Balance: ${self._cash_balance:.2f}")
                 return {"success": False, "reason": "INSUFFICIENT_FUNDS"}
-            
+
             self._cash_balance -= cost
             cur_qty = self.positions["YES"]
             new_qty = cur_qty + filled_qty
             if new_qty > 0.0:
                 self.entry_prices["YES"] = (self.entry_prices["YES"] * cur_qty + total_usd) / new_qty
             self.positions["YES"] = new_qty
-            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=False)
-            
+            # Pass exact per-level fills to the ConsumptionTracker
+            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=exec_is_bid, fills=level_fills, timestamp=exec_ts)
+
         elif side == "BUY_NO":
             cost = total_usd + gas + total_taker_fee
             if cost > self._cash_balance:
                 logger.warning(f"[MockClient] BUY_NO rejected: Insufficient cash. Needed ${cost:.2f}")
                 return {"success": False, "reason": "INSUFFICIENT_FUNDS"}
-                
+
             self._cash_balance -= cost
             cur_qty = self.positions["NO"]
             new_qty = cur_qty + filled_qty
             if new_qty > 0.0:
                 self.entry_prices["NO"] = (self.entry_prices["NO"] * cur_qty + total_usd) / new_qty
             self.positions["NO"] = new_qty
-            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=True)
-            
+            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=exec_is_bid, fills=level_fills, timestamp=exec_ts)
+
         elif side == "SELL_YES":
             revenue = total_usd - gas - total_taker_fee
             self._cash_balance += revenue
             purchase_cost = filled_qty * self.entry_prices["YES"]
             realized_pnl = revenue - purchase_cost
-            
+
             self.positions["YES"] -= filled_qty
             if self.positions["YES"] <= 1e-9:
                 self.positions["YES"] = 0.0
                 self.entry_prices["YES"] = 0.0
-                
-            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=True)
-            
+            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=exec_is_bid, fills=level_fills, timestamp=exec_ts)
+
         elif side == "SELL_NO":
             revenue = total_usd - gas - total_taker_fee
             self._cash_balance += revenue
             purchase_cost = filled_qty * self.entry_prices["NO"]
             realized_pnl = revenue - purchase_cost
-            
+
             self.positions["NO"] -= filled_qty
             if self.positions["NO"] <= 1e-9:
                 self.positions["NO"] = 0.0
                 self.entry_prices["NO"] = 0.0
-                
-            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=False)
+            self.shadow_book.paper_execute(0.0, filled_qty, is_bid=exec_is_bid, fills=level_fills, timestamp=exec_ts)
             
         # Compute mid-price for consistent portfolio MTM, independent of which
         # side triggered the call.  Using the execution-side price (p_market) as the
@@ -273,27 +286,58 @@ class MockExecutionClient(IExecutionClient):
         val += self.positions["NO"] * (1.0 - current_yes_price)
         return val
 
-    def settle_positions(self, settlement_price: float, strike_price: float, timestamp: float) -> float:
+    def settle_positions(self, settlement_price: float, strike_price: float, timestamp: float) -> dict:
         """
         Settles all remaining holdings at expiration and resets contracts to zero.
-        Returns the net payout in USD.
+
+        Returns a dict with a full breakdown:
+        {
+            "total_payout": float,       # gross cash received
+            "net_pnl":      float,       # payout minus entry cost minus gas fees
+            "yes": {                     # None if no YES position was open
+                "qty": float,
+                "entry_price": float,
+                "payoff_per_contract": float,   # 1.0 or 0.0
+                "gross_payoff": float,
+                "cost_basis": float,
+                "pnl": float,
+                "won": bool
+            } | None,
+            "no": {                      # None if no NO position was open
+                ...same fields...
+            } | None,
+        }
         """
-        payout = 0.0
         gas = self.config.arbitrage.GAS_FEE_USD
-        
+        total_payout = 0.0
+        net_pnl = 0.0
+        yes_summary = None
+        no_summary = None
+
         # 1. Settle YES positions
         if self.positions["YES"] > 0.0:
             won = settlement_price > strike_price
             payoff_per_contract = 1.0 if won else 0.0
-            
+
             qty = self.positions["YES"]
-            total_payoff = qty * payoff_per_contract
-            purchase_cost = qty * self.entry_prices["YES"]
-            pnl = total_payoff - purchase_cost - gas
-            
-            self._cash_balance += total_payoff
-            payout += total_payoff
-            
+            gross_payoff = qty * payoff_per_contract
+            cost_basis = qty * self.entry_prices["YES"]
+            pnl = gross_payoff - cost_basis - gas
+
+            self._cash_balance += gross_payoff
+            total_payout += gross_payoff
+            net_pnl += pnl
+
+            yes_summary = {
+                "qty": qty,
+                "entry_price": self.entry_prices["YES"],
+                "payoff_per_contract": payoff_per_contract,
+                "gross_payoff": gross_payoff,
+                "cost_basis": cost_basis,
+                "pnl": pnl,
+                "won": won,
+            }
+
             self.recorder.record_trade(
                 timestamp=timestamp,
                 side="SETTLE_YES",
@@ -308,23 +352,33 @@ class MockExecutionClient(IExecutionClient):
                 pnl=pnl,
                 capital=self._cash_balance
             )
-            logger.info(f"[MockClient] Settled YES position. Qty: {qty} | Won: {won} | PnL: ${pnl:+.2f}")
             self.positions["YES"] = 0.0
             self.entry_prices["YES"] = 0.0
-            
+
         # 2. Settle NO positions
         if self.positions["NO"] > 0.0:
             won = settlement_price <= strike_price
             payoff_per_contract = 1.0 if won else 0.0
-            
+
             qty = self.positions["NO"]
-            total_payoff = qty * payoff_per_contract
-            purchase_cost = qty * self.entry_prices["NO"]
-            pnl = total_payoff - purchase_cost - gas
-            
-            self._cash_balance += total_payoff
-            payout += total_payoff
-            
+            gross_payoff = qty * payoff_per_contract
+            cost_basis = qty * self.entry_prices["NO"]
+            pnl = gross_payoff - cost_basis - gas
+
+            self._cash_balance += gross_payoff
+            total_payout += gross_payoff
+            net_pnl += pnl
+
+            no_summary = {
+                "qty": qty,
+                "entry_price": self.entry_prices["NO"],
+                "payoff_per_contract": payoff_per_contract,
+                "gross_payoff": gross_payoff,
+                "cost_basis": cost_basis,
+                "pnl": pnl,
+                "won": won,
+            }
+
             self.recorder.record_trade(
                 timestamp=timestamp,
                 side="SETTLE_NO",
@@ -339,8 +393,14 @@ class MockExecutionClient(IExecutionClient):
                 pnl=pnl,
                 capital=self._cash_balance
             )
-            logger.info(f"[MockClient] Settled NO position. Qty: {qty} | Won: {won} | PnL: ${pnl:+.2f}")
             self.positions["NO"] = 0.0
             self.entry_prices["NO"] = 0.0
-            
-        return payout
+
+        return {
+            "total_payout": total_payout,
+            "net_pnl": net_pnl,
+            "yes": yes_summary,
+            "no": no_summary,
+        }
+
+
