@@ -184,59 +184,95 @@ class GilPelaezIntegrator:
             return p_bs_analytical
 
 
+class OFILogitShifter:
+    """
+    Applies smoothed OFI as a bounded logit-space adjustment on top of the Merton
+    base probability, keeping order-flow signal strictly decoupled from the
+    diffusion/jump model.
+
+    Formula:
+        p_final = sigmoid( logit(p_merton) + β × ofi_z )
+
+    where ofi_z = smoothed_ofi / sqrt(EMA(ofi²)) is the dimensionless z-score.
+
+    Properties:
+    - p_final is always in (0, 1) by construction — OFI can never collapse it to 0/1.
+    - β calibrates sensitivity independently of market depth or contract size.
+      At p=0.5: β=0.5 and ofi_z=+1σ → p_final ≈ 0.62 (+12pp).
+    - z-score is clipped to ±3σ so max logit shift is ±3β, preventing tail spikes.
+    - Running variance is warm-started at the first observed ofi² to avoid a cold
+      zero-std phase that would divide by near-zero.
+    """
+
+    def __init__(self, beta: float, ema_alpha: float = 0.1):
+        self.beta = beta
+        self.ema_alpha = ema_alpha
+        self._ema_sq: float = 0.0
+        self._initialized: bool = False
+
+    def shift(self, p_merton: float, smoothed_ofi: float) -> float:
+        alpha = self.ema_alpha
+        ofi_sq = smoothed_ofi ** 2
+
+        if not self._initialized:
+            self._ema_sq = ofi_sq if ofi_sq > 1e-12 else 1.0
+            self._initialized = True
+        else:
+            self._ema_sq = alpha * ofi_sq + (1.0 - alpha) * self._ema_sq
+
+        ofi_std = np.sqrt(max(self._ema_sq, 1e-12))
+        ofi_z = float(np.clip(smoothed_ofi / ofi_std, -3.0, 3.0))
+
+        if p_merton <= 0.0 or p_merton >= 1.0:
+            return p_merton
+
+        logit_p = np.log(p_merton / (1.0 - p_merton))
+        return float(1.0 / (1.0 + np.exp(-(logit_p + self.beta * ofi_z))))
+
+
 class MertonStrategy(BaseStrategy):
     """
     Fourier Merton Jump-Diffusion Strategy.
-    Uses rolling Spot price ticks to calibrate volatility, and Order Flow Imbalance
-    (OFI) to estimate drift, pricing options via Gil-Pelaez inversion.
+
+    Merton + Gil-Pelaez prices the pure diffusion/jump component (μ=0).
+    OFI enters separately as a logit-space shift via OFILogitShifter, keeping
+    the two signals orthogonal and preventing annualization artifacts.
     """
-    
+
     def __init__(self, config):
         super().__init__(config)
         self.integrator = GilPelaezIntegrator()
         self.vol_calibrator = HighFrequencyVolatilityCalibrator(
             window_size=config.merton.VOL_ROLLING_WINDOW_SEC
         )
-        
-    def estimate_drift(self, ofi: float, tau_seconds: float, default_drift: float = 0.0) -> float:
-        """Scales Order Flow Imbalance (OFI) into an annualized short-term drift value, diluted over tau."""
-        micro_drift = ofi * self.config.merton.OFI_DRIFT_MULTIPLIER
-        # Annualize the drift for model compatibility
-        annualized_micro_drift = micro_drift * (365.25 * 24 * 3600.0)
-        
-        # Dilute the drift over the remaining option lifetime (tau) using OFI_HORIZON_SEC (dt)
-        dt = self.config.merton.OFI_HORIZON_SEC
-        if tau_seconds > 0.0:
-            dilution_factor = min(dt, tau_seconds) / tau_seconds
-        else:
-            dilution_factor = 1.0
-            
-        return default_drift + dilution_factor * (annualized_micro_drift - default_drift)
+        self.ofi_shifter = OFILogitShifter(
+            beta=config.merton.OFI_LOGIT_BETA,
+            ema_alpha=config.merton.OFI_NORM_EMA_ALPHA
+        )
+
+    def reset(self) -> None:
+        """Resets OFI variance normalization state on cycle rollover."""
+        self.ofi_shifter._ema_sq = 0.0
+        self.ofi_shifter._initialized = False
 
     def get_probability(self, context: MarketContext) -> Optional[float]:
-        # Enforce zero-assumptions rule: if strike price is None, cannot price option
         if context.strike_price is None:
             return None
-            
-        # Update realized volatility calibration with the latest spot tick
+
         self.vol_calibrator.add_tick(context.spot_price, context.timestamp)
-        
-        # Calculate parameters
         sigma = self.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
-        mu = self.estimate_drift(context.ofi, context.tau_seconds)
-        
-        # Run Fourier Gil-Pelaez solver
-        p_yes = self.integrator.calculate_probability(
+
+        # Merton runs with μ=0: drift contribution is purely from the logit shift below.
+        p_merton = self.integrator.calculate_probability(
             S_t=context.spot_price,
             K=context.strike_price,
             tau_seconds=context.tau_seconds,
-            mu=mu,
+            mu=0.0,
             sigma=sigma,
             lambda_=self.config.merton.DEFAULT_LAMBDA,
             mu_j=self.config.merton.DEFAULT_MU_J,
             sigma_j=self.config.merton.DEFAULT_SIGMA_J
         )
-        
-        # Apply standard HFT boundary capping [1%, 99%]
-        p_final = float(np.clip(p_yes, 0.01, 0.99))
-        return p_final
+
+        p_final = self.ofi_shifter.shift(p_merton, context.ofi)
+        return float(np.clip(p_final, 0.01, 0.99))

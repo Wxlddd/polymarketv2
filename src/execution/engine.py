@@ -18,12 +18,12 @@ class ExecutionEngine:
     def __init__(self, config: SystemConfig):
         self.config = config
         self.spot_history: List[Tuple[float, float]] = []  # (timestamp, price)
-        
+
         # Staleness track memory
         self.last_bid_price: Optional[float] = None
         self.last_bid_qty: Optional[float] = None
         self.last_bid_updated_at: float = 0.0
-        
+
         self.last_ask_price: Optional[float] = None
         self.last_ask_qty: Optional[float] = None
         self.last_ask_updated_at: float = 0.0
@@ -124,8 +124,13 @@ class ExecutionEngine:
                 "vwap": 0.0,
                 "theoretical_edge_bps": 0.0
             }
+
+        # 1.6. Block trading if the order book has no executable levels on either side
+        if not context.bids_l2 or not context.asks_l2:
+            return {"side": "HOLD", "reason": "NO_BOOK_DATA", "size": 0.0}
             
         t_now = context.timestamp
+
         self.spot_history.append((t_now, context.spot_price))
         # Keep spot history pruned to 60s
         self.spot_history = [x for x in self.spot_history if x[0] >= t_now - 60.0]
@@ -302,8 +307,10 @@ class ExecutionEngine:
             
             if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
                 ev = vwap - p_yes
+                per_unit_fee = self.config.arbitrage.TAKER_FEE_MULTIPLIER * vwap * (1.0 - vwap)
+                ev_net = ev - per_unit_fee
                 pof = self._calculate_pof(context.tau_seconds, age_bid)
-                ev_adjusted = ev * pof
+                ev_adjusted = ev_net * pof
                 
                 if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
                     limit_price = max(0.0, p_bid_yes * (1.0 - max_slippage_bps / 10000.0))
@@ -338,8 +345,10 @@ class ExecutionEngine:
             
             if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
                 ev = vwap - p_no
+                per_unit_fee = self.config.arbitrage.TAKER_FEE_MULTIPLIER * vwap * (1.0 - vwap)
+                ev_net = ev - per_unit_fee
                 pof = self._calculate_pof(context.tau_seconds, age_ask)
-                ev_adjusted = ev * pof
+                ev_adjusted = ev_net * pof
                 
                 if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
                     best_bid_no = 1.0 - p_ask_yes
@@ -379,9 +388,12 @@ class ExecutionEngine:
             
             if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
                 ev = p_yes - vwap
+                # Subtract the dynamic taker fee per unit from the EV gate.
+                per_unit_fee = self.config.arbitrage.TAKER_FEE_MULTIPLIER * vwap * (1.0 - vwap)
+                ev_net = ev - per_unit_fee
                 # Apply fill probability EV scaling (PoF)
                 pof = self._calculate_pof(context.tau_seconds, age_ask)
-                ev_adjusted = ev * pof
+                ev_adjusted = ev_net * pof
                 
                 if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
                     limit_price = min(1.0, p_ask_yes * (1.0 + max_slippage_bps / 10000.0))
@@ -420,8 +432,10 @@ class ExecutionEngine:
             
             if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
                 ev = p_no - vwap
+                per_unit_fee = self.config.arbitrage.TAKER_FEE_MULTIPLIER * vwap * (1.0 - vwap)
+                ev_net = ev - per_unit_fee
                 pof = self._calculate_pof(context.tau_seconds, age_bid)
-                ev_adjusted = ev * pof
+                ev_adjusted = ev_net * pof
                 
                 if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
                     limit_price_no = min(1.0, p_ask_no * (1.0 + max_slippage_bps / 10000.0))

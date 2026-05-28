@@ -66,16 +66,27 @@ class BacktestRunner:
         # Expiry tracker variables
         current_expiry: Optional[int] = None
         strike_manager: Optional[StrikeManager] = None
-        
+
+        # Shadow book: only the first tick of each 5-min cycle is a full snapshot.
+        # Subsequent ticks are delta updates so that paper_execute depletions persist
+        # across ticks.  Resetting to is_snapshot=True on every tick was the primary
+        # cause of infinite-liquidity fills in the old backtest.
+        cycle_snapshot_sent: bool = False
+
+        # Time-based EMA for p_yes — mirrors the live orchestrator but uses actual
+        # tick timestamps so the smoothing is rate-independent.
+        p_yes_ema: Optional[float] = None
+        p_yes_ema_ts: float = 0.0
+
         # Parse data column arrays for fast iteration
         timestamps = df["timestamp"].to_numpy()
         spot_prices = df["spot_price"].to_numpy()
         ofis = df["ofi"].to_numpy() if "ofi" in df.columns else np.zeros(len(df))
         vols = df["volatility"].to_numpy() if "volatility" in df.columns else np.full(len(df), self.config.merton.DEFAULT_SIGMA)
-        
+
         bids_l2_raw = df["bids_l2"].to_list()
         asks_l2_raw = df["asks_l2"].to_list()
-        
+
         total_ticks = len(df)
         capital_history = []
         trade_count = 0
@@ -89,7 +100,7 @@ class BacktestRunner:
             spot = float(spot_prices[i])
             ofi = float(ofis[i])
             vol = float(vols[i])
-            
+
             # Parse L2 book updates (JSON string check)
             try:
                 bids_l2 = json.loads(bids_l2_raw[i]) if isinstance(bids_l2_raw[i], str) else bids_l2_raw[i]
@@ -97,27 +108,36 @@ class BacktestRunner:
             except Exception:
                 bids_l2 = []
                 asks_l2 = []
-                
+
             bids_l2 = [(float(p), float(q)) for p, q in bids_l2]
             asks_l2 = [(float(p), float(q)) for p, q in asks_l2]
-            
+
             # 2. Rollover boundary checks
             if current_expiry is None or t >= current_expiry:
                 if current_expiry is not None and strike_manager is not None:
                     # Settle active positions using the rollover spot price
                     settlement_strike = strike_manager.get_strike(t, spot)
                     client.settle_positions(settlement_price=spot, strike_price=settlement_strike, timestamp=t)
-                
+
                 # Roll to next 5-minute cycle expiration
                 current_expiry = int(t) - (int(t) % 300) + 300
                 # First tick price serves as the new cycle's strike K (ATM)
                 strike_manager = StrikeManager(presumed_strike=spot, expiration_timestamp=current_expiry)
-                # Capture the tick to resolve the strike immediately
                 strike_manager.get_strike(t, spot)
                 logger.info(f"[BacktestRunner] Rollover to cycle expiration: {current_expiry} | Strike K: ${spot:,.2f}")
+                
+                # New cycle → force a full snapshot for the shadow book and reset EMA
+                cycle_snapshot_sent = False
+                p_yes_ema = None
+                p_yes_ema_ts = 0.0
+                strategy.reset()
             
-            # 3. Update shadow order book proxy (reconciliation)
-            shadow_book.update_book(bids_l2, asks_l2, is_snapshot=True)
+            # 3. Update shadow order book proxy.
+            # First tick of each cycle: full snapshot (clears stale residuals from old cycle).
+            # Subsequent ticks: delta updates so paper_execute depletions are preserved.
+            is_snap = not cycle_snapshot_sent
+            shadow_book.update_book(bids_l2, asks_l2, is_snapshot=is_snap)
+            cycle_snapshot_sent = True
             
             # 3.5 Execute pending orders that have reached their execution time
             ready_orders = [o for o in pending_orders if o["exec_time"] <= t]
@@ -138,7 +158,7 @@ class BacktestRunner:
             # 4. Construct Context & evaluate Option Fair Value
             active_strike = strike_manager.get_strike(t, spot)
             tau_sec = max(0.0, current_expiry - t)
-            
+
             context = MarketContext(
                 timestamp=t,
                 spot_price=spot,
@@ -149,13 +169,29 @@ class BacktestRunner:
                 bids_l2=shadow_book.get_sorted_bids(),
                 asks_l2=shadow_book.get_sorted_asks()
             )
-            
+
             # Merton pricing solver
-            p_yes = strategy.get_probability(context)
-            
+            p_yes_raw = strategy.get_probability(context)
+
+            # Time-based EMA on p_yes — same logic as the live orchestrator.
+            # Prevents raw OFI oscillations from generating a trade signal every tick.
+            if p_yes_raw is not None:
+                if p_yes_ema is None:
+                    p_yes_ema = p_yes_raw
+                    p_yes_ema_ts = t
+                else:
+                    halflife = self.config.merton.EMA_HALFLIFE_SEC
+                    dt_ema = t - p_yes_ema_ts
+                    alpha = 1.0 - (2.718281828 ** (-dt_ema / halflife)) if halflife > 0.0 else 1.0
+                    p_yes_ema = alpha * p_yes_raw + (1.0 - alpha) * p_yes_ema
+                    p_yes_ema_ts = t
+                p_yes = p_yes_ema
+            else:
+                p_yes = None
+
             # 5. Record Tick update in Parquet buffer
             recorder.record_tick(t, spot, ofi, vol, bids_l2, asks_l2)
-            
+
             # 6. Engine Decisions & routing execution
             # Prevent spamming fragmented orders while waiting for latency delay
             if not pending_orders:
@@ -163,8 +199,8 @@ class BacktestRunner:
                 
                 if decision["side"] != "HOLD":
                     trade_count += 1
-                    # Compute implied market price
-                    top_b, top_a = shadow_book.get_top_of_book()
+                    # Compute implied market price from the REAL book (not shadow)
+                    top_b, top_a = shadow_book.get_market_top_of_book()
                     p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
                     
                     # Log Signal event
@@ -191,9 +227,14 @@ class BacktestRunner:
                         }
                     })
                 
-            # Track current equity
-            top_b, top_a = shadow_book.get_top_of_book()
-            ref_yes_price = top_b[0] if top_b else 0.5
+            # Track current equity using mid-price from REAL book for consistent MTM
+            top_b, top_a = shadow_book.get_market_top_of_book()
+            if top_b and top_a:
+                ref_yes_price = 0.5 * (top_b[0] + top_a[0])
+            elif top_b:
+                ref_yes_price = top_b[0]
+            else:
+                ref_yes_price = 0.5
             equity = client.cash_balance + client.get_portfolio_value(ref_yes_price)
             capital_history.append(equity)
             
@@ -202,11 +243,10 @@ class BacktestRunner:
         
         # Settle any remaining positions at simulation end
         if current_expiry is not None and strike_manager is not None:
-            last_spot = spot_prices[-1]
-            last_time = timestamps[-1]
+            last_spot = float(spot_prices[-1])
+            last_time = float(timestamps[-1])
             settlement_strike = strike_manager.get_strike(last_time, last_spot)
             client.settle_positions(settlement_price=last_spot, strike_price=settlement_strike, timestamp=last_time)
-            # Record final equity
             capital_history.append(client.cash_balance)
             recorder.flush()
  

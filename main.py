@@ -62,6 +62,12 @@ class LiveOrchestrator:
         self.waiting_for_first_rollover = False
         self.total_trades = 0
         self._last_console_log_time = 0.0
+        # Minimum interval (seconds) between full shadow-book resets to prevent
+        # CLOB reconnect bursts from triggering multiple independent snapshot fills.
+        self._last_snapshot_ts: float = 0.0
+        # Time-based EMA state for p_yes smoothing.
+        # Timestamp of the previous p_yes update, needed to compute dt for alpha.
+        self._smoothed_p_yes_ts: float = 0.0
         
         # Shared decision pointer for the UI Dashboard
         self.latest_decision_ref: List[Dict[str, Any]] = [
@@ -347,6 +353,16 @@ class LiveOrchestrator:
             
         spot = self.spot_feed.price
         
+        # Deduplicate rapid-fire CLOB snapshot bursts (reconnect storms).
+        # Multiple book_snapshot events within 1s each reset q_shadow to full
+        # liquidity, letting the engine fire identical trades 6× in 85ms.
+        # Downgrade subsequent snapshots to delta updates within the 1s window.
+        if is_snapshot:
+            if t_now - self._last_snapshot_ts < 1.0:
+                is_snapshot = False
+            else:
+                self._last_snapshot_ts = t_now
+
         # Reconcile local shadow order book
         ofi = self.shadow_book.update_book(bids, asks, is_snapshot)
         
@@ -393,13 +409,22 @@ class LiveOrchestrator:
         # Calculate Merton probability
         p_yes_raw = self.strategy.get_probability(context)
         
-        # Apply EMA smoothing to p_yes — alpha=0.05 gives ~30s memory at 1 tick/s
+        # Apply time-based EMA smoothing to p_yes.
+        # A fixed alpha (e.g. 0.05) was designed for 1 tick/s but CLOB delivers
+        # 10-20 ticks/s, compressing the effective smoothing window from ~30s to
+        # ~2-5s and letting raw OFI oscillations pass through almost unattenuated.
+        # Time-based formula: alpha = 1 - exp(-dt / T_half) ensures consistent
+        # smoothing regardless of tick rate.
         if p_yes_raw is not None:
             if not hasattr(self, "_smoothed_p_yes") or self._smoothed_p_yes is None:
                 self._smoothed_p_yes = p_yes_raw
+                self._smoothed_p_yes_ts = t_now
             else:
-                alpha = 0.05
+                halflife = self.config.merton.EMA_HALFLIFE_SEC
+                dt_ema = t_now - self._smoothed_p_yes_ts
+                alpha = 1.0 - (2.718281828 ** (-dt_ema / halflife)) if halflife > 0.0 else 1.0
                 self._smoothed_p_yes = alpha * p_yes_raw + (1.0 - alpha) * self._smoothed_p_yes
+                self._smoothed_p_yes_ts = t_now
             p_yes = self._smoothed_p_yes
         else:
             p_yes = None
@@ -548,7 +573,9 @@ class LiveOrchestrator:
                         expiration_timestamp=self.market_manager.current_expiry
                     )
                     self._smoothed_p_yes = None
-                    
+                    self._smoothed_p_yes_ts = 0.0
+                    self.strategy.reset()
+
                     # 3. Restart CLOB feed to subscribe to new tokens
                     await self._restart_clob_feed()
                     
