@@ -47,10 +47,17 @@ class MockExecutionClient(IExecutionClient):
         """
         Simulates HFT execution, performs bookkeeping, deducts shadow liquidity,
         and logs outcomes immediately. Now implements True L2 walking, IOC behavior, 
-        and stochastic rejection.
+        stochastic rejection, and simulated network latency.
         """
         import random
         import math
+        import asyncio
+
+        # Simulate network round-trip time and exchange processing latency (150ms - 300ms)
+        # This is critical for the queue logic in main.py to correctly block
+        # new signals from being evaluated while an order is in flight.
+        latency = random.uniform(0.150, 0.300)
+        await asyncio.sleep(latency)
 
         gas = self.config.arbitrage.GAS_FEE_USD
         top_bid, top_ask = self.shadow_book.get_top_of_book()

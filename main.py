@@ -69,15 +69,10 @@ class LiveOrchestrator:
         # Timestamp of the previous p_yes update, needed to compute dt for alpha.
         self._smoothed_p_yes_ts: float = 0.0
 
-        # ── Trade execution guard ─────────────────────────────────────────────
-        # asyncio.Lock: when held, it means a full signal→evaluate→execute
-        # cycle is currently in progress.  Any CLOB tick that arrives while the
-        # lock is held is dropped at the TOP of _clob_callback — before any
-        # evaluation, EMA update, or SIGNAL log.  This guarantees:
-        #   • No SIGNAL is ever emitted without a corresponding execution.
-        #   • No execution starts until the previous one is fully resolved.
-        #   • No artificial time-based cooldown needed.
-        self._execution_lock: asyncio.Lock = asyncio.Lock()
+        # ── Strict Trade Queue ────────────────────────────────────────────────
+        # Tracks the currently inflight trade execution.
+        # No new signals will be evaluated until this task completes.
+        self._pending_trade_task: Optional[asyncio.Task] = None
         # ─────────────────────────────────────────────────────────────────────
         
         # Shared decision pointer for the UI Dashboard
@@ -463,96 +458,101 @@ class LiveOrchestrator:
         # Record tick in Parquet database
         self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks)
         
-        # Evaluate Trade Sizing and Execution
-        async with self._execution_lock:
-            # Apply a strict 1.0-second cooldown between trades to prevent rapid-fire 
-            # spamming when liquidity replenishes instantly in paper-trading.
-            if t_now - getattr(self, "_last_trade_exec_ts", 0.0) < 1.0:
-                return
-
-            decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
-            self.latest_decision_ref[0] = decision
+        # ── Strict Execution Queue ──
+        # Do not evaluate new signals if a trade is currently inflight.
+        # This prevents spamming and correctly simulates network wait times
+        # before considering the order book updated.
+        if self._pending_trade_task is not None and not self._pending_trade_task.done():
+            return
             
-            # Get Implied Market price and Edge — use REAL market book (q_real), never depleted
+        decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
+        self.latest_decision_ref[0] = decision
+        
+        # Get Implied Market price and Edge — use REAL market book (q_real), never depleted
+        top_b, top_a = self.shadow_book.get_market_top_of_book()
+        p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else None
+        edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
+        
+        # Throttled console logger for pure console mode
+        if t_now - getattr(self, "_last_console_log_time", 0.0) >= 2.0:
+            self._last_console_log_time = t_now
+            p_yes_str = f"{p_yes * 100:.2f}%" if p_yes is not None else "—"
+            p_mkt_str = f"{p_mkt * 100:.2f}%" if p_mkt is not None else "—"
+            edge_str = f"{edge * 100:+.2f}%" if edge is not None else "—"
+            msg = (
+                f"[TICK] Spot: ${spot:,.2f} | Strike: ${active_strike or 0.0:,.2f} | "
+                f"YES: {p_yes_str} | Market YES: {p_mkt_str} | Edge: {edge_str} | OFI: {ofi:+.1f}"
+            )
+            self.log_message("info", msg)
+            
+        # Update Web Server state payload (non-blocking)
+        if self.web_server:
+            self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
+            
+        if decision["side"] != "HOLD":
+            self.total_trades += 1
+
+            # Record strategy signal
             top_b, top_a = self.shadow_book.get_market_top_of_book()
-            p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else None
-            edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
+            p_mkt_signal = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+
+            self.recorder.record_signal(
+                timestamp=t_now,
+                spot_price=spot,
+                strike=active_strike,
+                model_prob=p_yes,
+                implied_prob=p_mkt_signal,
+                kelly_size=decision["size"],
+                status=decision["side"]
+            )
+
+            # Log SIGNAL — single source of truth
+            self.log_message(
+                "info",
+                f"SIGNAL: {decision['side']} | Size: {decision['size']:.2f}"
+                f" | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}"
+            )
+
+            # Dispatch the execution to background queue
+            self._pending_trade_task = asyncio.create_task(
+                self._execute_trade_async(
+                    decision, spot, active_strike, ofi, vol, tau_sec, p_yes, t_now
+                )
+            )
+
+    async def _execute_trade_async(self, decision, spot, active_strike, ofi, vol, tau_sec, p_yes, t_signal):
+        """Background task that executes the trade and updates the UI afterward."""
+        try:
+            result = await self.client.execute_trade(
+                side=decision["side"],
+                qty=decision["size"],
+                price=decision["vwap"],
+                ev=decision["ev"],
+                expected_slippage_bps=decision["expected_slippage_bps"],
+                context_state={
+                    "timestamp": t_signal,
+                    "strike_price": active_strike,
+                    "volatility": vol,
+                    "limit_price": decision.get("limit_price", decision["vwap"])
+                }
+            )
             
-            # Throttled console logger for pure console mode
-            if t_now - getattr(self, "_last_console_log_time", 0.0) >= 2.0:
-                self._last_console_log_time = t_now
-                p_yes_str = f"{p_yes * 100:.2f}%" if p_yes is not None else "—"
-                p_mkt_str = f"{p_mkt * 100:.2f}%" if p_mkt is not None else "—"
-                edge_str = f"{edge * 100:+.2f}%" if edge is not None else "—"
-                msg = (
-                    f"[TICK] Spot: ${spot:,.2f} | Strike: ${active_strike or 0.0:,.2f} | "
-                    f"YES: {p_yes_str} | Market YES: {p_mkt_str} | Edge: {edge_str} | OFI: {ofi:+.1f}"
-                )
-                self.log_message("info", msg)
-                
-            # Update Web Server state payload (non-blocking)
-            if self.web_server:
-                self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
-                
-            if decision["side"] != "HOLD":
-                self.total_trades += 1
-
-                # Record strategy signal
-                top_b, top_a = self.shadow_book.get_market_top_of_book()
-                p_mkt_signal = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
-
-                self.recorder.record_signal(
-                    timestamp=t_now,
-                    spot_price=spot,
-                    strike=active_strike,
-                    model_prob=p_yes,
-                    implied_prob=p_mkt_signal,
-                    kelly_size=decision["size"],
-                    status=decision["side"]
-                )
-
-                # Log SIGNAL — single source of truth
+            if result.get("success"):
                 self.log_message(
                     "info",
-                    f"SIGNAL: {decision['side']} | Size: {decision['size']:.2f}"
-                    f" | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}"
+                    f"EXECUTED {result['side']} | Qty: {result['qty']:.2f} | Price: ${result['price']:.4f} "
+                    f"| PnL: ${result['pnl']:+.2f}"
+                )
+            else:
+                self.log_message(
+                    "warning", 
+                    f"TRADE REJECTED: {result.get('reason')}"
                 )
 
-                result = await self.client.execute_trade(
-                    side=decision["side"],
-                    qty=decision["size"],
-                    price=decision["vwap"],
-                    ev=decision["ev"],
-                    expected_slippage_bps=decision["expected_slippage_bps"],
-                    context_state={
-                        "timestamp": t_now,
-                        "strike_price": active_strike,
-                        "volatility": vol,
-                        "limit_price": decision.get("limit_price", decision["vwap"])
-                    }
-                )
-                
-                # Apply cooldown timestamp on any trade attempt
-                self._last_trade_exec_ts = t_now
-                
-                # Log execution result dynamically so it shows in the UI and console
-                if result.get("success"):
-                    self.log_message(
-                        "info",
-                        f"EXECUTED {result['side']} | Qty: {result['qty']:.2f} | Price: ${result['price']:.4f} "
-                        f"| PnL: ${result['pnl']:+.2f}"
-                    )
-                else:
-                    self.log_message(
-                        "warning", 
-                        f"TRADE REJECTED: {result.get('reason')}"
-                    )
-
-                # Update the web state immediately after the fill so the UI
-                # reflects the depleted shadow book before the next tick.
-                if self.web_server:
-                    self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
-
+            if self.web_server:
+                self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
+        except Exception as e:
+            self.log_message("error", f"Error during trade execution: {e}")
 
     async def _market_discovery_loop(self) -> None:
         """Periodically evaluates clock to trigger dynamic market Discovery and Rollovers."""
