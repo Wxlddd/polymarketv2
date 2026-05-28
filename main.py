@@ -446,7 +446,12 @@ class LiveOrchestrator:
                 self._smoothed_p_yes = p_yes_raw
                 self._smoothed_p_yes_ts = t_now
             else:
-                halflife = self.config.merton.EMA_HALFLIFE_SEC
+                base_halflife = self.config.merton.EMA_HALFLIFE_SEC
+                # Dynamically compress halflife as expiration approaches to prevent lag
+                # from keeping the probability stuck at ~0.50 when market collapses to 0/1.
+                # e.g., at tau=30s, halflife is at most 3.0s; at tau=5s, it is 0.5s.
+                halflife = min(base_halflife, max(0.1, tau_sec / 10.0))
+                
                 dt_ema = t_now - self._smoothed_p_yes_ts
                 alpha = 1.0 - (2.718281828 ** (-dt_ema / halflife)) if halflife > 0.0 else 1.0
                 self._smoothed_p_yes = alpha * p_yes_raw + (1.0 - alpha) * self._smoothed_p_yes

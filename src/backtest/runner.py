@@ -136,7 +136,7 @@ class BacktestRunner:
             # First tick of each cycle: full snapshot (clears stale residuals from old cycle).
             # Subsequent ticks: delta updates so paper_execute depletions are preserved.
             is_snap = not cycle_snapshot_sent
-            shadow_book.update_book(bids_l2, asks_l2, is_snapshot=is_snap)
+            shadow_book.update_book(bids_l2, asks_l2, is_snapshot=is_snap, timestamp=t)
             cycle_snapshot_sent = True
             
             # 3.5 Execute pending orders that have reached their execution time
@@ -180,7 +180,9 @@ class BacktestRunner:
                     p_yes_ema = p_yes_raw
                     p_yes_ema_ts = t
                 else:
-                    halflife = self.config.merton.EMA_HALFLIFE_SEC
+                    base_halflife = self.config.merton.EMA_HALFLIFE_SEC
+                    halflife = min(base_halflife, max(0.1, context.tau_seconds / 10.0))
+                    
                     dt_ema = t - p_yes_ema_ts
                     alpha = 1.0 - (2.718281828 ** (-dt_ema / halflife)) if halflife > 0.0 else 1.0
                     p_yes_ema = alpha * p_yes_raw + (1.0 - alpha) * p_yes_ema
