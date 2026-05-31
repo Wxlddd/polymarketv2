@@ -125,17 +125,20 @@ class DataRecorder(IDataRecorder):
         status: str
     ) -> None:
         """Immediately appends strategy signals to CSV for human-readable inspection."""
-        with open(self.signals_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                float(timestamp), 
-                float(spot_price), 
-                float(strike), 
-                float(model_prob), 
-                float(implied_prob), 
-                float(kelly_size), 
-                str(status)
-            ])
+        try:
+            with open(self.signals_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    float(timestamp), 
+                    float(spot_price), 
+                    float(strike), 
+                    float(model_prob), 
+                    float(implied_prob), 
+                    float(kelly_size), 
+                    str(status)
+                ])
+        except Exception as e:
+            print(f"[DataRecorder Error] Failed to write signal to CSV: {e}")
 
     def record_trade(
         self, 
@@ -153,22 +156,25 @@ class DataRecorder(IDataRecorder):
         capital: float
     ) -> None:
         """Immediately appends trade outcomes to CSV for human-readable inspection."""
-        with open(self.trades_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                float(timestamp), 
-                str(side), 
-                float(qty), 
-                float(vwap), 
-                float(p_market), 
-                float(expected_slippage_bps), 
-                float(realized_slippage_bps), 
-                float(ev), 
-                float(strike), 
-                bool(resolved_won), 
-                float(pnl), 
-                float(capital)
-            ])
+        try:
+            with open(self.trades_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    float(timestamp), 
+                    str(side), 
+                    float(qty), 
+                    float(vwap), 
+                    float(p_market), 
+                    float(expected_slippage_bps), 
+                    float(realized_slippage_bps), 
+                    float(ev), 
+                    float(strike), 
+                    bool(resolved_won), 
+                    float(pnl), 
+                    float(capital)
+                ])
+        except Exception as e:
+            print(f"[DataRecorder Error] Failed to write trade to CSV: {e}")
 
     def _flush_ticks_to_parquet(self) -> None:
         """Writes buffered ticks into a compressed Parquet database file using Polars."""
@@ -185,16 +191,29 @@ class DataRecorder(IDataRecorder):
             })
             
             if os.path.exists(self.ticks_path):
-                existing_df = pl.read_parquet(self.ticks_path)
-                combined_df = pl.concat([existing_df, new_df])
+                try:
+                    existing_df = pl.read_parquet(self.ticks_path)
+                    combined_df = pl.concat([existing_df, new_df])
+                    combined_df.write_parquet(self.ticks_path, compression="zstd")
+                except Exception as e:
+                    # If reading or writing the main file fails (e.g. file lock on Windows),
+                    # write to a new 'recovery' chunk to avoid losing data and prevent 
+                    # the buffer from growing indefinitely.
+                    ts_suffix = int(time.time() * 1000)
+                    recovery_path = self.ticks_path.replace(".parquet", f"_rec_{ts_suffix}.parquet")
+                    print(f"[DataRecorder Warning] Main Parquet lock/error, using recovery: {recovery_path} ({e})")
+                    new_df.write_parquet(recovery_path, compression="zstd")
             else:
-                combined_df = new_df
+                new_df.write_parquet(self.ticks_path, compression="zstd")
                 
-            combined_df.write_parquet(self.ticks_path, compression="zstd")
             self.tick_buffer.clear()
         except Exception as e:
-            # Print to stdout/stderr in case logging handlers are not fully configured
-            print(f"[DataRecorder Error] Failed to write Parquet log: {e}")
+            # Critical failure (e.g. OOM or Schema error in DataFrame creation)
+            print(f"[DataRecorder Error] CRITICAL failure to write Parquet log: {e}")
+            # Clear buffer if it gets too large to prevent memory leak
+            if len(self.tick_buffer) > self.buffer_size * 5:
+                print(f"[DataRecorder Error] Tick buffer cleared due to persistent failures to save memory.")
+                self.tick_buffer.clear()
 
     def flush(self) -> None:
         """Forces all buffered records to disk."""

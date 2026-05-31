@@ -48,7 +48,7 @@ class LiveOrchestrator:
             base_log_dir=config.LOG_DIR,
             strategy_name="merton",
             run_id=f"live_{int(time.time())}",
-            buffer_size=100  # Flush every 100 ticks for quick logging
+            buffer_size=1000  # Flush every 1000 ticks to reduce IO pressure
         )
         
         # Initialize strategy & execution
@@ -357,7 +357,7 @@ class LiveOrchestrator:
         # ── Execution guard — drop tick silently if a trade cycle is in flight ──
         # This is checked BEFORE any evaluation, EMA update, or SIGNAL log.
         # A SIGNAL must never be emitted unless we are ready to act on it.
-        if self._execution_lock.locked():
+        if self._pending_trade_task is not None and not self._pending_trade_task.done():
             return
         # ────────────────────────────────────────────────────────────────────────
 

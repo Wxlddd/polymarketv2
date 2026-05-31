@@ -34,17 +34,34 @@ def get_overlapping_files(data_dir: str, start_time: float, end_time: float):
         pattern = os.path.join(data_dir, "**", ext)
         for file_path in glob.glob(pattern, recursive=True):
             basename = os.path.basename(file_path)
+            # Try to extract timestamp from filename (e.g. ticks_rec_1716892345.parquet or tick_data_1779562304.parquet)
+            ts = None
             try:
-                ts = float(basename.split("_")[-1].split(".")[0])
+                # Try last part before extension
+                parts = basename.split(".")[0].split("_")
+                ts = float(parts[-1])
+            except (ValueError, IndexError):
+                # Fallback: Try to extract from parent directory name (e.g. live_1779837496/)
+                parent_dir = os.path.basename(os.path.dirname(file_path))
+                if "_" in parent_dir:
+                    try:
+                        ts = float(parent_dir.split("_")[-1])
+                    except ValueError:
+                        pass
+            
+            if ts is not None:
                 files_with_ts.append((ts, file_path))
-            except Exception:
-                pass
+                
     files_with_ts.sort(key=lambda x: x[0])
     
     selected_files = []
     for i in range(len(files_with_ts)):
         ts, file_path = files_with_ts[i]
+        # Use next file's timestamp as the upper bound for this file's coverage
         next_ts = files_with_ts[i+1][0] if i + 1 < len(files_with_ts) else float('inf')
+        
+        # If the file's start time is before our window's end, AND it might contain 
+        # data after our window's start, include it.
         if ts <= end_time and next_ts >= start_time:
             selected_files.append(file_path)
     return selected_files

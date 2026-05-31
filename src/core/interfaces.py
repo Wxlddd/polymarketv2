@@ -37,7 +37,7 @@ class IOrderBook(ABC):
     """Abstract interface for managing order book state (real or shadow)."""
 
     @abstractmethod
-    def update_book(self, bid_updates: List[Tuple[float, float]], ask_updates: List[Tuple[float, float]], is_snapshot: bool = False) -> float:
+    def update_book(self, bid_updates: List[Tuple[float, float]], ask_updates: List[Tuple[float, float]], is_snapshot: bool = False, timestamp: float = 0.0) -> float:
         """Updates internal levels and returns the computed OFI."""
         pass
 

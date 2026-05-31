@@ -172,6 +172,23 @@ class ChainlinkSpotFeed(ISpotFeed):
 
         return None
 
+    def get_last_tick_before(self, target_timestamp: float) -> Optional[Tuple[float, float]]:
+        """
+        Retrieves the (timestamp, price) of the LAST Chainlink tick whose payload timestamp
+        is strictly < target_timestamp.
+
+        This is the preferred settlement price: the final confirmed oracle price
+        of the expiring cycle, uncontaminated by the first tick of the new cycle.
+        Falls back to get_first_tick_after() if no tick exists before the boundary.
+        """
+        result: Optional[Tuple[float, float]] = None
+        for ts, val in self.ticks:
+            if ts < target_timestamp:
+                result = (ts, val)
+            else:
+                break  # ticks are sorted ascending, no need to scan further
+        return result
+
 
 class ClobOrderBookFeed:
     """

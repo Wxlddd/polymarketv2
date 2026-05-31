@@ -28,16 +28,33 @@ class BacktestRunner:
         self.config = config
 
     def load_ticks_file(self, file_path: str) -> pl.DataFrame:
-        """Loads historical ticks from a CSV or Parquet file using Polars."""
+        """Loads historical ticks from a CSV or Parquet file (or directory of parquets) using Polars."""
         logger.info(f"[BacktestRunner] Loading tick logs from: {file_path}")
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Ticks database not found: {file_path}")
             
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext == ".parquet":
-            df = pl.read_parquet(file_path)
+        if os.path.isdir(file_path):
+            # Load all parquet files in directory (handles chunked/recovery files)
+            import glob
+            files = glob.glob(os.path.join(file_path, "*.parquet"))
+            if not files:
+                raise FileNotFoundError(f"No parquet files found in directory: {file_path}")
+            logger.info(f"[BacktestRunner] Found {len(files)} parquet files in directory. Merging...")
+            dfs = []
+            for f in files:
+                try:
+                    dfs.append(pl.read_parquet(f))
+                except Exception as e:
+                    logger.warning(f"[BacktestRunner] Failed to read {f}: {e}")
+            if not dfs:
+                 raise ValueError(f"Failed to load any valid parquet files from {file_path}")
+            df = pl.concat(dfs)
         else:
-            df = pl.read_csv(file_path)
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == ".parquet":
+                df = pl.read_parquet(file_path)
+            else:
+                df = pl.read_csv(file_path)
             
         df = df.sort("timestamp")
         logger.info(f"[BacktestRunner] Successfully loaded {len(df)} historical ticks.")

@@ -111,6 +111,7 @@
       background: #000000;
       display: flex;
       flex-direction: column;
+      min-height: 0; /* Critical: allows grid to constrain panel height */
     }
     .panel-header {
       background-color: #111111;
@@ -228,8 +229,7 @@
     /* Logs view */
     .logs-box {
       font-size: 11px;
-      flex: 1;
-      min-height: 180px;
+      height: 100%;
       overflow-y: auto;
       background-color: #020202;
       border: 1px solid #222222;
@@ -409,9 +409,9 @@
       </div>
 
       <!-- Execution Logs -->
-      <div class="panel" style="flex: 1; display: flex; flex-direction: column;">
+      <div class="panel">
         <div class="panel-header">REAL-TIME EXECUTION LOGS</div>
-        <div class="panel-body" style="display: flex; flex-direction: column; overflow: hidden;">
+        <div class="panel-body" style="overflow: hidden; padding: 4px;">
           <div class="logs-box" id="logs-box"></div>
         </div>
       </div>
@@ -573,8 +573,8 @@
           // Process state update in animation frame for rendering performance
           requestAnimationFrame(() => renderState(msg));
         } else if (msg.type === 'trade_signal') {
-          const s = msg.signal;
-          addLog('trade', `SIGNAL: ${s.side} | Size: ${s.size} | VWAP: ${s.vwap} | EV: ${s.ev.toFixed(4)}`);
+          // trade_signal is used to update stats panels only.
+          // The "SIGNAL:" log line is already written by Python's log_message.
         } else if (msg.type === 'settlement_update') {
           const se = msg.settlement;
           addLog('settle', `SETTLEMENT: Settle Spot: $${se.settle_spot} | Strike: $${se.strike} | YES=${se.resolved_yes}`);
