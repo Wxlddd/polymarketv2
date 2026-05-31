@@ -85,45 +85,199 @@ class HighFrequencyVolatilityCalibrator:
         return float(np.clip(sigma_est, 0.15, 3.0))
 
 
-class MertonCharacteristicFunction:
+def update_bivariate_hawkes_intensities(
+    prev_lambda_plus: float,
+    prev_lambda_minus: float,
+    lambda_0: float,
+    kappa_self: float,
+    kappa_cross: float,
+    beta: float,
+    dt: float,
+    ofi_shock_plus: float,
+    ofi_shock_minus: float
+) -> Tuple[float, float]:
     """
-    Computes the characteristic function for the Merton Jump-Diffusion (MJD) model.
+    Computes recursive updates for a symmetric bivariate Hawkes intensity process
+    with cross-excitation. Designed for high performance and potential C++ export.
+    """
+    decay_factor = np.exp(-beta * dt)
+    excess_plus = (prev_lambda_plus - lambda_0) * decay_factor
+    excess_minus = (prev_lambda_minus - lambda_0) * decay_factor
+    
+    next_lambda_plus = lambda_0 + excess_plus + kappa_self * ofi_shock_plus + kappa_cross * ofi_shock_minus
+    next_lambda_minus = lambda_0 + excess_minus + kappa_self * ofi_shock_minus + kappa_cross * ofi_shock_plus
+    
+    return next_lambda_plus, next_lambda_minus
+
+
+class MicrostructuralState:
+    """
+    Manages and updates the microstructural state vector [lambda_plus, lambda_minus, mu]
+    tick-by-tick based on Order Flow Imbalance (OFI) and time elapsed.
+    Uses a coupled symmetric bivariate Hawkes process for cross-excitation.
+    """
+    
+    def __init__(self, lambda_0: float):
+        self.lambda_0 = lambda_0
+        self.last_timestamp: float = 0.0
+        self.lambda_plus: float = lambda_0
+        self.lambda_minus: float = lambda_0
+        self.mu: float = 0.0
+        self._stationarity_checked: bool = False
+        self._cached_kappa_self: float = 0.0
+        self._cached_kappa_cross: float = 0.0
+        
+    def reset(self) -> None:
+        """Resets intensities and drift back to baseline values."""
+        self.last_timestamp = 0.0
+        self.lambda_plus = self.lambda_0
+        self.lambda_minus = self.lambda_0
+        self.mu = 0.0
+        
+    def update_state(
+        self,
+        timestamp: float,
+        ofi: float,
+        kappa_self: float,
+        kappa_cross: float,
+        beta: float,
+        ofi_multiplier: float,
+        use_local_drift: bool,
+        r: float = 0.0
+    ) -> None:
+        """
+        Updates the stochastic intensities and drift on each price/CLOB tick using Bivariate Hawkes.
+        """
+        # Validate Hawkes stationarity on the first tick (avoiding high-frequency tick log spam)
+        if not self._stationarity_checked:
+            total_kappa = kappa_self + kappa_cross
+            if total_kappa >= beta:
+                target_total = 0.8 * beta
+                scale_factor = target_total / total_kappa
+                scaled_self = kappa_self * scale_factor
+                scaled_cross = kappa_cross * scale_factor
+                logger.warning(
+                    f"Hawkes Branching Ratio is explosive (spectral radius = {total_kappa / beta:.2f} >= 1.0)! "
+                    f"Applying mathematical safety guard: automatically scaled "
+                    f"KAPPA_SELF to {scaled_self:.4f} and KAPPA_CROSS to {scaled_cross:.4f} "
+                    f"to force stability (spectral radius = 0.8)."
+                )
+                kappa_self = scaled_self
+                kappa_cross = scaled_cross
+            self._stationarity_checked = True
+            self._cached_kappa_self = kappa_self
+            self._cached_kappa_cross = kappa_cross
+        else:
+            # Use cached (potentially scaled) values
+            kappa_self = self._cached_kappa_self
+            kappa_cross = self._cached_kappa_cross
+
+        if self.last_timestamp == 0.0:
+            # Initialization tick
+            self.last_timestamp = timestamp
+            self.lambda_plus = self.lambda_0
+            self.lambda_minus = self.lambda_0
+            self.mu = r
+            return
+            
+        dt = timestamp - self.last_timestamp
+        
+        # If time went backwards (e.g. due to backtesting clock jitter or duplicate ticks), cap dt at 0.0
+        if dt < 0.0:
+            dt = 0.0
+            
+        # Split OFI pressure into positive and negative shocks
+        ofi_shock_plus = max(ofi, 0.0)
+        ofi_shock_minus = max(-ofi, 0.0)
+        
+        # Coupled Bivariate Hawkes updates
+        self.lambda_plus, self.lambda_minus = update_bivariate_hawkes_intensities(
+            prev_lambda_plus=self.lambda_plus,
+            prev_lambda_minus=self.lambda_minus,
+            lambda_0=self.lambda_0,
+            kappa_self=kappa_self,
+            kappa_cross=kappa_cross,
+            beta=beta,
+            dt=dt,
+            ofi_shock_plus=ofi_shock_plus,
+            ofi_shock_minus=ofi_shock_minus
+        )
+        
+        # Enforce mathematical lower bounds on intensities to prevent zero/negative values
+        self.lambda_plus = max(1e-9, self.lambda_plus)
+        self.lambda_minus = max(1e-9, self.lambda_minus)
+        
+        # Update diffusive drift component
+        if use_local_drift:
+            self.mu = r + ofi_multiplier * ofi
+        else:
+            self.mu = r
+            
+        # Update timestamp for next tick
+        self.last_timestamp = timestamp
+
+
+class HawkesMertonCharacteristicFunction:
+    """
+    Computes the characteristic function for the Hawkes-Driven Merton Jump-Diffusion model
+    with split positive and negative jump processes.
     """
     
     def phi(
-        self, u: float, S_t: float, K: float, tau: float, mu: float, sigma: float,
-        lambda_: float, mu_j: float, sigma_j: float
-    ) -> complex:
+        self, u: np.ndarray, S_t: float, K: float, tau: float, mu: float, sigma: float,
+        lambda_plus: float, lambda_minus: float,
+        mu_j_plus: float, sigma_j_plus: float,
+        mu_j_minus: float, sigma_j_minus: float
+    ) -> np.ndarray:
         x0 = np.log(S_t)
         
-        # Jump drift corrector: kappa = E[e^Y] - 1
-        kappa = np.exp(mu_j + 0.5 * sigma_j**2) - 1.0
+        # Jump drift correctors: kappa = E[e^Y] - 1 for each jump process
+        kappa_plus = np.exp(mu_j_plus + 0.5 * sigma_j_plus**2) - 1.0
+        kappa_minus = np.exp(mu_j_minus + 0.5 * sigma_j_minus**2) - 1.0
         
-        # Drift component in log-price: b = mu - lambda*kappa - 0.5*sigma^2
-        b = mu - lambda_ * kappa - 0.5 * sigma**2
+        # Drift component in log-price: b = mu - lambda_plus * kappa_plus - lambda_minus * kappa_minus - 0.5 * sigma^2
+        #
+        # MATHEMATICAL NOTE ON MARTINGALE COMPENSATOR:
+        # Under standard Gil-Pelaez option pricing, the drift component 'mu' is assumed to be either
+        # constant or a deterministic function of time over the integration horizon tau.
+        # By setting use_local_drift = True, we introduce an instantaneous OFI-modulated stochastic drift
+        # mu_t = r + ofi_multiplier * ofi. Freezing this instantaneous mu_t over the entire remaining
+        # maturity tau is a local approximation. This approximation holds very well in high-frequency trading
+        # contexts (e.g. Polymarket V2) where tau is small and we continuously re-evaluate the expectation
+        # tick-by-tick.
+        b = mu - lambda_plus * kappa_plus - lambda_minus * kappa_minus - 0.5 * sigma**2
         
         # Continuous diffusion part
         diffusion = 1j * u * x0 + 1j * u * b * tau - 0.5 * (sigma**2) * (u**2) * tau
         
-        # Jump process characteristic part
-        jump = lambda_ * tau * (np.exp(1j * u * mu_j - 0.5 * (sigma_j**2) * (u**2)) - 1.0)
+        # Positive jump process characteristic part
+        jump_plus = lambda_plus * tau * (np.exp(1j * u * mu_j_plus - 0.5 * (sigma_j_plus**2) * (u**2)) - 1.0)
         
-        return np.exp(diffusion + jump)
+        # Negative jump process characteristic part
+        jump_minus = lambda_minus * tau * (np.exp(1j * u * mu_j_minus - 0.5 * (sigma_j_minus**2) * (u**2)) - 1.0)
+        
+        return np.exp(diffusion + jump_plus + jump_minus)
 
 
-class GilPelaezIntegrator:
+class HawkesMertonPricer:
     """
     Solves the option exercise probability P(S_T > K) using Gil-Pelaez Fourier inversion
-    with Black-Scholes as a control variate to ensure high-frequency stability.
+    under the Hawkes-Driven Merton model, using Black-Scholes as a control variate.
+    Uses ultra-fast vectorized Gauss-Legendre quadrature.
     """
     
-    def __init__(self):
-        self.cf = MertonCharacteristicFunction()
+    def __init__(self, n_nodes: int = 64):
+        self.cf = HawkesMertonCharacteristicFunction()
+        # Pre-cache standard Gauss-Legendre nodes and weights on [-1, 1]
+        self.gl_nodes_std, self.gl_weights_std = np.polynomial.legendre.leggauss(n_nodes)
         
     def calculate_probability(
-        self, S_t: float, K: float, tau_seconds: float, 
-        mu: float, sigma: float, lambda_: float, 
-        mu_j: float, sigma_j: float, limit: int = 150
+        self, S_t: float, K: float, tau_seconds: float,
+        mu: float, sigma: float,
+        lambda_plus: float, lambda_minus: float,
+        mu_j_plus: float, sigma_j_plus: float,
+        mu_j_minus: float, sigma_j_minus: float,
+        limit: int = 150
     ) -> float:
         # Convert tau to annualized terms (seconds to years)
         tau = tau_seconds / (365.25 * 24 * 3600)
@@ -144,135 +298,138 @@ class GilPelaezIntegrator:
         except Exception as e:
             logger.debug(f"Analytical BS calculation failed: {e}. Falling back to step function.")
             p_bs_analytical = 1.0 if S_t > K else (0.0 if S_t < K else 0.5)
+ 
+        # Late-cycle bypass: within 15 seconds of expiry, jump probability is virtually 0.
+        # Bypassing the double Fourier integration prevents high-frequency numerical oscillations
+        # near the boundary from slowing down the simulation.
+        if tau_seconds < 15.0:
+            return p_bs_analytical
             
         x0 = np.log(S_t)
+        eps = 1e-8
+        upper_bound = 15000.0 / (sigma * np.sqrt(max(tau, 1e-9)))
+        upper_bound = max(100.0, min(upper_bound, 50000.0))
         
-        def integrand(u: float) -> float:
-            if u == 0.0:
-                return 0.0
+        try:
+            # Map Legendre nodes from [-1, 1] to [eps, upper_bound]
+            nodes = 0.5 * (upper_bound - eps) * self.gl_nodes_std + 0.5 * (upper_bound + eps)
+            weights = 0.5 * (upper_bound - eps) * self.gl_weights_std
             
-            # Merton CF
-            kappa = np.exp(mu_j + 0.5 * sigma_j**2) - 1.0
-            b_merton = mu - lambda_ * kappa - 0.5 * sigma**2
-            diffusion_merton = 1j * u * x0 + 1j * u * b_merton * tau - 0.5 * (sigma**2) * (u**2) * tau
-            jump_merton = lambda_ * tau * (np.exp(1j * u * mu_j - 0.5 * (sigma_j**2) * (u**2)) - 1.0)
-            phi_merton = np.exp(diffusion_merton + jump_merton)
+            # Vectorized evaluation of the integrand
+            phi_merton = self.cf.phi(
+                u=nodes, S_t=S_t, K=K, tau=tau, mu=mu, sigma=sigma,
+                lambda_plus=lambda_plus, lambda_minus=lambda_minus,
+                mu_j_plus=mu_j_plus, sigma_j_plus=sigma_j_plus,
+                mu_j_minus=mu_j_minus, sigma_j_minus=sigma_j_minus
+            )
             
             # Black-Scholes CF (same continuous drift and volatility)
             b_bs = mu - 0.5 * sigma**2
-            diffusion_bs = 1j * u * x0 + 1j * u * b_bs * tau - 0.5 * (sigma**2) * (u**2) * tau
+            diffusion_bs = 1j * nodes * x0 + 1j * nodes * b_bs * tau - 0.5 * (sigma**2) * (nodes**2) * tau
             phi_bs = np.exp(diffusion_bs)
             
             # Difference term
-            z = np.exp(-1j * u * np.log(K)) * (phi_merton - phi_bs)
-            return np.imag(z) / u
+            z = np.exp(-1j * nodes * np.log(K)) * (phi_merton - phi_bs)
+            integrand_vals = np.imag(z) / nodes
             
-        try:
-            # Integrate the difference term. The integrand decays to zero extremely rapidly
-            eps = 1e-8
-            upper_bound = 15000.0 / (sigma * np.sqrt(max(tau, 1e-9)))
-            upper_bound = max(100.0, min(upper_bound, 50000.0))
-            
-            result, _ = integrate.quad(integrand, eps, upper_bound, limit=limit, epsabs=1e-8, epsrel=1e-8)
+            # Gauss-Legendre Quadrature sum (vectorized dot product)
+            result = float(np.dot(weights, integrand_vals))
             
             prob = p_bs_analytical + (1.0 / np.pi) * result
             # Bound probability to strict [0, 1] range to avoid floating-point noise
             return max(0.0, min(1.0, prob))
             
         except Exception as e:
-            logger.error(f"Control Variate Gil-Pelaez integration failed: {e}. Falling back to default GBM.")
+            logger.error(f"Vectorized Gauss-Legendre integration failed for Hawkes-Merton: {e}. Falling back to default GBM.")
             return p_bs_analytical
-
-
-class OFILogitShifter:
-    """
-    Applies smoothed OFI as a bounded logit-space adjustment on top of the Merton
-    base probability, keeping order-flow signal strictly decoupled from the
-    diffusion/jump model.
-
-    Formula:
-        p_final = sigmoid( logit(p_merton) + β × ofi_z )
-
-    where ofi_z = smoothed_ofi / sqrt(EMA(ofi²)) is the dimensionless z-score.
-
-    Properties:
-    - p_final is always in (0, 1) by construction — OFI can never collapse it to 0/1.
-    - β calibrates sensitivity independently of market depth or contract size.
-      At p=0.5: β=0.5 and ofi_z=+1σ → p_final ≈ 0.62 (+12pp).
-    - z-score is clipped to ±3σ so max logit shift is ±3β, preventing tail spikes.
-    - Running variance is warm-started at the first observed ofi² to avoid a cold
-      zero-std phase that would divide by near-zero.
-    """
-
-    def __init__(self, beta: float, ema_alpha: float = 0.1):
-        self.beta = beta
-        self.ema_alpha = ema_alpha
-        self._ema_sq: float = 0.0
-        self._initialized: bool = False
-
-    def shift(self, p_merton: float, smoothed_ofi: float) -> float:
-        alpha = self.ema_alpha
-        ofi_sq = smoothed_ofi ** 2
-
-        if not self._initialized:
-            self._ema_sq = ofi_sq if ofi_sq > 1e-12 else 1.0
-            self._initialized = True
-        else:
-            self._ema_sq = alpha * ofi_sq + (1.0 - alpha) * self._ema_sq
-
-        ofi_std = np.sqrt(max(self._ema_sq, 1e-12))
-        ofi_z = float(np.clip(smoothed_ofi / ofi_std, -3.0, 3.0))
-
-        if p_merton <= 0.0 or p_merton >= 1.0:
-            return p_merton
-
-        logit_p = np.log(p_merton / (1.0 - p_merton))
-        return float(1.0 / (1.0 + np.exp(-(logit_p + self.beta * ofi_z))))
 
 
 class MertonStrategy(BaseStrategy):
     """
-    Fourier Merton Jump-Diffusion Strategy.
-
-    Merton + Gil-Pelaez prices the pure diffusion/jump component (μ=0).
-    OFI enters separately as a logit-space shift via OFILogitShifter, keeping
-    the two signals orthogonal and preventing annualization artifacts.
+    Hawkes-Driven Merton Jump-Diffusion Strategy.
+    
+    Integrates the Order Flow Imbalance (OFI) directly into the underlying asset's SDE.
+    The jump intensities lambda+ and lambda- are stochastic and driven by positive/negative
+    OFI pressure via a coupled bivariate Hawkes cross-excitation kernel.
+    Optionally, the diffusive drift mu_t can also be modulated by the OFI.
     """
-
+    
     def __init__(self, config):
         super().__init__(config)
-        self.integrator = GilPelaezIntegrator()
         self.vol_calibrator = HighFrequencyVolatilityCalibrator(
             window_size=config.merton.VOL_ROLLING_WINDOW_SEC
         )
-        self.ofi_shifter = OFILogitShifter(
-            beta=config.merton.OFI_LOGIT_BETA,
-            ema_alpha=config.merton.OFI_NORM_EMA_ALPHA
-        )
-
+        self.pricer = HawkesMertonPricer()
+        
+        # Initialize Hawkes baseline intensity and state
+        self.lambda_0 = getattr(config.merton, "HAWKES_LAMBDA_0", config.merton.DEFAULT_LAMBDA)
+        self.state = MicrostructuralState(lambda_0=self.lambda_0)
+        
     def reset(self) -> None:
-        """Resets OFI variance normalization state on cycle rollover."""
-        self.ofi_shifter._ema_sq = 0.0
-        self.ofi_shifter._initialized = False
-
+        """Resets intensities and drift back to baseline values on cycle rollover."""
+        self.state.reset()
+        
     def get_probability(self, context: MarketContext) -> Optional[float]:
         if context.strike_price is None:
             return None
-
+            
+        # 1. Update Volatility
         self.vol_calibrator.add_tick(context.spot_price, context.timestamp)
         sigma = self.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
-
-        # Merton runs with μ=0: drift contribution is purely from the logit shift below.
-        p_merton = self.integrator.calculate_probability(
+        
+        # 2. Update Hawkes/Microstructural state tick-by-tick using Bivariate parameters
+        beta = getattr(self.config.merton, "HAWKES_BETA", 5.0)
+        legacy_kappa = getattr(self.config.merton, "HAWKES_KAPPA", 10.0)
+        kappa_self = getattr(self.config.merton, "HAWKES_KAPPA_SELF", 3.0)
+        kappa_cross = getattr(self.config.merton, "HAWKES_KAPPA_CROSS", 1.0)
+        
+        # Legacy fallback auto-migration:
+        # If legacy HAWKES_KAPPA is customized (not 10.0) in .env, but HAWKES_KAPPA_SELF is default (3.0),
+        # treat legacy HAWKES_KAPPA as HAWKES_KAPPA_SELF.
+        if legacy_kappa != 10.0 and kappa_self == 3.0:
+            kappa_self = legacy_kappa
+            
+        ofi_multiplier = getattr(self.config.merton, "OFI_DRIFT_MULTIPLIER", -1e-6)
+        use_local_drift = getattr(self.config.merton, "USE_LOCAL_INFORMED_DRIFT", False)
+        
+        # Risk-free rate (assumed 0 in short-term predictions, but can be customized)
+        r = 0.0
+        
+        self.state.update_state(
+            timestamp=context.timestamp,
+            ofi=context.ofi,
+            kappa_self=kappa_self,
+            kappa_cross=kappa_cross,
+            beta=beta,
+            ofi_multiplier=ofi_multiplier,
+            use_local_drift=use_local_drift,
+            r=r
+        )
+        
+        # 3. Compute probability using HawkesMertonPricer
+        # Jump size distribution parameters
+        mu_j = self.config.merton.DEFAULT_MU_J
+        sigma_j = self.config.merton.DEFAULT_SIGMA_J
+        
+        # We split jump parameters: positive jumps have +mu_j, negative jumps have -mu_j
+        mu_j_plus = abs(mu_j)
+        sigma_j_plus = sigma_j
+        mu_j_minus = -abs(mu_j)
+        sigma_j_minus = sigma_j
+        
+        p_merton = self.pricer.calculate_probability(
             S_t=context.spot_price,
             K=context.strike_price,
             tau_seconds=context.tau_seconds,
-            mu=0.0,
+            mu=self.state.mu,
             sigma=sigma,
-            lambda_=self.config.merton.DEFAULT_LAMBDA,
-            mu_j=self.config.merton.DEFAULT_MU_J,
-            sigma_j=self.config.merton.DEFAULT_SIGMA_J
+            lambda_plus=self.state.lambda_plus,
+            lambda_minus=self.state.lambda_minus,
+            mu_j_plus=mu_j_plus,
+            sigma_j_plus=sigma_j_plus,
+            mu_j_minus=mu_j_minus,
+            sigma_j_minus=sigma_j_minus
         )
-
-        p_final = self.ofi_shifter.shift(p_merton, context.ofi)
-        return float(np.clip(p_final, 0.01, 0.99))
+        
+        # Bound probability to avoid tail instabilities in Kelly sizing
+        return float(np.clip(p_merton, 0.01, 0.99))

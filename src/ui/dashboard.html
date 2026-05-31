@@ -83,12 +83,56 @@
       background-color: #00ff00;
     }
 
+    /* ── TABS BAR ── */
+    .tab-bar {
+      display: flex;
+      background-color: #0c0c0c;
+      border: 1px solid #333333;
+      border-bottom: none;
+      gap: 2px;
+      padding: 2px 2px 0 2px;
+    }
+    .tab-btn {
+      background-color: #1a1a1a;
+      border: 1px solid #333333;
+      border-bottom: none;
+      color: #888888;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: bold;
+      padding: 6px 16px;
+      cursor: pointer;
+      outline: none;
+      transition: all 0.15s ease;
+    }
+    .tab-btn:hover {
+      background-color: #2b2b2b;
+      color: #ffb000;
+    }
+    .tab-btn.active {
+      background-color: #000000;
+      color: #ffb000;
+      border-top: 2px solid #ffb000;
+      border-bottom: 1px solid #000000;
+      margin-bottom: -1px;
+      z-index: 2;
+    }
+
+    .tab-content-wrapper {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 0;
+      flex: 1;
+    }
+
     /* Panels Grid */
     .main-grid {
       display: grid;
       grid-template-columns: 3fr 2fr;
       gap: 8px;
       min-height: 0; /* Important for scroll nested items */
+      flex: 1;
     }
 
     .left-col {
@@ -260,13 +304,7 @@
       background: #020202;
     }
 
-    /* Backtester Controls */
-    .bt-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr auto;
-      gap: 4px;
-      margin-bottom: 8px;
-    }
+    /* select, button, input */
     select, button, input {
       background-color: #111111;
       border: 1px solid #444444;
@@ -301,6 +339,33 @@
       width: 0%;
     }
 
+    /* ── BACKTEST TAB GRID ── */
+    .backtest-grid {
+      display: grid;
+      grid-template-columns: 2fr 3fr;
+      gap: 8px;
+      min-height: 0;
+      flex: 1;
+    }
+    
+    .bt-left-col {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    
+    .bt-right-col {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    
+    .bt-kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 4px;
+    }
+
     /* Footer */
     footer {
       display: flex;
@@ -325,166 +390,287 @@
     </div>
   </header>
 
-  <!-- ══════════════ KPI CARDS ══════════════ -->
-  <div class="kpi-grid">
-    <div class="kpi-card">
-      <div class="kpi-lbl">Total Equity</div>
-      <div class="kpi-val" id="kpi-equity">—</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-lbl">Cash Balance</div>
-      <div class="kpi-val green" id="kpi-cash">—</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-lbl">Position Value</div>
-      <div class="kpi-val" id="kpi-posval">—</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-lbl">Cumulative P&amp;L</div>
-      <div class="kpi-val" id="kpi-pnl">—</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-lbl">Total Trades</div>
-      <div class="kpi-val white" id="kpi-trades">0</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-lbl">Oracle Status</div>
-      <div class="kpi-val green" id="kpi-oracle" style="font-size:12px;">OFFLINE</div>
-    </div>
+  <!-- ══════════════ TAB BAR ══════════════ -->
+  <div class="tab-bar">
+    <button class="tab-btn active" id="tab-btn-live" onclick="switchTab('live')">F1 - LIVE TRADING MONITOR</button>
+    <button class="tab-btn" id="tab-btn-backtest" onclick="switchTab('backtest')">F2 - HISTORICAL BACKTESTER</button>
   </div>
 
-  <!-- ══════════════ MAIN WORKSPACE ══════════════ -->
-  <div class="main-grid">
-    <!-- LEFT SIDE: Core Data & Charts -->
-    <div class="left-col">
-      <!-- Market Details -->
-      <div class="panel">
-        <div class="panel-header">CORE MARKET METRICS</div>
-        <div class="panel-body" style="padding: 0;">
-          <table>
-            <thead>
-              <tr>
-                <th>Ticker</th>
-                <th class="num">Spot Price</th>
-                <th class="num">Strike Price (K)</th>
-                <th class="num">YES</th>
-                <th class="num">Market YES</th>
-                <th class="num">Expected Edge</th>
-                <th class="num">Realized Vol</th>
-                <th class="num">OFI</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td id="tbl-ticker" class="white bold">—</td>
-                <td id="tbl-spot" class="num amber bold">—</td>
-                <td id="tbl-strike" class="num white">—</td>
-                <td id="tbl-pfair" class="num green bold">—</td>
-                <td id="tbl-pmarket" class="num num white">—</td>
-                <td id="tbl-edge" class="num bold">—</td>
-                <td id="tbl-vol" class="num dim">—</td>
-                <td id="tbl-ofi" class="num dim">—</td>
-              </tr>
-            </tbody>
-          </table>
-          <div style="padding: 6px 8px; font-size:10px; color:#555555; display:flex; justify-content:space-between; border-top:1px solid #111111;">
-            <div>Slug: <span id="mkt-slug" class="white">—</span></div>
-            <div>Condition: <span id="mkt-condition" class="white">—</span></div>
+  <!-- ══════════════ LIVE TAB CONTENT ══════════════ -->
+  <div id="tab-content-live" class="tab-content-wrapper">
+    <!-- ══════════════ KPI CARDS ══════════════ -->
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-lbl">Total Equity</div>
+        <div class="kpi-val" id="kpi-equity">—</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Cash Balance</div>
+        <div class="kpi-val green" id="kpi-cash">—</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Position Value</div>
+        <div class="kpi-val" id="kpi-posval">—</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Cumulative P&amp;L</div>
+        <div class="kpi-val" id="kpi-pnl">—</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Total Trades</div>
+        <div class="kpi-val white" id="kpi-trades">0</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Oracle Status</div>
+        <div class="kpi-val green" id="kpi-oracle" style="font-size:12px;">OFFLINE</div>
+      </div>
+    </div>
+
+    <!-- ══════════════ MAIN WORKSPACE ══════════════ -->
+    <div class="main-grid" style="flex: 1; min-height: 0;">
+      <!-- LEFT SIDE: Core Data & Charts -->
+      <div class="left-col">
+        <!-- Market Details -->
+        <div class="panel">
+          <div class="panel-header">CORE MARKET METRICS</div>
+          <div class="panel-body" style="padding: 0;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th class="num">Spot Price</th>
+                  <th class="num">Strike Price (K)</th>
+                  <th class="num">YES</th>
+                  <th class="num">Market YES</th>
+                  <th class="num">Expected Edge</th>
+                  <th class="num">Realized Vol</th>
+                  <th class="num">OFI</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td id="tbl-ticker" class="white bold">—</td>
+                  <td id="tbl-spot" class="num amber bold">—</td>
+                  <td id="tbl-strike" class="num white">—</td>
+                  <td id="tbl-pfair" class="num green bold">—</td>
+                  <td id="tbl-pmarket" class="num num white">—</td>
+                  <td id="tbl-edge" class="num bold">—</td>
+                  <td id="tbl-vol" class="num dim">—</td>
+                  <td id="tbl-ofi" class="num dim">—</td>
+                </tr>
+              </tbody>
+            </table>
+            <div style="padding: 6px 8px; font-size:10px; color:#555555; display:flex; justify-content:space-between; border-top:1px solid #111111;">
+              <div>Slug: <span id="mkt-slug" class="white">—</span></div>
+              <div>Condition: <span id="mkt-condition" class="white">—</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Canvas Charts (Flat stark rendering, no shadows) -->
+        <div class="chart-container">
+          <!-- Spot vs Strike -->
+          <div class="panel chart-box">
+            <div class="panel-header">SPOT PRICE VS STRIKE (RECENT HISTORY)</div>
+            <canvas id="chart-price" height="150"></canvas>
+          </div>
+          <!-- Merton vs Market Implied -->
+          <div class="panel chart-box">
+            <div class="panel-header">YES VS MARKET YES</div>
+            <canvas id="chart-prob" height="150"></canvas>
+          </div>
+        </div>
+
+        <!-- Execution Logs -->
+        <div class="panel">
+          <div class="panel-header">REAL-TIME EXECUTION LOGS</div>
+          <div class="panel-body" style="overflow: hidden; padding: 4px;">
+            <div class="logs-box" id="logs-box"></div>
           </div>
         </div>
       </div>
 
-      <!-- Canvas Charts (Flat stark rendering, no shadows) -->
-      <div class="chart-container">
-        <!-- Spot vs Strike -->
-        <div class="panel chart-box">
-          <div class="panel-header">SPOT PRICE VS STRIKE (RECENT HISTORY)</div>
-          <canvas id="chart-price" height="150"></canvas>
+      <!-- RIGHT SIDE: Orderbook, Execution engine & Simulator -->
+      <div class="right-col">
+        <!-- Orderbook -->
+        <div class="panel">
+          <div class="panel-header">ORDERBOOK (YES CONTRACT)</div>
+          <div class="panel-body" style="padding: 4px;">
+            <div id="ob-asks" style="display:flex; flex-direction:column-reverse;"></div>
+            <div class="ob-spread" id="ob-spread">SPREAD: —</div>
+            <div id="ob-bids"></div>
+          </div>
         </div>
-        <!-- Merton vs Market Implied -->
-        <div class="panel chart-box">
-          <div class="panel-header">YES VS MARKET YES</div>
-          <canvas id="chart-prob" height="150"></canvas>
-        </div>
-      </div>
 
-      <!-- Execution Logs -->
-      <div class="panel">
-        <div class="panel-header">REAL-TIME EXECUTION LOGS</div>
-        <div class="panel-body" style="overflow: hidden; padding: 4px;">
-          <div class="logs-box" id="logs-box"></div>
+        <!-- Risk, Kelly & Position Info -->
+        <div class="panel">
+          <div class="panel-header">RISK SIZING &amp; POSITION STATE DETAILS</div>
+          <div class="panel-body">
+            <table style="font-size:11px;">
+              <tr>
+                <td class="dim">Sizing Side:</td>
+                <td id="eng-side" class="bold">—</td>
+                <td class="dim">Kelly Alloc:</td>
+                <td id="eng-kelly" class="white bold">—</td>
+              </tr>
+              <tr>
+                <td class="dim">Target Price:</td>
+                <td id="eng-vwap" class="white">—</td>
+                <td class="dim">Position YES:</td>
+                <td id="eng-qty-yes" class="green">—</td>
+              </tr>
+              <tr>
+                <td class="dim">Margin Bps:</td>
+                <td id="eng-margin" class="white">—</td>
+                <td class="dim">Position NO:</td>
+                <td id="eng-qty-no" class="red">—</td>
+              </tr>
+              <tr>
+                <td class="dim">Engine Status:</td>
+                <td id="eng-reason" class="dim" colspan="3">—</td>
+              </tr>
+            </table>
+          </div>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- RIGHT SIDE: Orderbook, Execution engine & Simulator -->
-    <div class="right-col">
-      <!-- Orderbook -->
-      <div class="panel">
-        <div class="panel-header">ORDERBOOK (YES CONTRACT)</div>
-        <div class="panel-body" style="padding: 4px;">
-          <div id="ob-asks" style="display:flex; flex-direction:column-reverse;"></div>
-          <div class="ob-spread" id="ob-spread">SPREAD: —</div>
-          <div id="ob-bids"></div>
+  <!-- ══════════════ BACKTEST TAB CONTENT ══════════════ -->
+  <div id="tab-content-backtest" class="tab-content-wrapper" style="display: none;">
+    <div class="backtest-grid">
+      <!-- Left Column: Setup & Performance Grid -->
+      <div class="bt-left-col">
+        <!-- Setup Panel -->
+        <div class="panel">
+          <div class="panel-header">BACKTEST CONFIGURATION SETUP</div>
+          <div class="panel-body">
+            <!-- Continuous Data Session Dropdown -->
+            <div style="margin-bottom: 8px;">
+              <div style="font-size:9px; color:#888888; margin-bottom:2px;">SELECT CONTINUOUS DATA SESSION</div>
+              <select id="bt-session-select" onchange="selectSession(this.value)" style="width:100%; font-size:11px; padding:3px; height:24px; background-color:#111111; color:#ffffff; border:1px solid #444444;">
+                <option value="">-- Custom Range / Select Session --</option>
+              </select>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;">
+              <div>
+                <div style="font-size:9px; color:#888888; margin-bottom:2px;">START DATE/TIME</div>
+                <input type="datetime-local" id="bt-start" style="width:100%; font-size:11px; padding:3px; height:24px;">
+              </div>
+              <div>
+                <div style="font-size:9px; color:#888888; margin-bottom:2px;">END DATE/TIME</div>
+                <input type="datetime-local" id="bt-end" style="width:100%; font-size:11px; padding:3px; height:24px;">
+              </div>
+            </div>
+            <div style="margin-bottom: 10px;">
+              <div style="font-size:9px; color:#888888; margin-bottom:2px;">ACTIVE PRICING STRATEGY</div>
+              <select id="bt-strategy" style="width:100%; font-size:11px; padding:3px; height:24px; background-color:#111111; color:#ffffff; border:1px solid #444444;">
+                <option value="merton" selected>Hawkes-Driven Merton (Stochastic Intensity)</option>
+                <option value="legacy_merton">Legacy Merton (Posterior OFI Logit-Shift)</option>
+              </select>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: center; justify-content: space-between;">
+              <div style="font-size: 10px; color: #888888;">
+                Available range: <span id="bt-available-range" style="color: #ffb000; font-weight: bold;">Scanning...</span>
+              </div>
+              <button id="bt-btn-run" onclick="triggerBacktest()" style="background-color: #111111; border: 1px solid #ffb000; color: #ffb000; font-size: 10px; padding: 4px 14px; height:24px;">RUN SIMULATION</button>
+            </div>
+            <div class="progress-bar-bg" id="bt-progress-wrap" style="display:none; margin-top: 8px;">
+              <div class="progress-bar-fg" id="bt-progress-bar"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Metrics cards Grid -->
+        <div class="panel" style="margin-top: 8px; flex: 1;">
+          <div class="panel-header">PERFORMANCE METRICS SUMMARY</div>
+          <div class="panel-body" style="padding: 6px;">
+            <div class="bt-kpi-grid">
+              <div class="kpi-card">
+                <div class="kpi-lbl">Net Profit / Loss</div>
+                <div class="kpi-val" id="bt-val-pnl">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Total Return Rate</div>
+                <div class="kpi-val" id="bt-val-return">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Max Drawdown (%)</div>
+                <div class="kpi-val red" id="bt-val-mdd-pct">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Max Drawdown (USD)</div>
+                <div class="kpi-val red" id="bt-val-mdd-usd">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Profit Factor</div>
+                <div class="kpi-val" id="bt-val-pf">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Win Rate</div>
+                <div class="kpi-val" id="bt-val-winrate">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Win / Loss Ratio</div>
+                <div class="kpi-val" id="bt-val-wlratio">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Total Exits</div>
+                <div class="kpi-val white" id="bt-val-trades">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Wins / Losses / Flats</div>
+                <div class="kpi-val white" id="bt-val-counts" style="font-size: 11px; margin-top: 5px; font-weight: normal; color:#ddd;">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Avg Win / Avg Loss</div>
+                <div class="kpi-val white" id="bt-val-winlossavg" style="font-size: 11px; margin-top: 5px; font-weight: normal; color:#ddd;">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Gross Profit</div>
+                <div class="kpi-val green" id="bt-val-grossprof" style="font-size: 11px; margin-top: 5px; font-weight: normal;">—</div>
+              </div>
+              <div class="kpi-card">
+                <div class="kpi-lbl">Gross Loss</div>
+                <div class="kpi-val red" id="bt-val-grossloss" style="font-size: 11px; margin-top: 5px; font-weight: normal;">—</div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
-      <!-- Risk, Kelly & Backtesting -->
-      <div class="panel">
-        <div class="panel-header">RISK SIZING ENGINE &amp; REPLAY SIMULATION</div>
-        <div class="panel-body">
-          <table style="margin-bottom: 8px; font-size:11px;">
-            <tr>
-              <td class="dim">Sizing Side:</td>
-              <td id="eng-side" class="bold">—</td>
-              <td class="dim">Kelly Alloc:</td>
-              <td id="eng-kelly" class="white bold">—</td>
-            </tr>
-            <tr>
-              <td class="dim">Target Price:</td>
-              <td id="eng-vwap" class="white">—</td>
-              <td class="dim">Position YES:</td>
-              <td id="eng-qty-yes" class="green">—</td>
-            </tr>
-            <tr>
-              <td class="dim">Margin Bps:</td>
-              <td id="eng-margin" class="white">—</td>
-              <td class="dim">Position NO:</td>
-              <td id="eng-qty-no" class="red">—</td>
-            </tr>
-            <tr>
-              <td class="dim">Engine Status:</td>
-              <td id="eng-reason" class="dim" colspan="3">—</td>
-            </tr>
-          </table>
+      <!-- Right Column: Equity Growth Chart & Realized Trades Table -->
+      <div class="bt-right-col">
+        <!-- Equity Chart -->
+        <div class="panel" style="flex: 2;">
+          <div class="panel-header">EQUITY GROWTH &amp; MTM VALUATION CURVE</div>
+          <div class="panel-body" style="padding: 4px; overflow: hidden;">
+            <canvas id="chart-backtest-large" style="height: 100%; width: 100%;"></canvas>
+          </div>
+        </div>
 
-          <!-- Backtester Control Panel (Bloomberg start/end window style) -->
-          <div style="border-top: 1px dashed #333333; padding-top: 8px; margin-top: 8px;">
-            <div style="font-size:10px; color:#ffb000; font-weight:bold; margin-bottom:4px; text-transform:uppercase;">Historical Backtester (Replay Window)</div>
-            <div class="bt-grid">
-              <div>
-                <div style="font-size:9px; color:#666666; margin-bottom:2px;">START TIME</div>
-                <input type="datetime-local" id="bt-start" style="width:100%; font-size:10px; padding:2px; height:22px;">
-              </div>
-              <div>
-                <div style="font-size:9px; color:#666666; margin-bottom:2px;">END TIME</div>
-                <input type="datetime-local" id="bt-end" style="width:100%; font-size:10px; padding:2px; height:22px;">
-              </div>
-              <div style="display:flex; align-items:flex-end;">
-                <button id="bt-btn-run" onclick="triggerBacktest()" style="padding: 2px 8px; height: 22px; font-size:10px;">RUN</button>
-              </div>
-            </div>
-            <div class="progress-bar-bg" id="bt-progress-wrap" style="display:none;">
-              <div class="progress-bar-fg" id="bt-progress-bar"></div>
-            </div>
-            <div id="bt-stats" style="margin-top: 6px; font-size:11px; display:none;">
-              <span class="dim">Return:</span> <span id="bt-stat-return" class="bold"></span> | 
-              <span class="dim">MaxDD:</span> <span id="bt-stat-mdd" class="bold red"></span> | 
-              <span class="dim">Trades:</span> <span id="bt-stat-trades" class="white bold"></span>
-            </div>
-            <div id="bt-chart-wrap" style="margin-top:6px; display:none; border:1px solid #222222;">
-              <canvas id="chart-backtest" height="85"></canvas>
-            </div>
+        <!-- Realized Trades Audit Table -->
+        <div class="panel" style="margin-top: 8px; flex: 3;">
+          <div class="panel-header">REALIZED TRANSACTIONS LEDGER (SIMULATION AUDIT LOG)</div>
+          <div class="panel-body" style="padding: 0;">
+            <table id="bt-trades-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Side</th>
+                  <th class="num">Quantity</th>
+                  <th class="num">Entry Price</th>
+                  <th class="num">Exit Price</th>
+                  <th class="num">Realized P&amp;L</th>
+                  <th style="text-align: center;">Result</th>
+                </tr>
+              </thead>
+              <tbody id="bt-trades-tbody">
+                <tr>
+                  <td colspan="7" style="text-align: center; color: #555555; padding: 40px;">No simulation results available. Select window and click RUN SIMULATION.</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -504,6 +690,7 @@
   let history = { prices: [], strikes: [], pfairs: [], pmarkets: [], times: [] };
   const MAX_HIST = 120;
   let dataRange = { min_time: 0, max_time: 0 };
+  let lastBacktestHistory = [];
 
   // Cache target nodes for DOM efficiency (prevent querySelector lookup overhead)
   const els = {
@@ -539,12 +726,7 @@
     engReason: document.getElementById('eng-reason'),
     logsBox: document.getElementById('logs-box'),
     progressWrap: document.getElementById('bt-progress-wrap'),
-    progressBar: document.getElementById('bt-progress-bar'),
-    btStats: document.getElementById('bt-stats'),
-    btStatReturn: document.getElementById('bt-stat-return'),
-    btStatMdd: document.getElementById('bt-stat-mdd'),
-    btStatTrades: document.getElementById('bt-stat-trades'),
-    btChartWrap: document.getElementById('bt-chart-wrap')
+    progressBar: document.getElementById('bt-progress-bar')
   };
 
   // ── WEBSOCKET CONNECTION ──
@@ -574,10 +756,8 @@
           requestAnimationFrame(() => renderState(msg));
         } else if (msg.type === 'trade_signal') {
           // trade_signal is used to update stats panels only.
-          // The "SIGNAL:" log line is already written by Python's log_message.
         } else if (msg.type === 'settlement_update') {
-          const se = msg.settlement;
-          addLog('settle', `SETTLEMENT: Settle Spot: $${se.settle_spot} | Strike: $${se.strike} | YES=${se.resolved_yes}`);
+          // Handled via the rich log_message stream from orchestrator to prevent double logging
         } else if (msg.type === 'backtest_progress') {
           requestAnimationFrame(() => updateBacktestProgress(msg.progress));
         } else if (msg.type === 'log_message') {
@@ -712,8 +892,11 @@
 
   // ── CANVAS CHARTS DRAWING (FLAT SOLID PATHS, NO SHADOWS) ──
   function drawCharts() {
-    drawPriceChart();
-    drawProbabilityChart();
+    // Only draw charts if the Live Monitor tab is currently active
+    if (document.getElementById('tab-content-live').style.display !== 'none') {
+      drawPriceChart();
+      drawProbabilityChart();
+    }
   }
 
   function drawPriceChart() {
@@ -862,6 +1045,32 @@
     ctx.fillText('Market YES', pad.left + 60, pad.top + 10);
   }
 
+  // ── TAB SWITCHING ──
+  function switchTab(tabId) {
+    const liveBtn = document.getElementById('tab-btn-live');
+    const backtestBtn = document.getElementById('tab-btn-backtest');
+    const liveContent = document.getElementById('tab-content-live');
+    const backtestContent = document.getElementById('tab-content-backtest');
+    
+    if (tabId === 'live') {
+      liveBtn.classList.add('active');
+      backtestBtn.classList.remove('active');
+      liveContent.style.display = 'flex';
+      backtestContent.style.display = 'none';
+      drawCharts();
+    } else {
+      liveBtn.classList.remove('active');
+      backtestBtn.classList.add('active');
+      liveContent.style.display = 'none';
+      backtestContent.style.display = 'grid';
+      if (lastBacktestHistory.length > 0) {
+        requestAnimationFrame(() => drawBacktestChartLarge(lastBacktestHistory));
+      }
+    }
+  }
+
+  let availableSessions = [];
+
   // ── HISTORICAL RANGE ACQUISITION FOR BACKTESTING ──
   async function fetchDataRange() {
     try {
@@ -870,6 +1079,7 @@
       if (data.success) {
         const startInput = document.getElementById('bt-start');
         const endInput = document.getElementById('bt-end');
+        const sessionSelect = document.getElementById('bt-session-select');
         
         startInput.min = data.min_iso;
         startInput.max = data.max_iso;
@@ -882,10 +1092,41 @@
         dataRange.min_time = data.min_time;
         dataRange.max_time = data.max_time;
         
-        addLog('system', `Available tick data window: ${data.min_iso.replace('T', ' ')} to ${data.max_iso.replace('T', ' ')}`);
+        const rangeText = `${data.min_iso.replace('T', ' ')} to ${data.max_iso.replace('T', ' ')}`;
+        document.getElementById('bt-available-range').textContent = rangeText;
+        
+        // Populate sessions dropdown
+        availableSessions = data.sessions || [];
+        sessionSelect.innerHTML = '<option value="">-- Custom Range / Select Session --</option>';
+        availableSessions.forEach((s, idx) => {
+          const opt = document.createElement('option');
+          opt.value = idx;
+          opt.textContent = s.name;
+          sessionSelect.appendChild(opt);
+        });
+        
+        // Prefill with the last (most recent) session automatically
+        if (availableSessions.length > 0) {
+          const lastIdx = availableSessions.length - 1;
+          sessionSelect.value = lastIdx;
+          selectSession(lastIdx);
+        }
+        
+        addLog('system', `Loaded ${availableSessions.length} continuous data sessions.`);
       }
     } catch (e) {
       console.error("Failed to load backtest data range", e);
+    }
+  }
+
+  // ── SESSION SELECTOR PREFILL ──
+  window.selectSession = function(val) {
+    if (val === "") return;
+    const session = availableSessions[parseInt(val)];
+    if (session) {
+      document.getElementById('bt-start').value = session.min_iso;
+      document.getElementById('bt-end').value = session.max_iso;
+      addLog('system', `Selected continuous session: ${session.name}`);
     }
   }
 
@@ -910,15 +1151,20 @@
     // Reset UI
     els.progressWrap.style.display = 'block';
     els.progressBar.style.width = '0%';
-    els.btStats.style.display = 'none';
-    els.btChartWrap.style.display = 'none';
-    addLog('system', `Submitting backtest window: ${startVal.replace('T', ' ')} to ${endVal.replace('T', ' ')}...`);
+    
+    // Reset performance KPIs
+    document.getElementById('bt-val-pnl').textContent = 'Calculating...';
+    document.getElementById('bt-val-return').textContent = 'Calculating...';
+    document.getElementById('bt-val-mdd-pct').textContent = 'Calculating...';
+    
+    const strategyName = document.getElementById('bt-strategy').value;
+    addLog('system', `Submitting backtest window with ${strategyName} strategy: ${startVal.replace('T', ' ')} to ${endVal.replace('T', ' ')}...`);
 
     try {
       const response = await fetch('/api/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ start_time: startTs, end_time: endTs })
+        body: JSON.stringify({ start_time: startTs, end_time: endTs, strategy_name: strategyName })
       });
       const data = await response.json();
       
@@ -926,19 +1172,80 @@
         els.progressBar.style.width = '100%';
         const stats = data.results;
         
-        els.btStatReturn.textContent = (stats.total_return_pct >= 0 ? '+' : '') + stats.total_return_pct.toFixed(2) + '%';
-        els.btStatReturn.className = stats.total_return_pct >= 0 ? 'green bold' : 'red bold';
+        // 1. Populate performance KPIs
+        const pnl = stats.net_pnl;
+        const btValPnl = document.getElementById('bt-val-pnl');
+        btValPnl.textContent = (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl));
+        btValPnl.className = 'kpi-val ' + (pnl >= 0 ? 'green' : 'red');
         
-        els.btStatMdd.textContent = '-' + stats.max_drawdown_pct.toFixed(2) + '%';
-        els.btStatTrades.textContent = stats.total_trades;
+        const ret = stats.total_return_pct;
+        const btValReturn = document.getElementById('bt-val-return');
+        btValReturn.textContent = (ret >= 0 ? '+' : '') + ret.toFixed(2) + '%';
+        btValReturn.className = 'kpi-val ' + (ret >= 0 ? 'green' : 'red');
         
-        els.btStats.style.display = 'block';
-        addLog('system', `Backtest complete. Return: ${stats.total_return_pct.toFixed(2)}% | Trades: ${stats.total_trades} | MaxDD: -${stats.max_drawdown_pct.toFixed(2)}%`);
+        document.getElementById('bt-val-mdd-pct').textContent = '-' + stats.max_drawdown_pct.toFixed(2) + '%';
+        document.getElementById('bt-val-mdd-usd').textContent = '-$' + fmt(stats.max_drawdown_usd);
         
-        // Draw the flat backtest equity chart
+        const pf = stats.profit_factor;
+        const btValPf = document.getElementById('bt-val-pf');
+        btValPf.textContent = typeof pf === 'number' ? pf.toFixed(2) : pf;
+        btValPf.className = 'kpi-val ' + (pf >= 1.5 || pf === '∞' ? 'green' : pf < 1.0 ? 'red' : 'white');
+        
+        document.getElementById('bt-val-winrate').textContent = stats.win_rate_pct.toFixed(2) + '%';
+        
+        const wl = stats.win_loss_ratio;
+        document.getElementById('bt-val-wlratio').textContent = typeof wl === 'number' ? wl.toFixed(2) : wl;
+        
+        document.getElementById('bt-val-trades').textContent = stats.total_trades;
+        document.getElementById('bt-val-counts').textContent = `${stats.winning_trades} W / ${stats.losing_trades} L / ${stats.flat_trades} F`;
+        document.getElementById('bt-val-winlossavg').textContent = `$${fmt(stats.avg_win)} / $${fmt(stats.avg_loss)}`;
+        document.getElementById('bt-val-grossprof').textContent = '+$' + fmt(stats.gross_profit);
+        document.getElementById('bt-val-grossloss').textContent = '-$' + fmt(stats.gross_loss);
+        
+        addLog('system', `Backtest complete. Return: ${stats.total_return_pct.toFixed(2)}% | Exits: ${stats.total_trades} | Profit Factor: ${stats.profit_factor}`);
+        
+        // 2. Draw large equity chart
         if (stats.capital_history && stats.capital_history.length > 0) {
-          els.btChartWrap.style.display = 'block';
-          requestAnimationFrame(() => drawBacktestChart(stats.capital_history));
+          lastBacktestHistory = stats.capital_history;
+          requestAnimationFrame(() => drawBacktestChartLarge(stats.capital_history));
+        }
+        
+        // 3. Populate Realized Trades Ledger Table
+        const tbody = document.getElementById('bt-trades-tbody');
+        tbody.innerHTML = '';
+        
+        const realized = stats.realized_trades || [];
+        if (realized.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #555555; padding: 40px;">No trades were executed in this time window.</td></tr>';
+        } else {
+          realized.forEach(t => {
+            const tr = document.createElement('tr');
+            const dateStr = new Date(t.timestamp * 1000).toLocaleString('en-US', { hour12: false });
+            
+            let pnlStyle = 'white';
+            let pnlStr = '$0.00';
+            if (t.pnl > 0) {
+              pnlStyle = 'green';
+              pnlStr = '+$' + fmt(t.pnl);
+            } else if (t.pnl < 0) {
+              pnlStyle = 'red';
+              pnlStr = '-$' + fmt(Math.abs(t.pnl));
+            }
+            
+            const sideClass = t.side.startsWith('BUY_') || t.side.includes('YES') ? 'green' : 'red';
+            const outcomeText = t.won ? '<span class="green">WON</span>' : (t.pnl < 0 ? '<span class="red">LOST</span>' : '<span class="dim">FLAT</span>');
+            
+            tr.innerHTML = `
+              <td>${dateStr}</td>
+              <td class="bold ${sideClass}">${t.side}</td>
+              <td class="num">${t.qty.toFixed(1)}</td>
+              <td class="num">$${t.entry_price.toFixed(3)}</td>
+              <td class="num">$${t.exit_price.toFixed(3)}</td>
+              <td class="num bold ${pnlStyle}">${pnlStr}</td>
+              <td style="text-align: center; font-weight: bold;">${outcomeText}</td>
+            `;
+            tbody.appendChild(tr);
+          });
         }
       } else {
         alert("Backtest failed: " + data.error);
@@ -955,13 +1262,13 @@
     els.progressBar.style.width = pct + '%';
   }
 
-  function drawBacktestChart(capHistory) {
-    const canvas = document.getElementById('chart-backtest');
+  function drawBacktestChartLarge(capHistory) {
+    const canvas = document.getElementById('chart-backtest-large');
     const ctx = canvas.getContext('2d');
     const dpr = window.devicePixelRatio || 1;
     
     const W = canvas.clientWidth;
-    const H = 85;
+    const H = 150;
     canvas.width = W * dpr;
     canvas.height = H * dpr;
     ctx.scale(dpr, dpr);
@@ -971,7 +1278,7 @@
     
     if (capHistory.length < 2) return;
     
-    const pad = { top: 6, right: 6, bottom: 6, left: 45 };
+    const pad = { top: 12, right: 12, bottom: 16, left: 60 };
     const cw = W - pad.left - pad.right;
     const ch = H - pad.top - pad.bottom;
     
@@ -982,25 +1289,28 @@
     const xOf = (i) => pad.left + (i / (capHistory.length - 1)) * cw;
     const yOf = (v) => pad.top + (1 - (v - minV) / range) * ch;
     
-    // Grid (min, max, mid)
-    ctx.strokeStyle = '#111111';
+    // Grid (min, max, and 3 mid levels)
+    ctx.strokeStyle = '#1b1b1b';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    for (const v of [minV, 0.5 * (minV + maxV), maxV]) {
+    
+    const levels = 5;
+    for (let i = 0; i < levels; i++) {
+      const v = minV + (i / (levels - 1)) * range;
       const y = yOf(v);
       ctx.moveTo(pad.left, y);
       ctx.lineTo(W - pad.right, y);
       
-      ctx.fillStyle = '#444444';
-      ctx.font = '8px monospace';
+      ctx.fillStyle = '#555555';
+      ctx.font = '9px monospace';
       ctx.textAlign = 'right';
-      ctx.fillText('$' + Math.round(v).toLocaleString(), pad.left - 4, y + 3);
+      ctx.fillText('$' + Math.round(v).toLocaleString(), pad.left - 6, y + 3);
     }
     ctx.stroke();
     
     // Draw Equity Line (Solid green)
     ctx.strokeStyle = '#00ff00';
-    ctx.lineWidth = 1.2;
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
     for (let i = 0; i < capHistory.length; i++) {
       const x = xOf(i);

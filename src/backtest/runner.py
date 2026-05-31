@@ -4,12 +4,13 @@ import os
 import json
 import numpy as np
 import polars as pl
+from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 from config.settings import SystemConfig
 from src.core.market_context import MarketContext
 from src.core.strike_manager import StrikeManager
 from src.ingestion.market_manager import MarketManager
-from src.strategies.merton_strategy import MertonStrategy
+from src.strategies.factory import StrategyFactory
 from src.execution.shadow_book import ShadowOrderBook
 from src.execution.clients import MockExecutionClient
 from src.execution.engine import ExecutionEngine
@@ -71,13 +72,14 @@ class BacktestRunner:
         recorder = DataRecorder(
             base_log_dir=self.config.LOG_DIR,
             strategy_name=strategy_name,
-            run_id=f"backtest_{int(time.time())}",
+            run_id=f"backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             buffer_size=1000
         )
         
         shadow_book = ShadowOrderBook()
-        strategy = MertonStrategy(self.config)
+        strategy = StrategyFactory.get_strategy(self.config.STRATEGY_NAME, self.config)
         client = MockExecutionClient(self.config, recorder, shadow_book)
+        client.is_backtest = True
         engine = ExecutionEngine(self.config)
         
         # Expiry tracker variables
@@ -104,10 +106,44 @@ class BacktestRunner:
         bids_l2_raw = df["bids_l2"].to_list()
         asks_l2_raw = df["asks_l2"].to_list()
 
+        # Pre-parse and pre-convert L2 books to avoid interpreter overhead inside the loop
+        bids_l2_parsed = []
+        for x in bids_l2_raw:
+            item = []
+            if isinstance(x, str):
+                try:
+                    item = json.loads(x)
+                except Exception:
+                    pass
+            elif x is not None:
+                item = x
+            bids_l2_parsed.append([(float(p), float(q)) for p, q in item])
+            
+        asks_l2_parsed = []
+        for x in asks_l2_raw:
+            item = []
+            if isinstance(x, str):
+                try:
+                    item = json.loads(x)
+                except Exception:
+                    pass
+            elif x is not None:
+                item = x
+            asks_l2_parsed.append([(float(p), float(q)) for p, q in item])
+
         total_ticks = len(df)
         capital_history = []
         trade_count = 0
         pending_orders = []
+        
+        # Caching state to avoid redundant numerical integration
+        last_eval_spot = None
+        last_eval_time = 0.0
+        last_p_yes_raw = None
+        
+        last_evaluated_p_yes = None
+        last_evaluated_best_bid = None
+        last_evaluated_best_ask = None
         
         # Simulation Loop (Chronological ticks stream)
         for i in range(total_ticks):
@@ -118,16 +154,8 @@ class BacktestRunner:
             ofi = float(ofis[i])
             vol = float(vols[i])
 
-            # Parse L2 book updates (JSON string check)
-            try:
-                bids_l2 = json.loads(bids_l2_raw[i]) if isinstance(bids_l2_raw[i], str) else bids_l2_raw[i]
-                asks_l2 = json.loads(asks_l2_raw[i]) if isinstance(asks_l2_raw[i], str) else asks_l2_raw[i]
-            except Exception:
-                bids_l2 = []
-                asks_l2 = []
-
-            bids_l2 = [(float(p), float(q)) for p, q in bids_l2]
-            asks_l2 = [(float(p), float(q)) for p, q in asks_l2]
+            bids_l2 = bids_l2_parsed[i]
+            asks_l2 = asks_l2_parsed[i]
 
             # 2. Rollover boundary checks
             if current_expiry is None or t >= current_expiry:
@@ -172,7 +200,7 @@ class BacktestRunner:
                     context_state=order["context_state"]
                 )
             
-            # 4. Construct Context & evaluate Option Fair Value
+            # 4. Construct lightweight Context (without costly book sorting)
             active_strike = strike_manager.get_strike(t, spot)
             tau_sec = max(0.0, current_expiry - t)
 
@@ -183,12 +211,29 @@ class BacktestRunner:
                 tau_seconds=tau_sec,
                 volatility=vol,
                 ofi=ofi,
-                bids_l2=shadow_book.get_sorted_bids(),
-                asks_l2=shadow_book.get_sorted_asks()
+                bids_l2=[],
+                asks_l2=[]
             )
 
-            # Merton pricing solver
-            p_yes_raw = strategy.get_probability(context)
+            # Merton pricing solver (optimized to skip redundant adaptive integrations)
+            should_eval = (
+                last_p_yes_raw is None
+                or last_eval_spot is None
+                or abs(spot - last_eval_spot) > 1e-6
+                or t - last_eval_time >= 5.0
+                or is_snap
+            )
+            
+            if should_eval:
+                p_yes_raw = strategy.get_probability(context)
+                last_p_yes_raw = p_yes_raw
+                last_eval_spot = spot
+                last_eval_time = t
+            else:
+                p_yes_raw = last_p_yes_raw
+                # Keep the calibrator's tick buffer perfectly updated if supported
+                if hasattr(strategy, "vol_calibrator"):
+                    strategy.vol_calibrator.add_tick(spot, t)
 
             # Time-based EMA on p_yes — same logic as the live orchestrator.
             # Prevents raw OFI oscillations from generating a trade signal every tick.
@@ -208,19 +253,54 @@ class BacktestRunner:
             else:
                 p_yes = None
 
-            # 5. Record Tick update in Parquet buffer
-            recorder.record_tick(t, spot, ofi, vol, bids_l2, asks_l2)
+            # 5. Record Tick update in Parquet buffer (bypassed in backtest to eliminate I/O bottleneck)
+            # recorder.record_tick(t, spot, ofi, vol, bids_l2, asks_l2)
 
             # 6. Engine Decisions & routing execution
-            # Prevent spamming fragmented orders while waiting for latency delay
-            if not pending_orders:
+            # Check if we can bypass evaluation for trade decisions
+            top_b_sh, top_a_sh = shadow_book.get_top_of_book()
+            cur_best_bid = top_b_sh[0] if top_b_sh else None
+            cur_best_ask = top_a_sh[0] if top_a_sh else None
+            
+            has_positions = (client.get_position_size("YES") > 1e-9 or client.get_position_size("NO") > 1e-9)
+            
+            should_eval_trade = (
+                last_evaluated_p_yes is None
+                or p_yes is None
+                or should_eval
+                or abs(p_yes - last_evaluated_p_yes) > 1e-5
+                or cur_best_bid != last_evaluated_best_bid
+                or cur_best_ask != last_evaluated_best_ask
+                or ready_orders
+                or has_positions
+                or is_snap
+            )
+            
+            decision = {"side": "HOLD"}
+            if should_eval_trade and not pending_orders:
+                # Upgrade context with sorted L2 book ONLY when evaluating trade!
+                context = MarketContext(
+                    timestamp=t,
+                    spot_price=spot,
+                    strike_price=active_strike,
+                    tau_seconds=tau_sec,
+                    volatility=vol,
+                    ofi=ofi,
+                    bids_l2=shadow_book.get_sorted_bids(),
+                    asks_l2=shadow_book.get_sorted_asks()
+                )
+                
                 decision = engine.evaluate_and_trade(p_yes, context, client)
+                
+                last_evaluated_p_yes = p_yes
+                last_evaluated_best_bid = cur_best_bid
+                last_evaluated_best_ask = cur_best_ask
                 
                 if decision["side"] != "HOLD":
                     trade_count += 1
                     # Compute implied market price from the REAL book (not shadow)
-                    top_b, top_a = shadow_book.get_market_top_of_book()
-                    p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+                    top_b_real, top_a_real = shadow_book.get_market_top_of_book()
+                    p_mkt = 0.5 * (top_b_real[0] + top_a_real[0]) if top_b_real and top_a_real else p_yes
                     
                     # Log Signal event
                     recorder.record_signal(
@@ -279,25 +359,115 @@ class BacktestRunner:
         # Calculate max drawdown
         peak = self.config.arbitrage.INITIAL_CAPITAL
         max_dd = 0.0
+        max_dd_usd = 0.0
         for eq in capital_history:
             if eq > peak:
                 peak = eq
             dd = (peak - eq) / peak * 100.0 if peak > 0 else 0.0
+            dd_usd = peak - eq
             if dd > max_dd:
                 max_dd = dd
+            if dd_usd > max_dd_usd:
+                max_dd_usd = dd_usd
                 
         # Downsample capital history for chart rendering performance (max 300 points)
         step = max(1, len(capital_history) // 300)
         downsampled_cap = [float(c) for c in capital_history[::step]]
         if capital_history and (len(capital_history) - 1) % step != 0:
             downsampled_cap.append(float(capital_history[-1]))
-            
-        return {
+
+        # Calculate advanced performance metrics from client.realized_trades
+        realized = client.realized_trades
+        wins = [t for t in realized if t["pnl"] > 0.0]
+        losses = [t for t in realized if t["pnl"] < 0.0]
+        flats = [t for t in realized if t["pnl"] == 0.0]
+
+        winning_trades = len(wins)
+        losing_trades = len(losses)
+        flat_trades = len(flats)
+        total_realized_trades = len(realized)
+
+        gross_profit = sum(t["pnl"] for t in wins)
+        gross_loss = sum(abs(t["pnl"]) for t in losses)
+
+        import math
+        def safe_json_float(val: float) -> Any:
+            if math.isinf(val) or math.isnan(val):
+                return "N/A"
+            return float(val)
+
+        profit_factor = safe_json_float(gross_profit / gross_loss) if gross_loss > 0.0 else ("N/A" if gross_profit == 0.0 else "∞")
+        win_rate_pct = (winning_trades / total_realized_trades * 100.0) if total_realized_trades > 0 else 0.0
+        
+        avg_win = gross_profit / winning_trades if winning_trades > 0 else 0.0
+        avg_loss = gross_loss / losing_trades if losing_trades > 0 else 0.0
+        
+        win_loss_ratio = safe_json_float(avg_win / avg_loss) if avg_loss > 0.0 else ("N/A" if avg_win == 0.0 else "∞")
+
+        serialized_trades = []
+        for t in realized:
+            serialized_trades.append({
+                "timestamp": float(t["timestamp"]),
+                "side": str(t["side"]),
+                "qty": float(t["qty"]),
+                "entry_price": float(t["entry_price"]),
+                "exit_price": float(t["exit_price"]),
+                "pnl": float(t["pnl"]),
+                "won": bool(t["won"])
+            })
+
+        results = {
             "final_cash": client.cash_balance,
             "net_pnl": total_pnl,
             "total_return_pct": total_return_pct,
             "max_drawdown_pct": max_dd,
-            "total_trades": trade_count,
+            "max_drawdown_usd": max_dd_usd,
+            "total_trades": total_realized_trades,
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+            "flat_trades": flat_trades,
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "profit_factor": profit_factor,
+            "win_rate_pct": win_rate_pct,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "win_loss_ratio": win_loss_ratio,
             "capital_history": downsampled_cap,
+            "realized_trades": serialized_trades,
             "log_dir": recorder.log_dir
         }
+
+        # Write summary.json to the backtest log directory
+        summary_path = os.path.join(recorder.log_dir, "summary.json")
+        summary_data = {
+            "timestamp": datetime.now().isoformat(),
+            "strategy": strategy_name,
+            "ticks_processed": total_ticks,
+            "initial_capital": self.config.arbitrage.INITIAL_CAPITAL,
+            "final_cash": client.cash_balance,
+            "net_pnl": total_pnl,
+            "total_return_pct": total_return_pct,
+            "max_drawdown_pct": max_dd,
+            "max_drawdown_usd": max_dd_usd,
+            "total_trades": total_realized_trades,
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+            "flat_trades": flat_trades,
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "profit_factor": profit_factor,
+            "win_rate_pct": win_rate_pct,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "win_loss_ratio": win_loss_ratio,
+            "realized_trades": serialized_trades
+        }
+        try:
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary_data, f, indent=2, ensure_ascii=False)
+            logger.info(f"[BacktestRunner] Summary saved to: {summary_path}")
+        except Exception as e:
+            logger.error(f"[BacktestRunner] Failed to write summary.json: {e}")
+
+        return results

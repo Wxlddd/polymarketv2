@@ -50,7 +50,10 @@ def get_overlapping_files(data_dir: str, start_time: float, end_time: float):
                         pass
             
             if ts is not None:
-                files_with_ts.append((ts, file_path))
+                if ts > 5e9:
+                    ts /= 1000.0
+                if "tick" in basename.lower():
+                    files_with_ts.append((ts, file_path))
                 
     files_with_ts.sort(key=lambda x: x[0])
     
@@ -86,6 +89,12 @@ def parse_args():
         default=None,
         help="End datetime or timestamp (e.g. '2026-05-26 01:43')"
     )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default=None,
+        help="Active pricing strategy to use (e.g. 'merton', 'legacy_merton')"
+    )
     return parser.parse_args()
 
 async def main():
@@ -93,6 +102,8 @@ async def main():
     print("=== Polymarket V2 Backtest Replay ===")
     
     config = SystemConfig()
+    if args.strategy:
+        config.__dict__["STRATEGY_NAME"] = args.strategy
     runner = BacktestRunner(config)
     
     # 1. Load data based on arguments
@@ -113,6 +124,7 @@ async def main():
             return
             
         data_dirs = [
+            "logs",
             os.path.join("data", "raw"),
             "c:/Users/loren/Documents/AntiGravity Projects/polymarket/data/raw"
         ]
@@ -213,8 +225,13 @@ async def main():
     print(f"Ending Cash:        ${results['final_cash']:,.2f}")
     print(f"Net Profit/Loss:    {results['net_pnl']:+,.2f} USD")
     print(f"Return Rate:        {results['total_return_pct']:+.2f}%")
-    print(f"Max Drawdown:       -{results['max_drawdown_pct']:.2f}%")
-    print(f"Total Trades:       {results['total_trades']}")
+    print(f"Max Drawdown:       -{results['max_drawdown_pct']:.2f}% ($-{results['max_drawdown_usd']:,.2f})")
+    print(f"Total Exits:        {results['total_trades']}")
+    print(f"Win Rate:           {results['win_rate_pct']:.2f}% ({results['winning_trades']} W / {results['losing_trades']} L / {results['flat_trades']} F)")
+    print(f"Profit Factor:      {results['profit_factor']}")
+    print(f"Win/Loss Ratio:     {results['win_loss_ratio']}")
+    print(f"Average Win/Loss:   ${results['avg_win']:,.2f} / ${results['avg_loss']:,.2f}")
+    print(f"Gross Profit/Loss:  ${results['gross_profit']:,.2f} / ${results['gross_loss']:,.2f}")
     print(f"Logs Saved to:      {results['log_dir']}")
     print("==============================================")
     

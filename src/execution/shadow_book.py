@@ -209,6 +209,10 @@ class ShadowOrderBook(IOrderBook):
         self.prev_best_ask_qty: float = 0.0
         self.smoothed_ofi: float = 0.0
 
+        # ── Caches ───────────────────────────────────────────────────────────
+        self._cached_top_of_book: Optional[Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]] = None
+        self._cached_market_top_of_book: Optional[Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]] = None
+
     # ──────────────────────────────────────────────────────────────────────────
     # Core Feed Integration
     # ──────────────────────────────────────────────────────────────────────────
@@ -240,6 +244,9 @@ class ShadowOrderBook(IOrderBook):
         if timestamp > 0.0:
             self._t_now = timestamp
         t = self._t_now
+
+        self._cached_top_of_book = None
+        self._cached_market_top_of_book = None
 
         if is_snapshot:
             self.q_real_bids.clear()
@@ -273,7 +280,16 @@ class ShadowOrderBook(IOrderBook):
                 v_new = float(qty)
                 self._tracker_asks.reconcile(p, v_old, v_new, t)
                 self.q_real_asks[p] = v_new
-
+ 
+        # ── Prune Deep Levels (keep top 20 on each side) ────────────────────
+        if len(self.q_real_bids) > 25:
+            keep_bids = sorted(self.q_real_bids.keys(), reverse=True)[:20]
+            self.q_real_bids = {p: self.q_real_bids[p] for p in keep_bids}
+            
+        if len(self.q_real_asks) > 25:
+            keep_asks = sorted(self.q_real_asks.keys())[:20]
+            self.q_real_asks = {p: self.q_real_asks[p] for p in keep_asks}
+            
         # ── OFI Calculation (on effective book) ─────────────────────────────
         raw_ofi = self._calculate_ofi()
         self.smoothed_ofi = 0.1 * raw_ofi + 0.9 * self.smoothed_ofi
@@ -313,6 +329,7 @@ class ShadowOrderBook(IOrderBook):
             timestamp:    Execution timestamp (defaults to last known t_now).
         """
         t = timestamp if timestamp > 0.0 else self._t_now
+        self._cached_top_of_book = None
 
         if fills is not None:
             # ── Exact per-level accounting (preferred) ───────────────────────
@@ -373,11 +390,28 @@ class ShadowOrderBook(IOrderBook):
 
     def get_top_of_book(self) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
         """Returns best (bid, ask) as (price, V_eff) tuples from the shadow book."""
-        sorted_bids = self.get_sorted_bids()
-        sorted_asks = self.get_sorted_asks()
-        best_bid = sorted_bids[0] if sorted_bids else None
-        best_ask = sorted_asks[0] if sorted_asks else None
-        return best_bid, best_ask
+        if self._cached_top_of_book is not None:
+            return self._cached_top_of_book
+
+        t = self._t_now
+        best_bid = None
+        best_bid_p = -1.0
+        for p, v_hist in self.q_real_bids.items():
+            v_eff = self._tracker_bids.get_v_eff(p, v_hist, t)
+            if v_eff > 1e-9 and p > best_bid_p:
+                best_bid_p = p
+                best_bid = (p, v_eff)
+                
+        best_ask = None
+        best_ask_p = 1e12
+        for p, v_hist in self.q_real_asks.items():
+            v_eff = self._tracker_asks.get_v_eff(p, v_hist, t)
+            if v_eff > 1e-9 and p < best_ask_p:
+                best_ask_p = p
+                best_ask = (p, v_eff)
+        
+        self._cached_top_of_book = (best_bid, best_ask)
+        return self._cached_top_of_book
 
     def get_market_top_of_book(self) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
         """
@@ -385,18 +419,25 @@ class ShadowOrderBook(IOrderBook):
         Never depleted by paper fills — used for p_mkt display and MTM so that
         simulated trades do not corrupt the displayed market-implied probability.
         """
-        sorted_bids = sorted(
-            [(p, q) for p, q in self.q_real_bids.items() if q > 1e-9],
-            key=lambda x: x[0],
-            reverse=True
-        )
-        sorted_asks = sorted(
-            [(p, q) for p, q in self.q_real_asks.items() if q > 1e-9],
-            key=lambda x: x[0]
-        )
-        best_bid = sorted_bids[0] if sorted_bids else None
-        best_ask = sorted_asks[0] if sorted_asks else None
-        return best_bid, best_ask
+        if self._cached_market_top_of_book is not None:
+            return self._cached_market_top_of_book
+
+        best_bid = None
+        best_bid_p = -1.0
+        for p, q in self.q_real_bids.items():
+            if q > 1e-9 and p > best_bid_p:
+                best_bid_p = p
+                best_bid = (p, q)
+                
+        best_ask = None
+        best_ask_p = 1e12
+        for p, q in self.q_real_asks.items():
+            if q > 1e-9 and p < best_ask_p:
+                best_ask_p = p
+                best_ask = (p, q)
+        
+        self._cached_market_top_of_book = (best_bid, best_ask)
+        return self._cached_market_top_of_book
 
     # ──────────────────────────────────────────────────────────────────────────
     # OFI

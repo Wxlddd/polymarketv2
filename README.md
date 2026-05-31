@@ -1,59 +1,61 @@
 # Polymarket V2: High-Frequency Options Pricing & Execution Engine
 
-Polymarket V2 è un'architettura ultra-modulare ad alte prestazioni progettata per il pricing quantitativo e l'esecuzione automatizzata sui mercati opzionali binari a 5 minuti di Polymarket (Up/Down). Il sistema implementa il modello a salti di Merton (MJD) risolto nello spazio delle frequenze tramite inversione di Fourier (Gil-Pelaez) con tecniche di riduzione della varianza, integrando un motore di sizing Kelly frazionario e controlli di rischio per contesti High-Frequency Trading (HFT).
+Polymarket V2 è un'architettura ultra-modulare ad alte prestazioni progettata per il pricing quantitativo e l'esecuzione automatizzata sui mercati opzionali binari a 5 minuti di Polymarket (Up/Down). Il sistema implementa il modello a salti di Merton (MJD) con intensità di salto stocastiche guidate da un processo di Hawkes bivariato accoppiato, risolto nello spazio delle frequenze tramite inversione di Fourier (Gil-Pelaez) con quadratura vettorizzata di Gauss-Legendre e variata di controllo Black-Scholes, integrando un motore di sizing Kelly frazionario e controlli di rischio per contesti High-Frequency Trading (HFT).
 
 ---
 
 ## Modello Matematico e Pricing
 
-### 1. Dinamica del Sottostante: Merton Jump-Diffusion
-Il prezzo del sottostante $S_t$ segue un processo di diffusione con salti governato dalla seguente equazione differenziale stocastica (SDE):
+### 1. Dinamica del Sottostante: Hawkes-Driven Merton Jump-Diffusion
+Il prezzo del sottostante $S_t$ segue un processo di diffusione con salti asimmetrici governato dalla seguente equazione differenziale stocastica (SDE):
 
-$$dS_t = \mu S_t dt + \sigma S_t dW_t + S_t d\left( \sum_{i=1}^{N_t} (V_i - 1) \right)$$
+$$dS_t = \mu_t S_t dt + \sigma S_t dW_t + S_t d\left( \sum_{i=1}^{N_t^+} (V_i^+ - 1) \right) + S_t d\left( \sum_{j=1}^{N_t^-} (V_j^- - 1) \right)$$
 
 Dove:
-- $\mu$ rappresenta il tasso di drift istantaneo continuo.
-- $\sigma$ rappresenta il coefficiente di diffusione continuo (volatilità realizzata).
+- $\mu_t$ rappresenta il tasso di drift istantaneo continuo, modulato opzionalmente dall'OFI.
+- $\sigma$ rappresenta il coefficiente di diffusione continuo (volatilità realizzata HF).
 - $W_t$ rappresenta un moto browniano standard su uno spazio di probabilità filtrato.
-- $N_t$ rappresenta un processo di Poisson omogeneo con intensità di salto $\lambda$, indipendente da $W_t$.
-- $V_i$ rappresenta l'ampiezza del salto stocastico $i$-esimo, con $Y_i = \ln(V_i) \sim \mathcal{N}(\mu_j, \sigma_j^2)$.
+- $N_t^+, N_t^-$ rappresentano processi di conteggio con intensità stocastiche $\lambda^+(t), \lambda^-(t)$.
+- $V_i^+$ e $V_j^-$ rappresentano le ampiezze di salto positive e negative rispettivamente, con $Y^+ = \ln(V^+) \sim \mathcal{N}(\mu_j^+, (\sigma_j^+)^2)$ e $Y^- = \ln(V^-) \sim \mathcal{N}(\mu_j^-, (\sigma_j^-)^2)$.
 
-Il log-prezzo $x_t = \ln(S_t)$ segue la dinamica differenziale stocastica:
+### 2. Processo di Hawkes Bivariato Accoppiato
+Le intensità di salto $\lambda^+(t)$ e $\lambda^-(t)$ evolvono secondo un processo di Hawkes bivariato simmetrico con eccitazione incrociata:
 
-$$dx_t = \left( \mu - \frac{1}{2}\sigma^2 - \lambda \kappa \right)dt + \sigma dW_t + \sum_{i=1}^{dN_t} Y_i$$
+$$\lambda^+(t_k) = \lambda_0 + (\lambda^+(t_{k-1}) - \lambda_0) e^{-\beta \Delta t} + \kappa_{\text{self}} \cdot \text{OFI}^+ + \kappa_{\text{cross}} \cdot \text{OFI}^-$$
 
-Con il correttore di deriva definito da:
+$$\lambda^-(t_k) = \lambda_0 + (\lambda^-(t_{k-1}) - \lambda_0) e^{-\beta \Delta t} + \kappa_{\text{self}} \cdot \text{OFI}^- + \kappa_{\text{cross}} \cdot \text{OFI}^+$$
 
-$$\kappa = \mathbb{E}[e^{Y_i}] - 1 = \exp\left(\mu_j + \frac{1}{2}\sigma_j^2\right) - 1$$
+Dove:
+- $\lambda_0$ è l'intensità di base (baseline intensity).
+- $\kappa_{\text{self}}$ è il coefficiente di auto-eccitazione.
+- $\kappa_{\text{cross}}$ è il coefficiente di eccitazione incrociata.
+- $\beta$ è il parametro di decadimento esponenziale.
+- $\text{OFI}^+ = \max(\text{OFI}, 0)$ e $\text{OFI}^- = \max(-\text{OFI}, 0)$ sono le componenti direzionali dell'OFI.
 
-### 2. Funzione Caratteristica dell'Asset
+**Vincolo di stazionarietà**: Il sistema verifica automaticamente che il raggio spettrale della matrice di branching sia $< 1$ (cioè $\kappa_{\text{self}} + \kappa_{\text{cross}} < \beta$). In caso contrario, i parametri vengono riscalati automaticamente per garantire la stabilità ($\rho = 0.8$).
+
+### 3. Funzione Caratteristica dell'Asset
 La funzione caratteristica $\phi(u)$ di $x_T = \ln(S_T)$ al tempo di scadenza $\tau = T - t$ è definita in forma chiusa come:
 
-$$\phi(u) = \exp\left( i u x_t + i u b \tau - \frac{1}{2}\sigma^2 u^2 \tau + \lambda \tau \left( e^{i u \mu_j - \frac{1}{2}\sigma_j^2 u^2} - 1 \right) \right)$$
+$$\phi(u) = \exp\left( i u x_t + i u b \tau - \frac{1}{2}\sigma^2 u^2 \tau + \lambda^+ \tau \left( e^{i u \mu_j^+ - \frac{1}{2}(\sigma_j^+)^2 u^2} - 1 \right) + \lambda^- \tau \left( e^{i u \mu_j^- - \frac{1}{2}(\sigma_j^-)^2 u^2} - 1 \right) \right)$$
 
 Dove la deriva complessiva corretta per la martingala è definita da:
 
-$$b = \mu - \lambda\kappa - \frac{1}{2}\sigma^2$$
+$$b = \mu_t - \lambda^+ \kappa^+ - \lambda^- \kappa^- - \frac{1}{2}\sigma^2$$
 
-### 3. Soluzione di Gil-Pelaez con Riduzione della Varianza
-La probabilità teorica $P(S_T > K)$ che l'opzione YES scada in-the-money (cioè che lo spot alla scadenza superi il prezzo strike $K$) viene espressa tramite l'inversione di Fourier di Gil-Pelaez:
-
-$$P(S_T > K) = \frac{1}{2} + \frac{1}{\\pi} \int_0^\infty \text{Im}\left[ \frac{e^{-i u \ln K} \phi(u)}{u} \right] du$$
-
-Per eliminare le instabilità numeriche ad alta frequenza in prossimità della scadenza ($\tau \to 0$), il sistema applica una tecnica di riduzione della varianza basata su Black-Scholes come variata di controllo (Control Variate):
+### 4. Soluzione di Gil-Pelaez con Gauss-Legendre Vettorizzato
+La probabilità teorica $P(S_T > K)$ che l'opzione YES scada in-the-money viene espressa tramite l'inversione di Fourier di Gil-Pelaez con variata di controllo Black-Scholes:
 
 $$P(S_T > K) = P_{\text{BS}}(S_T > K) + \frac{1}{\pi} \int_0^\infty \text{Im}\left[ \frac{e^{-i u \ln K} \left( \phi(u) - \phi_{\text{BS}}(u) \right)}{u} \right] du$$
 
-Dove:
-- $P_{\text{BS}}(S_T > K) = \Phi(d_2)$ indica la probabilità analitica del modello geometrico browniano continuo.
-- $\phi_{\text{BS}}(u)$ rappresenta la funzione caratteristica di Black-Scholes con i medesimi parametri continui di deriva e volatilità.
+L'integrale viene risolto con quadratura di Gauss-Legendre a 64 nodi, completamente vettorizzata su NumPy, eliminando il loop scalare di `scipy.integrate.quad` e ottenendo un speedup di circa 10x rispetto all'implementazione precedente.
 
 ---
 
 ## Modulo di Microstruttura ed Esecuzione
 
 ### 1. Stima del Drift Istantaneo tramite OFI
-Il drift di breve termine $\mu$ viene stimato in tempo reale a partire dall'Order Flow Imbalance (OFI) estratto dal book L2 delle quotazioni:
+Il drift di breve termine $\mu_t$ viene stimato in tempo reale a partire dall'Order Flow Imbalance (OFI) estratto dal book L2 delle quotazioni:
 
 $$\text{OFI}_t = \Delta \text{Bid}_t - \Delta \text{Ask}_t$$
 
@@ -63,49 +65,66 @@ $$\Delta \text{Bid}_t = \begin{cases} I(P^{\text{bid}}_t > P^{\text{bid}}_{t-1})
 
 $$\Delta \text{Ask}_t = \begin{cases} I(P^{\text{ask}}_t < P^{\text{ask}}_{t-1}) \cdot Q^{\text{ask}}_t \\ I(P^{\text{ask}}_t = P^{\text{ask}}_{t-1}) \cdot (Q^{\text{ask}}_t - Q^{\text{ask}}_{t-1}) \\ 0 \end{cases}$$
 
-Il drift istantaneo annualizzato è ottenuto riscalando l'OFI livellato tramite un moltiplicatore $\gamma$ (valore corrente: `-1e-7`, segno negativo validato empiricamente):
+Il drift istantaneo annualizzato è ottenuto riscalando l'OFI livellato tramite un moltiplicatore $\gamma$:
 
-$$\mu_t = \mu_{\text{default}} + \text{OFI}_{\text{smoothed}} \cdot \gamma \cdot (365.25 \times 24 \times 3600)$$
+$$\mu_t = r + \text{OFI}_{\text{smoothed}} \cdot \gamma \cdot (365.25 \times 24 \times 3600)$$
 
-La probabilità Merton risultante è stabilizzata con un filtro EMA a $\alpha = 0.05$ (~30s di memoria a 1 tick/s).
+La probabilità Merton risultante è stabilizzata con un filtro EMA time-based con halflife adattivo (compresso verso la scadenza).
 
 ### 2. Sizing Frazionario di Kelly
-L'esposizione ottimale in percentuale del capitale di portafoglio sul book YES/NO viene calibrata applicando la formula di Kelly frazionaria:
+L'esposizione ottimale in percentuale del capitale di portafoglio sul book YES/NO viene calibrata applicando la formula di Kelly frazionaria con buffer di regolarizzazione per le commissioni taker:
 
-$$f^* = \frac{P \cdot (b + 1) - 1}{b} \cdot f_{\text{Kelly}}$$
+$$f^*_{\text{YES}} = \gamma \cdot \frac{p_{\text{yes}} - p_{\text{ask}}}{1 - p_{\text{ask}}}$$
 
-Dove:
-- $P$ è la probabilità corretta stimata dal modello teorico di Merton.
-- $b$ rappresenta le quote del mercato (odds), calcolate come $b = \frac{1 - P_{\text{market}}}{P_{\text{market}}}$.
-- $f_{\text{Kelly}}$ indica il fattore frazionario di Kelly per limitare l'over-betting in contesti con rischi di modello o latenza.
+Il target effettivo è regolarizzato con un buffer $\delta = \text{taker\_fee\_multiplier} \times \gamma$ per evitare churning su edge marginali.
 
 ---
 
 ## Architettura del Shadow Order Book
 
-Il `ShadowOrderBook` mantiene due rappresentazioni distinte e indipendenti del book L2:
+Il `ShadowOrderBook` implementa un'architettura a doppio libro con un ledger di consumo parallelo basato su decadimento esponenziale:
 
-| Book | Struttura dati | Scopo |
-|---|---|---|
-| **Real Book** (`q_real_bids/asks`) | Aggiornato da ogni tick CLOB | Calcolo di `p_mkt` (probabilità implicita di mercato) |
-| **Shadow Book** (`q_shadow_bids/asks`) | Stesso del Real Book, ma depleto da `paper_execute` | Calcolo VWAP, sizing Kelly, filtri di rischio |
+| Componente | Descrizione |
+|---|---|
+| **V_hist** (`q_real_bids/asks`) | Stato storico del book L2 — aggiornato esclusivamente dai tick del feed WebSocket. Mai mutato da paper fills. |
+| **V_cons** (`ConsumptionTracker`) | Ledger di consumo parallelo — registra SOLO la liquidità consumata dal bot. Decade esponenzialmente con half-life configurabile (default 0.2s) per modellare la latenza di re-quoting dei Market Maker. |
+| **V_eff** | Volume effettivo disponibile: $V_{\text{eff}}(p, t) = \max(0, V_{\text{hist}}(p) - V_{\text{cons}}(p, t))$ |
 
-Il `paper_execute` depleta solo il Shadow Book, mai il Real Book. Questo garantisce che la probabilità di mercato visualizzata nella dashboard rifletta sempre la vera liquidità disponibile, indipendentemente dalle fill simulate.
+### Riconciliazione Event-Driven
+Ad ogni tick del feed, il tracker esegue una riconciliazione event-driven:
+- **Replenishment** ($\Delta V > 0$): $V_{\text{cons}} \leftarrow \max(0, V_{\text{cons}} - \Delta V)$
+- **Drop/Removal** ($\Delta V \leq 0$): $V_{\text{cons}} \leftarrow \min(V_{\text{cons}}, V_{\text{new}})$
 
-### Risoluzione dello Strike in Tempo Reale
-Se la Gamma API non fornisce lo strike price $K$ all'avvio, il sistema cattura il **primo tick Chainlink** generato immediatamente dopo l'inizio del ciclo (`cycle_start = expiry - 300s`) e lo utilizza come strike di riferimento dell'opzione attiva.
+### Pruning e Caching
+- I livelli profondi vengono potati (top 20 per lato) per eliminare overhead CPU su livelli irrilevanti.
+- Le query `get_top_of_book()` e `get_market_top_of_book()` sono cachate e invalidate solo su aggiornamenti o paper fills.
 
 ### Prevenzione del Double Trade
-Il callback CLOB (`_clob_callback`) è una coroutine `async` che esegue `await client.execute_trade(...)` prima di restituire il controllo al loop. Questo garantisce che `paper_execute` abbia già depleto il Shadow Book prima dell'arrivo del tick successivo, prevenendo segnali duplicati sulla stessa opportunità.
-
-### Mitigazione del "Ghost Token" (Bug Fix)
-In precedenza, se la query delle API di Gamma per i nuovi token ID falliva durante il rollover, il sistema manteneva i token del ciclo precedente. Questo portava ad arbitraggi falsi su contratti morti (scambiati a $0.01) con payoff simulati errati.
-- **Risoluzione Robustezza Gamma API**: È stato implementato un ciclo di retry con backoff fino a 5 tentativi se le chiamate API falliscono.
-- **Gestione Token Stale**: Se i token falliscono del tutto la risoluzione, `YES_TOKEN_ID` e `NO_TOKEN_ID` vengono impostati a `None` e il feed CLOB viene disattivato, prevenendo trading su contratti scaduti.
-- **Mid-Cycle Auto-Recovery**: Il loop di discovery riprova periodicamente a risolvere i token mancanti ogni 10 secondi durante il ciclo, riavviando il feed e ripristinando il trading appena l'API ritorna disponibile.
+Il callback CLOB (`_clob_callback`) è una coroutine `async` che esegue `await client.execute_trade(...)` prima di restituire il controllo al loop. Questo garantisce che `paper_execute` abbia già registrato i fill nel consumption tracker prima dell'arrivo del tick successivo.
 
 ### Keep-Awake Windows
 Il sistema esegue un loop asincrono `_keep_awake_loop` che aggiorna ogni 30 secondi il `SetThreadExecutionState` di Windows con i flag `ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED`, prevenendo lo standby durante le sessioni di trading prolungate.
+
+---
+
+## Backtester Storico Event-Driven
+
+Il motore di backtest (`BacktestRunner`) replica fedelmente la pipeline di esecuzione live su dati storici ad alta frequenza, con le seguenti ottimizzazioni:
+
+- **Bypass intelligente**: Le valutazioni dell'engine vengono saltate quando probabilità, top-of-book e posizioni non sono cambiati (riduzione del 83% delle chiamate).
+- **Ricerca binaria $O(\log N)$**: Le query di staleness e pin risk usano `bisect` invece di scansioni lineari.
+- **L2 sorting lazy**: Il book L2 viene ordinato solo quando serve valutare un trade, non su ogni tick.
+- **Latenza simulata**: Gli ordini vengono messi in coda con un delay stocastico uniforme $[150, 300]$ ms per simulare la latenza di rete.
+
+### Output
+Ogni run di backtest produce nella cartella `logs/YYYY-MM-DD/merton/backtest_YYYYMMDD_HHMMSS/`:
+- `signals.csv` — segnali di trading generati
+- `trades.csv` — esecuzioni simulate
+- `summary.json` — report completo con tutte le metriche di performance:
+  - Net P&L, Return %, Max Drawdown (% e USD)
+  - Win Rate, Profit Factor, Win/Loss Ratio
+  - Gross Profit/Loss, Average Win/Loss
+  - Lista completa dei trade realizzati con entry/exit price e P&L
 
 ---
 
@@ -114,37 +133,40 @@ Il sistema esegue un loop asincrono `_keep_awake_loop` che aggiorna ogni 30 seco
 ```
 polymarketv2/
 ├── config/
-│   └── settings.py          # Gestione configurazioni da variabili d'ambiente (.env)
+│   └── settings.py               # Gestione configurazioni da variabili d'ambiente (.env)
 ├── src/
 │   ├── core/
-│   │   ├── base_strategy.py # Classe base per l'astrazione delle strategie quantitative
-│   │   ├── events.py        # Eventi di log e segnali HFT disaccoppiati
-│   │   ├── interfaces.py    # Interfacce astratte per feed dati, esecuzione e log
-│   │   ├── market_context.py# Modello dati unificato MarketContext
-│   │   └── strike_manager.py# Gestore dello Strike Price K
+│   │   ├── base_strategy.py      # Classe base per l'astrazione delle strategie quantitative
+│   │   ├── events.py             # Eventi di log e segnali HFT disaccoppiati
+│   │   ├── interfaces.py         # Interfacce astratte per feed dati, esecuzione e log
+│   │   ├── market_context.py     # Modello dati unificato MarketContext
+│   │   └── strike_manager.py     # Gestore dello Strike Price K
 │   ├── ingestion/
-│   │   ├── live_feeds.py    # WebSocket Chainlink Spot Feed & CLOB L2 Orderbook Feed (YES-only)
-│   │   └── market_manager.py# Dynamic discovery dei mercati Gamma API & Rollover
+│   │   ├── live_feeds.py         # WebSocket Chainlink Spot Feed & CLOB L2 Orderbook Feed (YES-only)
+│   │   └── market_manager.py     # Dynamic discovery dei mercati Gamma API & Rollover
 │   ├── strategies/
-│   │   └── merton_strategy.py# Caratteristica Merton, Gil-Pelaez e calibrazione Vol/OFI
+│   │   ├── factory.py            # Strategy Factory — risoluzione dinamica della strategia attiva
+│   │   ├── merton_strategy.py    # Hawkes-Merton bivariato, Gil-Pelaez vettorizzato, calibrazione Vol/OFI
+│   │   └── legacy_merton_strategy.py # Legacy Merton strategy (Poisson omogeneo, scipy.integrate.quad)
 │   ├── execution/
-│   │   ├── shadow_book.py   # Dual-book L2 (Real + Shadow) con get_market_top_of_book()
-│   │   ├── engine.py        # Walk del book L2, Kelly sizing e filtri di rischio (Pin, Desync, PoF)
-│   │   └── clients.py       # Mock/Simulated Execution Client per paper trading e backtest
+│   │   ├── shadow_book.py        # Shadow Book con ConsumptionTracker (V_hist + V_cons + V_eff)
+│   │   ├── engine.py             # Walk del book L2, Kelly sizing e filtri di rischio (Pin, Desync, PoF)
+│   │   └── clients.py            # Mock/Simulated Execution Client per paper trading e backtest
+│   ├── backtest/
+│   │   └── runner.py             # Event-Driven Backtester con summary.json automatico
 │   ├── logging/
-│   │   └── recorder.py      # Scrittura Parquet (ticks) e CSV (segnali/esecuzioni) ad alte prestazioni
+│   │   └── recorder.py           # Scrittura Parquet (ticks) e CSV (segnali/esecuzioni) ad alte prestazioni
 │   └── ui/
-│       ├── dashboard.py     # Terminal Dashboard Rich CLI (locale)
-│       ├── web_server.py    # Integrated HTTP/WS Server (Bloomberg Web Dashboard)
-│       └── dashboard.html   # Bloomberg Stark Terminal UI (Flat black, no shadows, 2D canvases)
+│       ├── dashboard.py          # Terminal Dashboard Rich CLI (locale)
+│       ├── web_server.py         # Integrated HTTP/WS Server (Bloomberg Web Dashboard)
+│       └── dashboard.html        # Bloomberg Stark Terminal UI con tab Live Monitor + Backtester
 ├── tests/
-│   ├── verify_dashboard.py            # Convalida terminal CLI Rich Dashboard
-│   ├── verify_live_data_and_pricing.py# Convalida della pipeline dei prezzi in tempo reale
-│   ├── verify_phase1.py               # Convalida dei log Parquet e modulo dati
-│   ├── verify_phase2.py               # Convalida slug e risoluzione strike
-│   ├── verify_phase3.py               # Convalida pricing Merton e calibrazione vol
-│   ├── verify_phase4.py               # Convalida shadow book ed esecuzione ordini
-│   └── verify_web_server.py           # Convalida degli endpoint HTTP/WS del web server
+│   ├── verify_live_data_and_pricing.py  # Convalida della pipeline dei prezzi in tempo reale
+│   ├── verify_phase3.py                 # Convalida pricing Merton e calibrazione vol
+│   ├── verify_phase4.py                 # Convalida shadow book ed esecuzione ordini
+│   ├── verify_web_server.py             # Convalida degli endpoint HTTP/WS del web server
+│   ├── verify_factory.py               # Convalida della Strategy Factory
+│   └── benchmark_pricing.py            # Benchmark performance del pricer
 ├── main.py                  # Entrypoint dell'Orchestratore Live/Paper Trading
 ├── run_backtest.py          # Script CLI per avviare il Backtester Storico Temporale
 ├── pyproject.toml           # Gestione dipendenze e configurazione del progetto Python (uv)
@@ -157,15 +179,17 @@ polymarketv2/
 
 | Parametro | Valore corrente | Descrizione |
 |---|---|---|
-| `OFI_DRIFT_MULTIPLIER` | `-1e-7` | Scala OFI → drift annualizzato (segno negativo validato empiricamente) |
-| `DEFAULT_LAMBDA` | `4000` | Intensità di salto Poisson (salti/anno) |
+| `OFI_DRIFT_MULTIPLIER` | `-1e-6` | Scala OFI → drift annualizzato |
+| `DEFAULT_LAMBDA` | `4000` | Intensità di salto baseline (salti/anno) |
 | `DEFAULT_MU_J` | `0.0001` | Media log-normale del salto |
 | `DEFAULT_SIGMA_J` | `0.0015` | Deviazione standard del salto |
 | `DEFAULT_SIGMA` | `0.25` | Volatilità implicita di default |
+| `HAWKES_BETA` | `5.0` | Parametro di decadimento esponenziale Hawkes |
+| `HAWKES_KAPPA_SELF` | `3.0` | Coefficiente di auto-eccitazione Hawkes |
+| `HAWKES_KAPPA_CROSS` | `1.0` | Coefficiente di eccitazione incrociata Hawkes |
 | `KELLY_FRACTION` | `0.1` | Fattore frazionario di Kelly |
 | `MIN_EXPECTED_VALUE` | `0.015` | Soglia minima di EV per eseguire un trade |
-| `EMA_ALPHA` (Merton) | `0.05` | Smoothing EMA sulla probabilità Merton (~30s memoria) |
-| `EMA_ALPHA` (OFI) | `0.1` | Smoothing EMA sull'Order Flow Imbalance |
+| `EMA_HALFLIFE_SEC` | `15.0` | Halflife EMA time-based sulla probabilità Merton |
 
 ---
 
@@ -193,19 +217,16 @@ Il sistema utilizza lo strumento `uv` per la gestione rapida dell'ambiente virtu
 3. **Avvio del Backtest Replayer**:
    - **Con Finestra Temporale**:
      ```bash
-     uv run python run_backtest.py --start "2026-05-23 20:51:00" --end "2026-05-23 21:51:00"
+     uv run python run_backtest.py --start "2026-05-28 19:15:00" --end "2026-05-28 19:20:00"
      ```
    - **Con File Singolo**:
      ```bash
-     uv run python run_backtest.py --file "c:/percorso/del/tuo/file.parquet"
+     uv run python run_backtest.py --file "path/to/ticks.parquet"
      ```
 
 4. **Suite di Validazione Interna**:
    ```bash
-   uv run python tests/verify_live_data_and_pricing.py
-   uv run python tests/verify_phase1.py
-   uv run python tests/verify_phase2.py
-   uv run python tests/verify_phase3.py
-   uv run python tests/verify_phase4.py
+   uv run python tests/verify_phase3.py   # Pricing Merton + vol calibration
+   uv run python tests/verify_phase4.py   # Shadow book + order execution
    uv run python tests/verify_web_server.py
    ```

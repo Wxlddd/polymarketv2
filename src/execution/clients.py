@@ -26,6 +26,9 @@ class MockExecutionClient(IExecutionClient):
         # Average entry price per contract type
         self.entry_prices: Dict[str, float] = {"YES": 0.0, "NO": 0.0}
         
+        # Realized exits/trades (SELL/SETTLE) tracking
+        self.realized_trades: List[Dict[str, Any]] = []
+        
     @property
     def cash_balance(self) -> float:
         return self._cash_balance
@@ -57,7 +60,8 @@ class MockExecutionClient(IExecutionClient):
         # This is critical for the queue logic in main.py to correctly block
         # new signals from being evaluated while an order is in flight.
         latency = random.uniform(0.150, 0.300)
-        await asyncio.sleep(latency)
+        if not getattr(self, "is_backtest", False):
+            await asyncio.sleep(latency)
 
         gas = self.config.arbitrage.GAS_FEE_USD
         top_bid, top_ask = self.shadow_book.get_top_of_book()
@@ -222,24 +226,46 @@ class MockExecutionClient(IExecutionClient):
             self._cash_balance += revenue
             purchase_cost = filled_qty * self.entry_prices["YES"]
             realized_pnl = revenue - purchase_cost
+            avg_entry_price = self.entry_prices["YES"]
 
             self.positions["YES"] -= filled_qty
             if self.positions["YES"] <= 1e-9:
                 self.positions["YES"] = 0.0
                 self.entry_prices["YES"] = 0.0
             self.shadow_book.paper_execute(0.0, filled_qty, is_bid=exec_is_bid, fills=level_fills, timestamp=exec_ts)
+            
+            self.realized_trades.append({
+                "timestamp": exec_ts,
+                "side": side,
+                "qty": filled_qty,
+                "entry_price": avg_entry_price,
+                "exit_price": vwap_exec,
+                "pnl": realized_pnl,
+                "won": realized_pnl > 0.0
+            })
 
         elif side == "SELL_NO":
             revenue = total_usd - gas - total_taker_fee
             self._cash_balance += revenue
             purchase_cost = filled_qty * self.entry_prices["NO"]
             realized_pnl = revenue - purchase_cost
+            avg_entry_price = self.entry_prices["NO"]
 
             self.positions["NO"] -= filled_qty
             if self.positions["NO"] <= 1e-9:
                 self.positions["NO"] = 0.0
                 self.entry_prices["NO"] = 0.0
             self.shadow_book.paper_execute(0.0, filled_qty, is_bid=exec_is_bid, fills=level_fills, timestamp=exec_ts)
+            
+            self.realized_trades.append({
+                "timestamp": exec_ts,
+                "side": side,
+                "qty": filled_qty,
+                "entry_price": avg_entry_price,
+                "exit_price": vwap_exec,
+                "pnl": realized_pnl,
+                "won": realized_pnl > 0.0
+            })
             
         # Compute mid-price for consistent portfolio MTM, independent of which
         # side triggered the call.  Using the execution-side price (p_market) as the
@@ -359,6 +385,17 @@ class MockExecutionClient(IExecutionClient):
                 pnl=pnl,
                 capital=self._cash_balance
             )
+            
+            self.realized_trades.append({
+                "timestamp": timestamp,
+                "side": "SETTLE_YES",
+                "qty": qty,
+                "entry_price": self.entry_prices["YES"],
+                "exit_price": payoff_per_contract,
+                "pnl": pnl,
+                "won": won
+            })
+            
             self.positions["YES"] = 0.0
             self.entry_prices["YES"] = 0.0
 
@@ -400,6 +437,17 @@ class MockExecutionClient(IExecutionClient):
                 pnl=pnl,
                 capital=self._cash_balance
             )
+            
+            self.realized_trades.append({
+                "timestamp": timestamp,
+                "side": "SETTLE_NO",
+                "qty": qty,
+                "entry_price": self.entry_prices["NO"],
+                "exit_price": payoff_per_contract,
+                "pnl": pnl,
+                "won": won
+            })
+            
             self.positions["NO"] = 0.0
             self.entry_prices["NO"] = 0.0
 

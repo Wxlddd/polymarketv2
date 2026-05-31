@@ -131,10 +131,13 @@ class ExecutionEngine:
             return {"side": "HOLD", "reason": "NO_BOOK_DATA", "size": 0.0}
             
         t_now = context.timestamp
-
         self.spot_history.append((t_now, context.spot_price))
-        # Keep spot history pruned to 60s
-        self.spot_history = [x for x in self.spot_history if x[0] >= t_now - 60.0]
+        # Keep spot history pruned to 60s using binary search
+        import bisect
+        cutoff = t_now - 60.0
+        idx = bisect.bisect_left(self.spot_history, (cutoff,))
+        if idx > 0:
+            self.spot_history = self.spot_history[idx:]
         
         # Track L2 update stale ages
         best_bid, best_ask = context.bids_l2[0] if context.bids_l2 else (None, None), context.asks_l2[0] if context.asks_l2 else (None, None)
@@ -228,7 +231,10 @@ class ExecutionEngine:
         if context.tau_seconds <= pin_risk_window and context.tau_seconds > 0.0:
             # Noise margin: either standard BPS or empirical standard deviation of spot
             noise_bps_usd = context.spot_price * (self.config.risk.ORACLE_NOISE_BPS / 10000.0)
-            recent_spots = [p for t, p in self.spot_history if t >= t_now - 10.0]
+            import bisect
+            cutoff_10 = t_now - 10.0
+            idx_10 = bisect.bisect_left(self.spot_history, (cutoff_10,))
+            recent_spots = [x[1] for x in self.spot_history[idx_10:]]
             empirical_std = np.std(recent_spots) if len(recent_spots) > 1 else 0.0
             
             oracle_noise = max(noise_bps_usd, empirical_std)
@@ -256,7 +262,19 @@ class ExecutionEngine:
             # If quote is stale (older than 100ms) and spot has walked too far
             if quote_age > 0.100 and self.spot_history:
                 t_lookup = t_now - quote_age
-                closest_spot = min(self.spot_history, key=lambda x: abs(x[0] - t_lookup))[1]
+                import bisect
+                idx = bisect.bisect_left(self.spot_history, (t_lookup,))
+                if idx == 0:
+                    closest_spot = self.spot_history[0][1]
+                elif idx == len(self.spot_history):
+                    closest_spot = self.spot_history[-1][1]
+                else:
+                    before = self.spot_history[idx - 1]
+                    after = self.spot_history[idx]
+                    if abs(before[0] - t_lookup) < abs(after[0] - t_lookup):
+                        closest_spot = before[1]
+                    else:
+                        closest_spot = after[1]
                 delta_S = abs(context.spot_price - closest_spot)
                 
                 # Check normal diffusion expected moves

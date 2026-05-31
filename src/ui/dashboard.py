@@ -6,7 +6,7 @@ from config.settings import SystemConfig
 from src.ingestion.market_manager import MarketManager
 from src.core.interfaces import ISpotFeed, IExecutionClient
 from src.execution.shadow_book import ShadowOrderBook
-from src.strategies.merton_strategy import MertonStrategy
+from src.core.base_strategy import BaseStrategy
 from src.execution.engine import ExecutionEngine
 
 try:
@@ -52,7 +52,7 @@ def build_dashboard(
     market_manager: MarketManager,
     spot_feed: ISpotFeed,
     shadow_book: ShadowOrderBook,
-    strategy: MertonStrategy,
+    strategy: BaseStrategy,
     client: IExecutionClient,
     engine: ExecutionEngine,
     latest_decision: Dict[str, Any]
@@ -254,7 +254,7 @@ async def run_terminal_dashboard(
     market_manager: MarketManager,
     spot_feed: ISpotFeed,
     shadow_book: ShadowOrderBook,
-    strategy: MertonStrategy,
+    strategy: BaseStrategy,
     client: IExecutionClient,
     engine: ExecutionEngine,
     latest_decision_ref: List[Dict[str, Any]],  # mutable list reference to share engine updates

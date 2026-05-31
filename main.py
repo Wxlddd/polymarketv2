@@ -9,7 +9,7 @@ from src.ingestion.market_manager import MarketManager
 from src.ingestion.live_feeds import ChainlinkSpotFeed, ClobOrderBookFeed
 from src.core.strike_manager import StrikeManager
 from src.core.market_context import MarketContext
-from src.strategies.merton_strategy import MertonStrategy
+from src.strategies.factory import StrategyFactory
 from src.execution.shadow_book import ShadowOrderBook
 from src.execution.clients import MockExecutionClient
 from src.execution.engine import ExecutionEngine
@@ -55,7 +55,7 @@ class LiveOrchestrator:
         self.market_manager = MarketManager(config)
         self.spot_feed = ChainlinkSpotFeed(config)
         self.shadow_book = ShadowOrderBook()
-        self.strategy = MertonStrategy(config)
+        self.strategy = StrategyFactory.get_strategy(config.STRATEGY_NAME, config)
         self.client = MockExecutionClient(config, self.recorder, self.shadow_book)
         self.engine = ExecutionEngine(config)
         self.strike_manager: Optional[StrikeManager] = None
@@ -328,7 +328,7 @@ class LiveOrchestrator:
                 ui_type = "settle"
             elif level in ("warning", "error"):
                 ui_type = "warning"
-            elif "signal" in message.lower() or "executing" in message.lower():
+            elif any(x in message.lower() for x in ("signal", "execut", "trade")):
                 ui_type = "trade"
             elif "settle" in message.lower():
                 ui_type = "settle"
@@ -762,8 +762,59 @@ class LiveOrchestrator:
                 logger.error(f"UI heartbeat error: {e}")
             await asyncio.sleep(0.33)
 
+def select_strategy_interactively(default_strategy: str) -> str:
+    """
+    Prompts the user in the console to choose the active pricing strategy on startup.
+    Supports default fallback if input is empty or if stdin is not a TTY.
+    """
+    import sys
+    if not sys.stdin.isatty():
+        return default_strategy
+        
+    print("\n" + "="*56)
+    print("      POLYMARKET V2: ACTIVE STRATEGY SELECTION      ")
+    print("="*56)
+    print("  [1] Hawkes-Driven Merton (New Stochastic Intensity) [DEFAULT]")
+    print("  [2] Legacy Merton (Posterior OFI Logit-Shift)")
+    print("-"*56)
+    
+    try:
+        choice = input(f"Select strategy [1 or 2, default '1']: ").strip()
+        if not choice:
+            return "merton"
+        if choice == "1":
+            return "merton"
+        elif choice == "2":
+            return "legacy_merton"
+        elif choice.lower() in ["merton", "legacy_merton"]:
+            return choice.lower()
+        else:
+            print(f"Invalid choice. Falling back to default: '{default_strategy}'\n")
+            return default_strategy
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return default_strategy
+
 async def main_async():
     config = SystemConfig()
+    
+    # ── Interactive Strategy Selection ──
+    cli_strategy = None
+    for arg in sys.argv:
+        if arg.startswith("--strategy="):
+            cli_strategy = arg.split("=")[1]
+        elif arg == "--strategy" and sys.argv.index(arg) + 1 < len(sys.argv):
+            cli_strategy = sys.argv[sys.argv.index(arg) + 1]
+            
+    if cli_strategy:
+        strategy_name = cli_strategy
+    else:
+        strategy_name = select_strategy_interactively(config.STRATEGY_NAME)
+        
+    config.__dict__["STRATEGY_NAME"] = strategy_name
+    print(f"\n>>> Starting Polymarket V2 with strategy: {strategy_name.upper()} <<<\n")
+    
     orchestrator = LiveOrchestrator(config)
     
     try:

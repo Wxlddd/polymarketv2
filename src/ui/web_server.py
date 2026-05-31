@@ -158,38 +158,132 @@ class WebServer:
             self.active_monitors.discard(ws)
         return ws
 
+    def _extract_timestamp_from_path(self, file_path: str) -> Optional[float]:
+        """Extracts Unix timestamp from either filename or its parent directory name."""
+        basename = os.path.basename(file_path)
+        ts = None
+        # Try extracting from filename, e.g. ticks_rec_1779988461.parquet or tick_data_1779562304.parquet
+        try:
+            parts = basename.split(".")[0].split("_")
+            ts = float(parts[-1])
+        except (ValueError, IndexError):
+            pass
+            
+        if ts is None:
+            # Try parent directory fallback, e.g. live_1779988461/
+            parent_dir = os.path.basename(os.path.dirname(file_path))
+            if "_" in parent_dir:
+                try:
+                    ts = float(parent_dir.split("_")[-1])
+                except ValueError:
+                    pass
+                    
+        if ts is not None:
+            if ts > 5e9:
+                ts /= 1000.0
+            return ts
+        return None
+
     async def handle_api_data_range(self, request: web.Request) -> web.Response:
-        """Finds the min and max timestamp across all available tick files."""
+        """Finds available continuous data sessions across all tick files."""
+        import glob
+        import polars as pl
+        
+        patterns = [
+            "logs/*/*/*/ticks.parquet",
+            "logs/*/*/*/ticks.csv",
+            "data/raw/ticks.parquet",
+            "data/raw/tick_data_*.parquet",
+            "data/raw/ticks_rec_*.parquet",
+            "c:/Users/loren/Documents/AntiGravity Projects/polymarket/data/raw/ticks.parquet",
+            "c:/Users/loren/Documents/AntiGravity Projects/polymarket/data/raw/tick_data_*.parquet",
+            "c:/Users/loren/Documents/AntiGravity Projects/polymarket/data/raw/ticks_rec_*.parquet",
+        ]
+        
+        file_paths = []
+        for pattern in patterns:
+            for p in glob.glob(pattern):
+                file_paths.append(p)
+                
+        # Deduplicate paths
+        file_paths = list(set(file_paths))
+        
+        sessions = []
         min_ts = float('inf')
         max_ts = float('-inf')
         
-        paths = [
-            os.path.join("data", "raw"),
-            "c:/Users/loren/Documents/AntiGravity Projects/polymarket/data/raw"
-        ]
-        
-        for base_path in paths:
-            if not os.path.exists(base_path):
+        for file_path in file_paths:
+            # Skip old backtest run logs to avoid cluttering
+            if "backtest_" in file_path.replace("\\", "/"):
                 continue
-            for ext in ("*.parquet", "*.csv"):
-                pattern = os.path.join(base_path, "**", ext)
-                for file_path in glob.glob(pattern, recursive=True):
-                    basename = os.path.basename(file_path)
-                    try:
-                        ts = float(basename.split("_")[-1].split(".")[0])
-                        if ts < min_ts:
-                            min_ts = ts
-                        if ts > max_ts:
-                            max_ts = ts
-                    except Exception:
-                        pass
-                        
+                
+            try:
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext == ".parquet":
+                    lf = pl.scan_parquet(file_path)
+                    stats = lf.select([
+                        pl.col("timestamp").first().alias("min_t"),
+                        pl.col("timestamp").last().alias("max_t"),
+                        pl.len().alias("count")
+                    ]).collect()
+                    
+                    min_t = float(stats["min_t"][0])
+                    max_t = float(stats["max_t"][0])
+                    count = int(stats["count"][0])
+                else:
+                    df = pl.read_csv(file_path, columns=["timestamp"])
+                    min_t = float(df["timestamp"].min())
+                    max_t = float(df["timestamp"].max())
+                    count = len(df)
+                
+                # Millisecond checks
+                if min_t > 5e9:
+                    min_t /= 1000.0
+                if max_t > 5e9:
+                    max_t /= 1000.0
+                    
+                duration_sec = max_t - min_t
+                min_dt = datetime.datetime.fromtimestamp(min_t)
+                max_dt = datetime.datetime.fromtimestamp(max_t)
+                
+                # Format name beautifully
+                parts = file_path.replace("\\", "/").split("/")
+                if len(parts) >= 4 and parts[0] == "logs":
+                    session_name = f"{parts[1]} - {parts[3]}"
+                else:
+                    session_name = os.path.basename(file_path)
+                    
+                # Format counts readable, e.g. 118K
+                count_str = f"{count/1000:.0f}K" if count >= 1000 else str(count)
+                duration_str = f"{duration_sec/60:.1f} min" if duration_sec < 3600 else f"{duration_sec/3600:.1f} hrs"
+                
+                session_lbl = f"{session_name} ({duration_str}, {count_str} ticks)"
+                
+                sessions.append({
+                    "name": session_lbl,
+                    "file_path": file_path,
+                    "min_time": min_t,
+                    "max_time": max_t,
+                    "min_iso": min_dt.strftime("%Y-%m-%dT%H:%M"),
+                    "max_iso": max_dt.strftime("%Y-%m-%dT%H:%M"),
+                    "duration_minutes": round(duration_sec / 60.0, 1),
+                    "ticks_count": count
+                })
+                
+                if min_t < min_ts:
+                    min_ts = min_t
+                if max_t > max_ts:
+                    max_ts = max_t
+            except Exception:
+                pass
+                
+        sessions.sort(key=lambda x: x["min_time"])
+        
         if min_ts == float('inf') or max_ts == float('-inf'):
             now = time.time()
             min_ts = now - 86400
             max_ts = now
             
-        # Form ISO formats matching <input type="datetime-local"> requirement: YYYY-MM-DDTHH:mm
         min_iso = datetime.datetime.fromtimestamp(min_ts).strftime("%Y-%m-%dT%H:%M")
         max_iso = datetime.datetime.fromtimestamp(max_ts + 300).strftime("%Y-%m-%dT%H:%M")
         
@@ -198,7 +292,8 @@ class WebServer:
             "min_iso": min_iso,
             "max_iso": max_iso,
             "min_time": min_ts,
-            "max_time": max_ts + 300
+            "max_time": max_ts + 300,
+            "sessions": sessions
         })
 
     async def handle_api_backtest(self, request: web.Request) -> web.Response:
@@ -207,6 +302,7 @@ class WebServer:
             body = await request.json()
             start_time = body.get("start_time")
             end_time = body.get("end_time")
+            strategy_name = body.get("strategy_name", "merton")
             
             if not start_time or not end_time:
                 return web.json_response({"success": False, "error": "Invalid time window parameters."}, status=400)
@@ -226,10 +322,13 @@ class WebServer:
                     
             def run_backtest_thread():
                 config = SystemConfig()
+                if strategy_name:
+                    config.__dict__["STRATEGY_NAME"] = strategy_name
                 runner = BacktestRunner(config)
                 
                 # Scan folders to gather files and check boundaries
                 paths = [
+                    "logs",
                     os.path.join("data", "raw"),
                     "c:/Users/loren/Documents/AntiGravity Projects/polymarket/data/raw"
                 ]
@@ -242,11 +341,11 @@ class WebServer:
                         pattern = os.path.join(base_path, "**", ext)
                         for file_path in glob.glob(pattern, recursive=True):
                             basename = os.path.basename(file_path)
-                            try:
-                                ts = float(basename.split("_")[-1].split(".")[0])
+                            if "tick" not in basename.lower():
+                                continue
+                            ts = self._extract_timestamp_from_path(file_path)
+                            if ts is not None:
                                 files_with_ts.append((ts, file_path))
-                            except Exception:
-                                pass
                                 
                 files_with_ts.sort(key=lambda x: x[0])
                 
@@ -258,10 +357,9 @@ class WebServer:
                     next_ts = files_with_ts[i+1][0] if i + 1 < len(files_with_ts) else float('inf')
                     
                     if ts <= end_time and next_ts >= start_time:
-                        # If there is a gap > 10 minutes between this file and the last one we included, we truncate the backtest here
+                        # Log if there is a gap > 10 minutes between this file and the last one we included
                         if last_ts is not None and (ts - last_ts > 600):
-                            logger.warning(f"Backtest data gap detected (>10m). Truncating contiguous window.")
-                            break
+                            logger.warning(f"Backtest data gap detected (>10m) between files. Continuing...")
                         selected_files.append(file_path)
                         last_ts = ts
                         
@@ -316,11 +414,11 @@ class WebServer:
                 async_loop = asyncio.new_event_loop()
                 try:
                     return async_loop.run_until_complete(
-                        runner.run(aligned_df, strategy_name="merton", progress_callback=progress_callback)
+                        runner.run(aligned_df, strategy_name=strategy_name, progress_callback=progress_callback)
                     )
                 finally:
                     async_loop.close()
-
+ 
             # Execute backtest thread
             results = await loop.run_in_executor(None, run_backtest_thread)
             

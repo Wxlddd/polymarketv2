@@ -117,7 +117,7 @@ async def main():
         strike_price=strike,
         timestamp=time.time()
     )
-    print(f"Settlement Net Payout: ${payout:.2f}")
+    print(f"Settlement Net Payout: ${payout['net_pnl']:.2f}")
     print(f"Final Client Cash Balance: ${client.cash_balance:.2f}")
     print(f"YES position size (expected 0): {client.get_position_size('YES')}")
     

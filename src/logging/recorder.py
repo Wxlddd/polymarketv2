@@ -182,13 +182,19 @@ class DataRecorder(IDataRecorder):
             return
             
         try:
-            new_df = pl.DataFrame(self.tick_buffer)
-            
-            # Cast L2 JSON string columns to prevent schema mismatches
-            new_df = new_df.cast({
+            schema = {
+                "timestamp": pl.Float64,
+                "spot_price": pl.Float64,
+                "best_bid": pl.Float64,
+                "best_bid_qty": pl.Float64,
+                "best_ask": pl.Float64,
+                "best_ask_qty": pl.Float64,
+                "ofi": pl.Float64,
+                "volatility": pl.Float64,
                 "bids_l2": pl.String,
                 "asks_l2": pl.String
-            })
+            }
+            new_df = pl.DataFrame(self.tick_buffer, schema=schema)
             
             if os.path.exists(self.ticks_path):
                 try:

@@ -45,6 +45,15 @@ class MertonJumpDiffusionConfig:
     # Half-life (seconds) for the time-based EMA applied to raw p_yes before the engine.
     # Time-based EMA ensures consistent smoothing regardless of CLOB tick rate.
     EMA_HALFLIFE_SEC: float = field(default_factory=lambda: float(os.getenv("EMA_HALFLIFE_SEC", "30.0")))
+    
+    # Hawkes stochastic intensity parameters
+    HAWKES_LAMBDA_0: float = field(default_factory=lambda: float(os.getenv("HAWKES_LAMBDA_0", "4000.0")))
+    HAWKES_KAPPA: float = field(default_factory=lambda: float(os.getenv("HAWKES_KAPPA", "10.0")))  # Deprecated fallback
+    HAWKES_KAPPA_SELF: float = field(default_factory=lambda: float(os.getenv("HAWKES_KAPPA_SELF", "3.0")))
+    HAWKES_KAPPA_CROSS: float = field(default_factory=lambda: float(os.getenv("HAWKES_KAPPA_CROSS", "1.0")))
+    HAWKES_BETA: float = field(default_factory=lambda: float(os.getenv("HAWKES_BETA", "5.0")))
+    OFI_DRIFT_MULTIPLIER: float = field(default_factory=lambda: float(os.getenv("OFI_DRIFT_MULTIPLIER", "-1e-6")))
+    USE_LOCAL_INFORMED_DRIFT: bool = field(default_factory=lambda: os.getenv("USE_LOCAL_INFORMED_DRIFT", "False").lower() == "true")
 
 @dataclass(frozen=True)
 class ArbitrageConfig:
@@ -81,6 +90,7 @@ class SystemConfig:
     """Root configuration holding all sub-modules."""
     TICKER: str = field(default_factory=lambda: os.getenv("TICKER", "BTC").upper())
     LOG_DIR: str = field(default_factory=lambda: os.getenv("LOG_DIR", "logs"))
+    STRATEGY_NAME: str = field(default_factory=lambda: os.getenv("STRATEGY_NAME", "merton"))
     
     polymarket: PolymarketConfig = field(default_factory=PolymarketConfig)
     merton: MertonJumpDiffusionConfig = field(default_factory=MertonJumpDiffusionConfig)
