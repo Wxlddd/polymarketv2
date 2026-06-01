@@ -445,7 +445,7 @@ class ShadowOrderBook(IOrderBook):
 
     def _calculate_ofi(self) -> float:
         """Calculates Order Flow Imbalance (OFI) for the top level changes."""
-        best_bid, best_ask = self.get_top_of_book()
+        best_bid, best_ask = self.get_market_top_of_book()
         if not best_bid or not best_ask:
             return 0.0
 

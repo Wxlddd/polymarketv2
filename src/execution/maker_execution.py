@@ -227,11 +227,15 @@ class ExecutionRouter:
             if q > 0:
                 # We have YES inventory. Reducing side is Ask (selling YES). Cancel Bid.
                 self._cancel_bid(instructions, regime)
-                self._route_maker_ask(p_ask_target, instructions, regime, yes_shares, cash_balance)
+                p_ask_post = max(p_ask_target, best_bid + self.tick_size)
+                p_ask_post = max(0.01, min(0.99, p_ask_post))
+                self._route_maker_ask(p_ask_post, instructions, regime, yes_shares, cash_balance)
             elif q < 0:
                 # We have NO inventory. Reducing side is Bid (buying YES). Cancel Ask.
                 self._cancel_ask(instructions, regime)
-                self._route_maker_bid(p_bid_target, instructions, regime, cash_balance)
+                p_bid_post = min(p_bid_target, best_ask - self.tick_size)
+                p_bid_post = max(0.01, min(0.99, p_bid_post))
+                self._route_maker_bid(p_bid_post, instructions, regime, cash_balance)
                 
         else:
             # Check for REGIME B: Taker crossing conditions
@@ -311,8 +315,18 @@ class ExecutionRouter:
             else:
                 # REGIME A: Maker Mode
                 regime = "A"
-                self._route_maker_bid(p_bid_target, instructions, regime, cash_balance)
-                self._route_maker_ask(p_ask_target, instructions, regime, yes_shares, cash_balance)
+                # Clip quotes to be strictly post-only (at least 1 tick inside the spread)
+                p_bid_post = min(p_bid_target, best_ask - self.tick_size)
+                p_ask_post = max(p_ask_target, best_bid + self.tick_size)
+                
+                # Keep quotes within valid bounds [0.01, 0.99]
+                p_bid_post = max(0.01, min(0.99, p_bid_post))
+                p_ask_post = max(0.01, min(0.99, p_ask_post))
+                if p_bid_post >= p_ask_post:
+                    p_ask_post = p_bid_post + self.tick_size
+                    
+                self._route_maker_bid(p_bid_post, instructions, regime, cash_balance)
+                self._route_maker_ask(p_ask_post, instructions, regime, yes_shares, cash_balance)
                 
         return instructions
 
