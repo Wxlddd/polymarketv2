@@ -57,7 +57,11 @@ class LiveOrchestrator:
         self.shadow_book = ShadowOrderBook()
         self.strategy = StrategyFactory.get_strategy(config.STRATEGY_NAME, config)
         self.client = MockExecutionClient(config, self.recorder, self.shadow_book)
-        self.engine = ExecutionEngine(config)
+        if config.maker.ENABLED:
+            from src.execution.maker_execution import MakerExecutionEngine
+            self.engine = MakerExecutionEngine(self.strategy, self.client, config)
+        else:
+            self.engine = ExecutionEngine(config)
         self.strike_manager: Optional[StrikeManager] = None
         self.waiting_for_first_rollover = False
         self.total_trades = 0
@@ -465,8 +469,221 @@ class LiveOrchestrator:
         if self._pending_trade_task is not None and not self._pending_trade_task.done():
             return
             
-        decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
-        self.latest_decision_ref[0] = decision
+        # Evaluate Trade Sizing and Execution
+        if self.config.maker.ENABLED:
+            decision = {"side": "HOLD", "reason": "MAKER_QUOTING", "size": 0.0, "vwap": 0.0}
+            self.latest_decision_ref[0] = decision
+            
+            # A. Simulate limit order fills first (for paper/mock live trading)
+            top_b, top_a = self.shadow_book.get_market_top_of_book()
+            best_bid_p = top_b[0] if top_b else None
+            best_ask_p = top_a[0] if top_a else None
+            
+            # Check active buy limit order (bid) fill
+            active_bid_p = self.engine.execution_router.active_bid_price
+            active_bid_q = self.engine.execution_router.active_bid_qty
+            if active_bid_p > 0.0 and best_ask_p is not None and best_ask_p <= active_bid_p:
+                fee = active_bid_q * self.engine.execution_router.taker_fee_multiplier * active_bid_p * (1.0 - active_bid_p)
+                cost = active_bid_q * active_bid_p + self.config.arbitrage.GAS_FEE_USD + fee
+                if cost > self.client.cash_balance:
+                    cost_per_share = active_bid_p * (1.0 + self.engine.execution_router.taker_fee_multiplier * (1.0 - active_bid_p))
+                    max_q = max(0.0, (self.client.cash_balance - self.config.arbitrage.GAS_FEE_USD) / cost_per_share)
+                    if max_q > 0.0 and (max_q * active_bid_p) >= 5.0:
+                        active_bid_q = max_q
+                    else:
+                        self.engine.execution_router.active_bid_id = ""
+                        self.engine.execution_router.active_bid_price = 0.0
+                        self.engine.execution_router.active_bid_qty = 0.0
+                        active_bid_p = 0.0
+                        
+                if active_bid_p > 0.0:
+                    # Buy Fill!
+                    self.total_trades += 1
+                    p_mkt = best_ask_p
+                    self.recorder.record_signal(
+                        timestamp=t_now,
+                        spot_price=spot,
+                        strike=active_strike,
+                        model_prob=p_yes,
+                        implied_prob=p_mkt,
+                        kelly_size=active_bid_q,
+                        status="MAKER_FILL_BUY"
+                    )
+                    
+                    self.log_message("info", f"[MAKER FILL] BUY_YES filled at limit price: {active_bid_p:.4f} | Size: {active_bid_q:.2f}")
+                    if self.web_server:
+                        self.web_server.broadcast_message({
+                            "type": "trade_signal",
+                            "signal": {"side": "BUY_YES", "size": active_bid_q, "vwap": active_bid_p, "ev": p_yes - active_bid_p if p_yes is not None else 0.0}
+                        })
+                        
+                    await self.client.execute_trade(
+                        side="BUY_YES",
+                        qty=active_bid_q,
+                        price=active_bid_p,
+                        ev=p_yes - active_bid_p if p_yes is not None else 0.0,
+                        expected_slippage_bps=0.0,
+                        context_state={"timestamp": t_now, "strike_price": active_strike}
+                    )
+                    self.engine.execution_router.active_bid_id = ""
+                    self.engine.execution_router.active_bid_price = 0.0
+                    self.engine.execution_router.active_bid_qty = 0.0
+
+            # Check active sell limit order (ask) fill
+            active_ask_p = self.engine.execution_router.active_ask_price
+            active_ask_q = self.engine.execution_router.active_ask_qty
+            if active_ask_p > 0.0 and best_bid_p is not None and best_bid_p >= active_ask_p:
+                yes_shares = self.client.get_position_size("YES")
+                if yes_shares < active_ask_q:
+                    rem_qty = active_ask_q - yes_shares
+                    no_price = 1.0 - active_ask_p
+                    fee = rem_qty * self.engine.execution_router.taker_fee_multiplier * no_price * (1.0 - no_price)
+                    cost = rem_qty * no_price + self.config.arbitrage.GAS_FEE_USD + fee
+                    if cost > self.client.cash_balance:
+                        cost_per_share_no = no_price * (1.0 + self.engine.execution_router.taker_fee_multiplier * active_ask_p)
+                        max_rem = max(0.0, (self.client.cash_balance - self.config.arbitrage.GAS_FEE_USD) / cost_per_share_no)
+                        active_ask_q = yes_shares + max_rem
+                        if active_ask_q < 1e-5 or (yes_shares == 0.0 and max_rem * no_price < 5.0):
+                            self.engine.execution_router.active_ask_id = ""
+                            self.engine.execution_router.active_ask_price = 0.0
+                            self.engine.execution_router.active_ask_qty = 0.0
+                            active_ask_p = 0.0
+                            
+                if active_ask_p > 0.0:
+                    # Sell Fill!
+                    self.total_trades += 1
+                    p_mkt = best_bid_p
+                    self.recorder.record_signal(
+                        timestamp=t_now,
+                        spot_price=spot,
+                        strike=active_strike,
+                        model_prob=p_yes,
+                        implied_prob=p_mkt,
+                        kelly_size=active_ask_q,
+                        status="MAKER_FILL_SELL"
+                    )
+                    
+                    self.log_message("info", f"[MAKER FILL] SELL_YES filled at limit price: {active_ask_p:.4f} | Size: {active_ask_q:.2f}")
+                    if self.web_server:
+                        self.web_server.broadcast_message({
+                            "type": "trade_signal",
+                            "signal": {"side": "SELL_YES", "size": active_ask_q, "vwap": active_ask_p, "ev": active_ask_p - p_yes if p_yes is not None else 0.0}
+                        })
+                        
+                    yes_shares = self.client.get_position_size("YES")
+                    if yes_shares >= active_ask_q:
+                        await self.client.execute_trade(
+                            side="SELL_YES",
+                            qty=active_ask_q,
+                            price=active_ask_p,
+                            ev=active_ask_p - p_yes if p_yes is not None else 0.0,
+                            expected_slippage_bps=0.0,
+                            context_state={"timestamp": t_now, "strike_price": active_strike}
+                        )
+                    else:
+                        if yes_shares > 0.0:
+                            await self.client.execute_trade(
+                                side="SELL_YES",
+                                qty=yes_shares,
+                                price=active_ask_p,
+                                ev=active_ask_p - p_yes if p_yes is not None else 0.0,
+                                expected_slippage_bps=0.0,
+                                context_state={"timestamp": t_now, "strike_price": active_strike}
+                            )
+                        rem_q = active_ask_q - yes_shares
+                        no_price = 1.0 - active_ask_p
+                        await self.client.execute_trade(
+                            side="BUY_NO",
+                            qty=rem_q,
+                            price=no_price,
+                            ev=(1.0 - p_yes) - no_price if p_yes is not None else 0.0,
+                            expected_slippage_bps=0.0,
+                            context_state={"timestamp": t_now, "strike_price": active_strike}
+                        )
+                    self.engine.execution_router.active_ask_id = ""
+                    self.engine.execution_router.active_ask_price = 0.0
+                    self.engine.execution_router.active_ask_qty = 0.0
+
+            # B. Generate and process new quoting instructions
+            instructions = self.engine.evaluate_and_route(context)
+            
+            # Format diagnostic decision for the dashboard & web state
+            bid_p = self.engine.execution_router.active_bid_price
+            ask_p = self.engine.execution_router.active_ask_price
+            decision = {
+                "side": "QUOTING",
+                "size": self.engine.execution_router.active_bid_qty,
+                "vwap": bid_p if bid_p > 0.0 else ask_p,
+                "reason": f"Bid: {bid_p:.2f} Ask: {ask_p:.2f}",
+                "expected_slippage_bps": 0.0,
+                "ev": 0.0
+            }
+            self.latest_decision_ref[0] = decision
+            
+            for instr in instructions:
+                if instr.action == "NEW" and instr.regime == "B":
+                    # Taker execution in Regime B!
+                    self.total_trades += 1
+                    top_b, top_a = self.shadow_book.get_market_top_of_book()
+                    p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+                    self.recorder.record_signal(
+                        timestamp=t_now,
+                        spot_price=spot,
+                        strike=active_strike,
+                        model_prob=p_yes,
+                        implied_prob=p_mkt,
+                        kelly_size=instr.qty,
+                        status=f"TAKER_{instr.side}"
+                    )
+                    
+                    self.log_message("info", f"[TAKER ORDER] Executing {instr.side} | Size: {instr.qty:.2f} | Price: {instr.price:.4f}")
+                    if self.web_server:
+                        self.web_server.broadcast_message({
+                            "type": "trade_signal",
+                            "signal": {"side": instr.side, "size": instr.qty, "vwap": instr.price, "ev": p_yes - instr.price if "BUY" in instr.side else instr.price - p_yes if p_yes is not None else 0.0}
+                        })
+                        
+                    decision_taker = {
+                        "side": instr.side,
+                        "size": instr.qty,
+                        "vwap": instr.price,
+                        "ev": p_yes - instr.price if instr.side == "BUY_YES" else (1.0 - p_yes) - instr.price if p_yes is not None else 0.0,
+                        "expected_slippage_bps": 0.0,
+                        "limit_price": instr.price
+                    }
+                    self._pending_trade_task = asyncio.create_task(
+                        self._execute_trade_async(
+                            decision_taker, spot, active_strike, ofi, vol, tau_sec, p_yes, t_now
+                        )
+                    )
+        else:
+            decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
+            self.latest_decision_ref[0] = decision
+            if decision["side"] != "HOLD":
+                p_mkt_signal = p_mkt if p_mkt is not None else p_yes
+                self.recorder.record_signal(
+                    timestamp=t_now,
+                    spot_price=spot,
+                    strike=active_strike,
+                    model_prob=p_yes,
+                    implied_prob=p_mkt_signal,
+                    kelly_size=decision["size"],
+                    status=decision["side"]
+                )
+
+                # Log SIGNAL — single source of truth
+                self.log_message(
+                    "info",
+                    f"SIGNAL: {decision['side']} | Size: {decision['size']:.2f}"
+                    f" | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}"
+                )
+
+                # Dispatch the execution to background queue
+                self._pending_trade_task = asyncio.create_task(
+                    self._execute_trade_async(
+                        decision, spot, active_strike, ofi, vol, tau_sec, p_yes, t_now
+                    )
+                )
         
         # Get Implied Market price and Edge — use REAL market book (q_real), never depleted
         top_b, top_a = self.shadow_book.get_market_top_of_book()

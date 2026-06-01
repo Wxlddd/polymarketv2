@@ -82,6 +82,12 @@ class BacktestRunner:
         client.is_backtest = True
         engine = ExecutionEngine(self.config)
         
+        if self.config.maker.ENABLED:
+            from src.execution.maker_execution import MakerExecutionEngine
+            maker_engine = MakerExecutionEngine(strategy, client, self.config)
+        else:
+            maker_engine = None
+        
         # Expiry tracker variables
         current_expiry: Optional[int] = None
         strike_manager: Optional[StrikeManager] = None
@@ -258,39 +264,232 @@ class BacktestRunner:
 
             # 6. Engine Decisions & routing execution
             # Check if we can bypass evaluation for trade decisions
-            top_b_sh, top_a_sh = shadow_book.get_top_of_book()
-            cur_best_bid = top_b_sh[0] if top_b_sh else None
-            cur_best_ask = top_a_sh[0] if top_a_sh else None
-            
-            has_positions = (client.get_position_size("YES") > 1e-9 or client.get_position_size("NO") > 1e-9)
-            
-            should_eval_trade = (
-                last_evaluated_p_yes is None
-                or p_yes is None
-                or should_eval
-                or abs(p_yes - last_evaluated_p_yes) > 1e-5
-                or cur_best_bid != last_evaluated_best_bid
-                or cur_best_ask != last_evaluated_best_ask
-                or ready_orders
-                or has_positions
-                or is_snap
-            )
-            
-            decision = {"side": "HOLD"}
-            if should_eval_trade and not pending_orders:
-                # Upgrade context with sorted L2 book ONLY when evaluating trade!
-                context = MarketContext(
-                    timestamp=t,
-                    spot_price=spot,
-                    strike_price=active_strike,
-                    tau_seconds=tau_sec,
-                    volatility=vol,
-                    ofi=ofi,
-                    bids_l2=shadow_book.get_sorted_bids(),
-                    asks_l2=shadow_book.get_sorted_asks()
+            if self.config.maker.ENABLED and maker_engine is not None:
+                # A. Simulate limit order fills first! (Continuous check on every tick)
+                top_b_sh, top_a_sh = shadow_book.get_market_top_of_book()
+                best_bid_p = top_b_sh[0] if top_b_sh else None
+                best_ask_p = top_a_sh[0] if top_a_sh else None
+                
+                # Check active buy limit order (bid) fill
+                active_bid_p = maker_engine.execution_router.active_bid_price
+                active_bid_q = maker_engine.execution_router.active_bid_qty
+                fill_occurred = False
+                if active_bid_p > 0.0 and best_ask_p is not None and best_ask_p <= active_bid_p:
+                    # Fee-aware cash balance check
+                    fee = active_bid_q * maker_engine.execution_router.taker_fee_multiplier * active_bid_p * (1.0 - active_bid_p)
+                    cost = active_bid_q * active_bid_p + 0.03 + fee
+                    if cost > client.cash_balance:
+                        # Scale down the fill to what we can afford
+                        cost_per_share = active_bid_p * (1.0 + maker_engine.execution_router.taker_fee_multiplier * (1.0 - active_bid_p))
+                        max_q = max(0.0, (client.cash_balance - 0.03) / cost_per_share)
+                        if max_q > 0.0 and (max_q * active_bid_p) >= 5.0:
+                            active_bid_q = max_q
+                        else:
+                            # Cannot afford minimum fill, clear and skip
+                            maker_engine.execution_router.active_bid_id = ""
+                            maker_engine.execution_router.active_bid_price = 0.0
+                            maker_engine.execution_router.active_bid_qty = 0.0
+                            active_bid_p = 0.0
+                            
+                    if active_bid_p > 0.0:
+                        # Buy Fill!
+                        trade_count += 1
+                        fill_occurred = True
+                        recorder.record_signal(
+                            timestamp=t,
+                            spot_price=spot,
+                            strike=active_strike,
+                            model_prob=p_yes,
+                            implied_prob=best_ask_p,
+                            kelly_size=active_bid_q,
+                            status="MAKER_FILL_BUY"
+                        )
+                        await client.execute_trade(
+                            side="BUY_YES",
+                            qty=active_bid_q,
+                            price=active_bid_p,
+                            ev=p_yes - active_bid_p if p_yes is not None else 0.0,
+                            expected_slippage_bps=0.0,
+                            context_state={"timestamp": t, "strike_price": active_strike}
+                        )
+                        maker_engine.execution_router.active_bid_id = ""
+                        maker_engine.execution_router.active_bid_price = 0.0
+                        maker_engine.execution_router.active_bid_qty = 0.0
+
+                # Check active sell limit order (ask) fill
+                active_ask_p = maker_engine.execution_router.active_ask_price
+                active_ask_q = maker_engine.execution_router.active_ask_qty
+                if active_ask_p > 0.0 and best_bid_p is not None and best_bid_p >= active_ask_p:
+                    yes_shares = client.get_position_size("YES")
+                    if yes_shares < active_ask_q:
+                        # We need cash to buy NO for the remainder
+                        rem_qty = active_ask_q - yes_shares
+                        no_price = 1.0 - active_ask_p
+                        fee = rem_qty * maker_engine.execution_router.taker_fee_multiplier * no_price * (1.0 - no_price)
+                        cost = rem_qty * no_price + 0.03 + fee
+                        if cost > client.cash_balance:
+                            # Scale down remainder to what we can afford
+                            cost_per_share_no = no_price * (1.0 + maker_engine.execution_router.taker_fee_multiplier * active_ask_p)
+                            max_rem = max(0.0, (client.cash_balance - 0.03) / cost_per_share_no)
+                            active_ask_q = yes_shares + max_rem
+                            if active_ask_q < 1e-5 or (yes_shares == 0.0 and max_rem * no_price < 5.0):
+                                # Cannot afford
+                                maker_engine.execution_router.active_ask_id = ""
+                                maker_engine.execution_router.active_ask_price = 0.0
+                                maker_engine.execution_router.active_ask_qty = 0.0
+                                active_ask_p = 0.0
+                                
+                    if active_ask_p > 0.0:
+                        # Sell Fill!
+                        trade_count += 1
+                        fill_occurred = True
+                        recorder.record_signal(
+                            timestamp=t,
+                            spot_price=spot,
+                            strike=active_strike,
+                            model_prob=p_yes,
+                            implied_prob=best_bid_p,
+                            kelly_size=active_ask_q,
+                            status="MAKER_FILL_SELL"
+                        )
+                        yes_shares = client.get_position_size("YES")
+                        if yes_shares >= active_ask_q:
+                            await client.execute_trade(
+                                side="SELL_YES",
+                                qty=active_ask_q,
+                                price=active_ask_p,
+                                ev=active_ask_p - p_yes if p_yes is not None else 0.0,
+                                expected_slippage_bps=0.0,
+                                context_state={"timestamp": t, "strike_price": active_strike}
+                            )
+                        else:
+                            if yes_shares > 0.0:
+                                await client.execute_trade(
+                                    side="SELL_YES",
+                                    qty=yes_shares,
+                                    price=active_ask_p,
+                                    ev=active_ask_p - p_yes if p_yes is not None else 0.0,
+                                    expected_slippage_bps=0.0,
+                                    context_state={"timestamp": t, "strike_price": active_strike}
+                                )
+                            rem_q = active_ask_q - yes_shares
+                            no_price = 1.0 - active_ask_p
+                            await client.execute_trade(
+                                side="BUY_NO",
+                                qty=rem_q,
+                                price=no_price,
+                                ev=(1.0 - p_yes) - no_price if p_yes is not None else 0.0,
+                                expected_slippage_bps=0.0,
+                                context_state={"timestamp": t, "strike_price": active_strike}
+                            )
+                        maker_engine.execution_router.active_ask_id = ""
+                        maker_engine.execution_router.active_ask_price = 0.0
+                        maker_engine.execution_router.active_ask_qty = 0.0
+
+                # B. Quoting evaluation bypass check
+                cur_best_bid = top_b_sh[0] if top_b_sh else None
+                cur_best_ask = top_a_sh[0] if top_a_sh else None
+                
+                should_eval_quote = (
+                    last_evaluated_p_yes is None
+                    or p_yes is None
+                    or should_eval
+                    or abs(p_yes - last_evaluated_p_yes) > 1e-5
+                    or cur_best_bid != last_evaluated_best_bid
+                    or cur_best_ask != last_evaluated_best_ask
+                    or fill_occurred
+                    or is_snap
                 )
                 
-                decision = engine.evaluate_and_trade(p_yes, context, client)
+                if should_eval_quote and not pending_orders:
+                    # Upgrade context with sorted L2 book!
+                    context = MarketContext(
+                        timestamp=t,
+                        spot_price=spot,
+                        strike_price=active_strike,
+                        tau_seconds=tau_sec,
+                        volatility=vol,
+                        ofi=ofi,
+                        bids_l2=shadow_book.get_sorted_bids(),
+                        asks_l2=shadow_book.get_sorted_asks()
+                    )
+                    instructions = maker_engine.evaluate_and_route(context)
+                    
+                    last_evaluated_p_yes = p_yes
+                    last_evaluated_best_bid = cur_best_bid
+                    last_evaluated_best_ask = cur_best_ask
+                    
+                    for instr in instructions:
+                        if instr.action == "NEW" and instr.regime == "B":
+                            # Taker execution in Regime B!
+                            trade_count += 1
+                            top_b_real, top_a_real = shadow_book.get_market_top_of_book()
+                            p_mkt = 0.5 * (top_b_real[0] + top_a_real[0]) if top_b_real and top_a_real else p_yes
+                            recorder.record_signal(
+                                timestamp=t,
+                                spot_price=spot,
+                                strike=active_strike,
+                                model_prob=p_yes,
+                                implied_prob=p_mkt,
+                                kelly_size=instr.qty,
+                                status=f"TAKER_{instr.side}"
+                            )
+                            
+                            decision_taker = {
+                                "side": instr.side,
+                                "size": instr.qty,
+                                "vwap": instr.price,
+                                "ev": p_yes - instr.price if instr.side == "BUY_YES" else (1.0 - p_yes) - instr.price,
+                                "expected_slippage_bps": 0.0,
+                                "limit_price": instr.price
+                            }
+                            # Queue simulated taker order with stochastic latency
+                            delay = np.random.uniform(0.150, 0.300)
+                            pending_orders.append({
+                                "exec_time": t + delay,
+                                "decision": decision_taker,
+                                "context_state": {
+                                    "timestamp": t,
+                                    "strike_price": active_strike,
+                                    "volatility": vol,
+                                    "limit_price": instr.price
+                                }
+                            })
+            else:
+                # Taker-only logic evaluation bypass check
+                top_b_sh, top_a_sh = shadow_book.get_top_of_book()
+                cur_best_bid = top_b_sh[0] if top_b_sh else None
+                cur_best_ask = top_a_sh[0] if top_a_sh else None
+                
+                has_positions = (client.get_position_size("YES") > 1e-9 or client.get_position_size("NO") > 1e-9)
+                
+                should_eval_trade = (
+                    last_evaluated_p_yes is None
+                    or p_yes is None
+                    or should_eval
+                    or abs(p_yes - last_evaluated_p_yes) > 1e-5
+                    or cur_best_bid != last_evaluated_best_bid
+                    or cur_best_ask != last_evaluated_best_ask
+                    or ready_orders
+                    or has_positions
+                    or is_snap
+                )
+                
+                decision = {"side": "HOLD"}
+                if should_eval_trade and not pending_orders:
+                    # Upgrade context with sorted L2 book ONLY when evaluating trade!
+                    context = MarketContext(
+                        timestamp=t,
+                        spot_price=spot,
+                        strike_price=active_strike,
+                        tau_seconds=tau_sec,
+                        volatility=vol,
+                        ofi=ofi,
+                        bids_l2=shadow_book.get_sorted_bids(),
+                        asks_l2=shadow_book.get_sorted_asks()
+                    )
+                    
+                    decision = engine.evaluate_and_trade(p_yes, context, client)
                 
                 last_evaluated_p_yes = p_yes
                 last_evaluated_best_bid = cur_best_bid

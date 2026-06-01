@@ -78,6 +78,21 @@ class RiskConfig:
     COOLDOWN_PERIOD_SEC: int = field(default_factory=lambda: int(os.getenv("COOLDOWN_PERIOD_SEC", "10")))
 
 @dataclass(frozen=True)
+class MarketMakerConfig:
+    """Statistical market making and quoting configurations."""
+    ENABLED: bool = field(default_factory=lambda: os.getenv("MM_ENABLED", "True").lower() == "true")
+    RISK_AVERSION: float = field(default_factory=lambda: float(os.getenv("MM_RISK_AVERSION", "0.1")))
+    MIN_FEE_BUFFER: float = field(default_factory=lambda: float(os.getenv("MM_MIN_FEE_BUFFER", "0.005")))
+    TOXICITY_BUFFER: float = field(default_factory=lambda: float(os.getenv("MM_TOXICITY_BUFFER", "0.005")))
+    MAKER_SIZE: float = field(default_factory=lambda: float(os.getenv("MM_MAKER_SIZE", "100.0")))
+    MAX_INVENTORY: float = field(default_factory=lambda: float(os.getenv("MM_MAX_INVENTORY", "5000.0")))
+    UNWIND_THRESHOLD: float = field(default_factory=lambda: float(os.getenv("MM_UNWIND_THRESHOLD", "0.01")))
+    TAKER_EDGE_EPSILON: float = field(default_factory=lambda: float(os.getenv("MM_TAKER_EDGE_EPSILON", "0.015")))
+    FIXED_HORIZON_SEC: float = field(default_factory=lambda: float(os.getenv("MM_FIXED_HORIZON_SEC", "300.0")))
+    TICK_SIZE: float = field(default_factory=lambda: float(os.getenv("MM_TICK_SIZE", "0.01")))
+    REQUOTE_THRESHOLD: float = field(default_factory=lambda: float(os.getenv("MM_REQUOTE_THRESHOLD", "0.01")))
+
+@dataclass(frozen=True)
 class WebServerConfig:
     """Integrated HTTP and WebSocket server settings for Bloomberg Terminal UI."""
     ENABLED: bool = field(default_factory=lambda: os.getenv("WEB_SERVER_ENABLED", "True").lower() == "true")
@@ -96,4 +111,6 @@ class SystemConfig:
     merton: MertonJumpDiffusionConfig = field(default_factory=MertonJumpDiffusionConfig)
     arbitrage: ArbitrageConfig = field(default_factory=ArbitrageConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    maker: MarketMakerConfig = field(default_factory=MarketMakerConfig)
     web_server: WebServerConfig = field(default_factory=WebServerConfig)
+
