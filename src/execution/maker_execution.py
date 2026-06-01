@@ -30,14 +30,15 @@ class InventoryManager:
     r"""
     Tracks net inventory risk and calculates the skewed Avellaneda-Stoikov Reservation Price.
     
-    $q = \text{YES shares} - \text{NO shares}$
-    $P_{res} = \hat{P} - \gamma \cdot q \cdot \sigma^2 \cdot \tau$
+    $q_{norm} = q / Q_{max}$
+    $P_{res} = \hat{P} - \gamma \cdot q_{norm} \cdot \sigma^2$
     """
-    __slots__ = ('gamma', 'fixed_horizon_sec')
+    __slots__ = ('gamma', 'fixed_horizon_sec', 'max_inventory')
 
-    def __init__(self, gamma: float = 0.1, fixed_horizon_sec: float = 300.0):
+    def __init__(self, gamma: float = 0.1, fixed_horizon_sec: float = 300.0, max_inventory: float = 5000.0):
         self.gamma = gamma
         self.fixed_horizon_sec = fixed_horizon_sec
+        self.max_inventory = max_inventory
 
     def get_inventory(self, yes_shares: float, no_shares: float) -> float:
         """Returns the net inventory risk q."""
@@ -53,16 +54,13 @@ class InventoryManager:
             p_hat: Model's internal fair probability of YES [0.0, 1.0].
             q: Net inventory count (YES - NO).
             sigma_sq: Instantaneous variance (volatility^2) annualized.
-            tau_seconds: Remaining time to maturity in seconds.
+            tau_seconds: Deprecated / unused for pure HFT instant risk.
             
         Returns:
             Reservation price, clipped to [0.01, 0.99] to prevent illegal probability values.
         """
-        # Annualize tau for consistency with annualized variance sigma_sq
-        tau_years = tau_seconds / (365.25 * 24.0 * 3600.0) if tau_seconds > 0.0 else (self.fixed_horizon_sec / (365.25 * 24.0 * 3600.0))
-        
-        # Calculate skew adjustment: gamma * q * sigma_sq * tau
-        skew = self.gamma * q * sigma_sq * tau_years
+        q_norm = q / self.max_inventory if self.max_inventory > 0.0 else q
+        skew = self.gamma * q_norm * sigma_sq
         p_res = p_hat - skew
         
         # Clip to valid probability bounds
@@ -185,13 +183,11 @@ class ExecutionRouter:
         
         # 1. Calculate net inventory and reservation price
         q = yes_shares - no_shares
-        
-        # Convert tau to years for reservation price formula
+        q_norm = q / self.max_inventory if self.max_inventory > 0.0 else q
         tau_sec = context.tau_seconds
-        tau_years = tau_sec / (365.25 * 24.0 * 3600.0) if tau_sec > 0.0 else (self.fixed_horizon_sec / (365.25 * 24.0 * 3600.0))
         
-        # P_res calculation
-        p_res = p_hat - self.gamma * q * sigma_sq * tau_years
+        # P_res calculation using the pure HFT instant risk formula recommended by the user
+        p_res = p_hat - self.gamma * q_norm * sigma_sq
         if p_res < 0.01:
             p_res = 0.01
         elif p_res > 0.99:
@@ -427,7 +423,8 @@ class MakerExecutionEngine:
         
         self.inventory_manager = InventoryManager(
             gamma=config.maker.RISK_AVERSION,
-            fixed_horizon_sec=config.maker.FIXED_HORIZON_SEC
+            fixed_horizon_sec=config.maker.FIXED_HORIZON_SEC,
+            max_inventory=config.maker.MAX_INVENTORY
         )
         
         self.execution_router = ExecutionRouter(
