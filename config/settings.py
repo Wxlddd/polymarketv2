@@ -67,6 +67,7 @@ class ArbitrageConfig:
     ABSOLUTE_MAX_SLIPPAGE_BPS: float = field(default_factory=lambda: float(os.getenv("ABSOLUTE_MAX_SLIPPAGE_BPS", "150.0")))
     MAX_POSITION_SIZE_USD: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_USD", "250.0")))
     MIN_ORDER_USD: float = field(default_factory=lambda: float(os.getenv("MIN_ORDER_USD", "1.0")))
+    TAKER_ENABLED: bool = field(default_factory=lambda: os.getenv("TAKER_ENABLED", "True").lower() == "true")
 
 @dataclass(frozen=True)
 class RiskConfig:

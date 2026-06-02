@@ -902,6 +902,10 @@ class LiveOrchestrator:
             
             for instr in instructions:
                 if instr.action == "NEW" and instr.regime in ("B", "PANIC"):
+                    # Check if taker executions are enabled (PANIC is always allowed to prevent holding to settlement)
+                    if instr.regime == "B" and not self.config.arbitrage.TAKER_ENABLED:
+                        continue
+
                     # Gate taker execution if a trade task is already in flight
                     if self._pending_trade_task is not None and not self._pending_trade_task.done():
                         continue
@@ -941,8 +945,19 @@ class LiveOrchestrator:
                         )
                     )
         else:
+            # Check if taker executions are enabled
+            if not self.config.arbitrage.TAKER_ENABLED:
+                decision = {
+                    "side": "HOLD",
+                    "reason": "TAKER_DISABLED",
+                    "size": 0.0,
+                    "kelly_alloc": 0.0,
+                    "vwap": p_mkt if p_mkt is not None else 0.5,
+                    "theoretical_edge_bps": 0.0
+                }
+                self.latest_decision_ref[0] = decision
             # Check if a taker trade task is already in flight
-            if self._pending_trade_task is not None and not self._pending_trade_task.done():
+            elif self._pending_trade_task is not None and not self._pending_trade_task.done():
                 decision = {
                     "side": "HOLD",
                     "reason": "TAKER_TASK_IN_FLIGHT",
