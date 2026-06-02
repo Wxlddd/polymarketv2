@@ -143,8 +143,8 @@
     }
 
     .right-col {
-      display: grid;
-      grid-template-rows: 1fr 1fr;
+      display: flex;
+      flex-direction: column;
       gap: 8px;
       min-height: 0;
     }
@@ -532,6 +532,35 @@
             </table>
           </div>
         </div>
+
+        <!-- HFT Performance & Toxicity Metrics Panel -->
+        <div class="panel">
+          <div class="panel-header">HFT EXECUTION &amp; RISK QUALITY METRICS</div>
+          <div class="panel-body" style="padding: 6px;">
+            <table style="font-size:10px; line-height: 1.4;">
+              <tr>
+                <td class="dim" title="Ratio of executed limit volume to total sent limit volume at touched prices. Healthy > 30%, Red Flag < 20% (indicates adverse selection).">Limit Fill Rate:</td>
+                <td id="hft-fill-rate" class="bold white">—</td>
+                <td class="dim" title="Theoretical P&L (valued at Mid) vs Liquidation P&L (incorporates book walk for positional size). Large gap indicates phantom profits.">PnL Divergence:</td>
+                <td id="hft-pnl-div" class="bold white">—</td>
+              </tr>
+              <tr>
+                <td class="dim" title="Mark-to-Market P&L in bps at 1s, 5s, 15s after execution. Systematic negative MTM at 5s/15s means sniper bots are using you as exit liquidity (toxic flow).">MTM Post-Fill (1s/5s/15s):</td>
+                <td id="hft-mtm-post" class="white" colspan="3">—</td>
+              </tr>
+              <tr>
+                <td class="dim" title="Ratio of theoretical edge to actual execution slippage. Healthy > 2.0. Red Flag <= 1.0 (expected profit wiped out by transaction costs/latency).">Edge/Slippage Ratio:</td>
+                <td id="hft-es-ratio" class="bold white">—</td>
+                <td class="dim" title="Total number of NEW and CANCEL orders relative to Executed Trades. Healthy < 50. Red Flag > 100 (noise-chasing ping-pong, high gas/rate limits).">OTR (Order/Trade):</td>
+                <td id="hft-otr" class="bold white">—</td>
+              </tr>
+            </table>
+            <!-- Mini Warning Banner / Alerts for Quality Checks -->
+            <div id="hft-alerts" style="margin-top: 5px; padding: 4px 6px; font-size: 9px; display: none; border: 1px solid #ff3333; background: #220000; color: #ff3333; font-family: monospace;">
+              ⚠️ <span id="hft-alert-msg"></span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -691,6 +720,7 @@
   const MAX_HIST = 120;
   let dataRange = { min_time: 0, max_time: 0 };
   let lastBacktestHistory = [];
+  let currentSlug = null;
 
   // Cache target nodes for DOM efficiency (prevent querySelector lookup overhead)
   const els = {
@@ -771,6 +801,16 @@
 
   // ── STATE RENDERING (DOM TextContent updates) ──
   function renderState(state) {
+    // Check for market cycle rollover and clear old graph paths
+    if (state.slug && state.slug !== currentSlug) {
+      currentSlug = state.slug;
+      history.prices = [];
+      history.strikes = [];
+      history.pfairs = [];
+      history.pmarkets = [];
+      history.times = [];
+    }
+
     // 1. Header
     els.ticker.textContent = state.ticker || '—';
     
@@ -836,13 +876,80 @@
     els.engQtyYes.textContent = state.pos_qty_yes ? state.pos_qty_yes.toFixed(1) : '0.0';
     els.engQtyNo.textContent = state.pos_qty_no ? state.pos_qty_no.toFixed(1) : '0.0';
 
+    // 5.5 HFT quality and toxicity metrics update
+    if (state.hft_metrics) {
+      const hft = state.hft_metrics;
+      
+      // limit fill rate
+      const fr = hft.fill_rate;
+      const frEl = document.getElementById('hft-fill-rate');
+      frEl.textContent = (fr * 100).toFixed(1) + '%';
+      frEl.className = 'bold ' + (fr >= 0.3 ? 'green' : fr >= 0.2 ? 'amber' : 'red');
+      
+      // post-fill MTM
+      const m1 = hft.avg_mtm_1s * 10000;
+      const m5 = hft.avg_mtm_5s * 10000;
+      const m15 = hft.avg_mtm_15s * 10000;
+      const mtmEl = document.getElementById('hft-mtm-post');
+      mtmEl.innerHTML = `<span class="${m1 >= 0 ? 'green' : 'red'}">${m1 >= 0 ? '+' : ''}${m1.toFixed(1)}</span> / ` +
+                        `<span class="${m5 >= 0 ? 'green' : 'red'}">${m5 >= 0 ? '+' : ''}${m5.toFixed(1)}</span> / ` +
+                        `<span class="${m15 >= 0 ? 'green' : 'red'}">${m15 >= 0 ? '+' : ''}${m15.toFixed(1)} bps</span>`;
+                        
+      // es ratio
+      const es = hft.es_ratio;
+      const esEl = document.getElementById('hft-es-ratio');
+      esEl.textContent = es === 99.9 ? '∞' : es.toFixed(2);
+      esEl.className = 'bold ' + (es > 2.0 ? 'green' : es > 1.0 ? 'amber' : 'red');
+      
+      // pnl div
+      const div = hft.pnl_divergence;
+      const divEl = document.getElementById('hft-pnl-div');
+      divEl.textContent = '$' + fmt(Math.abs(div)) + (div >= 0 ? ' (mid>liq)' : ' (liq>mid)');
+      divEl.className = 'bold ' + (Math.abs(div) < 50 ? 'green' : Math.abs(div) < 200 ? 'amber' : 'red');
+      
+      // OTR
+      const otr = hft.otr;
+      const otrEl = document.getElementById('hft-otr');
+      otrEl.textContent = otr.toFixed(1) + 'x';
+      otrEl.className = 'bold ' + (otr < 50 ? 'green' : otr < 100 ? 'amber' : 'red');
+      
+      // Alerts handling
+      const alertWrap = document.getElementById('hft-alerts');
+      const alertMsg = document.getElementById('hft-alert-msg');
+      let alerts = [];
+      
+      if (fr < 0.20 && state.total_trades > 3) {
+        alerts.push('ADVERSE SELECTION (Fill rate < 20%)');
+      }
+      if (m5 < -8.0 && state.total_trades > 3) {
+        alerts.push('TOXIC FLOW INFLOW (5s MTM < -8bps)');
+      }
+      if (es <= 1.0 && hft.total_orders_sent > 3) {
+        alerts.push('EDGE EATEN BY SLIPPAGE (E/S Ratio <= 1.0)');
+      }
+      if (Math.abs(div) > 500 && Math.abs(state.pnl) > 100) {
+        alerts.push('P&L DESYNC/PHANTOM MID PROFITS (Div > $500)');
+      }
+      if (otr > 100 && state.total_trades > 2) {
+        alerts.push('HIGH ORDER CHURN / RATE LIMIT RISK (OTR > 100)');
+      }
+      
+      if (alerts.length > 0) {
+        alertWrap.style.display = 'block';
+        alertMsg.innerHTML = 'ALERT: ' + alerts.join(' | ');
+      } else {
+        alertWrap.style.display = 'none';
+      }
+    }
+
     // 6. Update chart histories
     if (state.spot_price) {
       const nowTime = new Date().toLocaleTimeString('en-US', { hour12: false });
       history.prices.push(state.spot_price);
       history.strikes.push(state.strike || 0.0);
-      history.pfairs.push(pfair !== null ? pfair : 0.5);
-      history.pmarkets.push(pmarket !== null ? pmarket : 0.5);
+      
+      history.pfairs.push(pfair);
+      history.pmarkets.push(pmarket);
       history.times.push(nowTime);
 
       if (history.prices.length > MAX_HIST) {
@@ -1017,11 +1124,18 @@
     ctx.strokeStyle = '#00ff00';
     ctx.lineWidth = 1.2;
     ctx.beginPath();
+    let firstFair = true;
     for (let i = 0; i < history.pfairs.length; i++) {
+      const v = history.pfairs[i];
+      if (v === null || v === undefined) continue;
       const x = xOf(i);
-      const y = yOf(history.pfairs[i]);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      const y = yOf(v);
+      if (firstFair) {
+        ctx.moveTo(x, y);
+        firstFair = false;
+      } else {
+        ctx.lineTo(x, y);
+      }
     }
     ctx.stroke();
 
@@ -1029,11 +1143,18 @@
     ctx.strokeStyle = '#ff00ff';
     ctx.lineWidth = 1.2;
     ctx.beginPath();
+    let firstMkt = true;
     for (let i = 0; i < history.pmarkets.length; i++) {
+      const v = history.pmarkets[i];
+      if (v === null || v === undefined) continue;
       const x = xOf(i);
-      const y = yOf(history.pmarkets[i]);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      const y = yOf(v);
+      if (firstMkt) {
+        ctx.moveTo(x, y);
+        firstMkt = false;
+      } else {
+        ctx.lineTo(x, y);
+      }
     }
     ctx.stroke();
 

@@ -76,7 +76,17 @@ L'esposizione ottimale in percentuale del capitale di portafoglio sul book YES/N
 
 $$f^*_{\text{YES}} = \gamma \cdot \frac{p_{\text{yes}} - p_{\text{ask}}}{1 - p_{\text{ask}}}$$
 
-Il target effettivo è regolarizzato con un buffer $\delta = \text{taker\_fee\_multiplier} \times \gamma$ per evitare churning su edge marginali.
+Il target effettivo è regolarizzato con un buffer $\delta = \text{taker fee multiplier} \times \gamma$ per evitare churning su edge marginali.
+
+### 3. Macchina a Stati del Pre-Settlement Unwind (Liquidazione HFT)
+Per eliminare la varianza terminale tipica delle opzioni 0-DTE a 5 minuti detenute fino alla scadenza, il motore implementa una macchina a stati dinamica basata sul tempo rimanente alla scadenza (TTE, Time-To-Expiry) e sullo spread corrente:
+- **Fase 1: Soft Unwind (Reduce-Only)** (TTE $\le 45.0$ secondi):
+  Entra in modalità reduce-only. Vengono cancellati tutti gli ordini maker attivi che aumenterebbero l'inventario assoluto $|q|$. È consentito quotare o eseguire solo operazioni che riducono $|q|$ verso lo zero (se $q > 0$ si quota solo ASK per liquidare YES; se $q < 0$ si quota solo BID per coprire NO; se $q == 0$ si azzera l'attività di trading). Nei filtri taker, vengono bloccati tutti i trade tranne quelli diretti ad appiattire l'esposizione.
+- **Fase 2: Hard Liquidation Sweep (Panic Sweep)** (TTE $\le 15.0$ secondi OR (TTE $\le 45.0$ e spread > 0.10 USD)):
+  Cancella istantaneamente qualsiasi quotazione maker pendente. Ignora completamente il sizing di Kelly e spara un ordine Taker Market aggressivo che incrocia il book per appiattire l'inventario istantaneamente a zero (vendendo YES se $q > 0$, o comprando YES se $q < 0$). Attiva uno stato di blocco (`locked`) che inibisce nuove aperture fino al rollover del ciclo successivo.
+
+### 4. Parametro di Sizing Minimo Centralizzato
+Le soglie rigide di dimensione minima al dettaglio di 50 USD sono state rimosse e centralizzate nel parametro `MIN_ORDER_USD` (default `1.0` USD), consentendo al bot di eseguire micro-operazioni e micro-coperture da 5 USD o 10 USD per sintonizzare finemente l'inventario ottimale.
 
 ---
 
@@ -187,9 +197,13 @@ polymarketv2/
 | `HAWKES_BETA` | `5.0` | Parametro di decadimento esponenziale Hawkes |
 | `HAWKES_KAPPA_SELF` | `3.0` | Coefficiente di auto-eccitazione Hawkes |
 | `HAWKES_KAPPA_CROSS` | `1.0` | Coefficiente di eccitazione incrociata Hawkes |
-| `KELLY_FRACTION` | `0.1` | Fattore frazionario di Kelly |
-| `MIN_EXPECTED_VALUE` | `0.015` | Soglia minima di EV per eseguire un trade |
-| `EMA_HALFLIFE_SEC` | `15.0` | Halflife EMA time-based sulla probabilità Merton |
+| `KELLY_FRACTION` | `0.05` | Fattore frazionario di Kelly (ridotto a 0.05 per HFT) |
+| `MIN_EXPECTED_VALUE` | `0.005` | Soglia minima di EV per eseguire un trade |
+| `EMA_HALFLIFE_SEC` | `3.0` | Halflife EMA time-based sulla probabilità Merton |
+| `MIN_ORDER_USD` | `1.0` | Dimensione minima dell'ordine in USD per micro-coperture |
+| `MAX_POSITION_SIZE_USD` | `250.0` | Massima esposizione direzionale taker in USD |
+| `MM_MAX_INVENTORY` | `500.0` | Massimo accumulo di inventario in token maker |
+| `MM_RISK_AVERSION` | `2.5` | Coefficiente gamma di avversione al rischio maker (Avellaneda) |
 
 ---
 

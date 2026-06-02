@@ -55,7 +55,8 @@ def build_dashboard(
     strategy: BaseStrategy,
     client: IExecutionClient,
     engine: ExecutionEngine,
-    latest_decision: Dict[str, Any]
+    latest_decision: Dict[str, Any],
+    hft_metrics: Optional[Dict[str, Any]] = None
 ) -> Layout:
     """Builds the Rich terminal layout combining all system modules."""
     layout = Layout()
@@ -77,7 +78,8 @@ def build_dashboard(
     
     layout["right"].split_column(
         Layout(name="orderbook"),
-        Layout(name="execution_engine", size=10)
+        Layout(name="execution_engine", size=8),
+        Layout(name="hft_metrics", size=8)
     )
 
     # 1. Header Layout
@@ -244,6 +246,81 @@ def build_dashboard(
     
     layout["execution_engine"].update(Panel(ex_table, title="[bold]Risk & Sizing Engine[/]", border_style="bright_black"))
 
+    # 5.5 Right: HFT Quality & Toxicity Panel
+    if hft_metrics:
+        hft_table = Table(box=None, show_header=False, padding=(0, 2))
+        hft_table.add_column("Metric", style="dim", width=20)
+        hft_table.add_column("Val", width=18)
+        
+        # 1. Limit Fill Rate
+        vol_touched = hft_metrics["volume_sent_touched"]
+        vol_executed = hft_metrics["volume_executed"]
+        fill_rate = vol_executed / vol_touched if vol_touched > 0.0 else (1.0 if config.maker.ENABLED else 0.0)
+        fill_color = "green" if fill_rate >= 0.3 else "yellow" if fill_rate >= 0.2 else "red"
+        
+        # 2. MTM post fill (5s)
+        all_mtm_trades = hft_metrics["completed_mtm_trades"] + hft_metrics["pending_mtm_trades"]
+        mtms_5s = [t["mtm_5s"] for t in all_mtm_trades if t["mtm_5s"] is not None]
+        avg_5s = sum(mtms_5s) / len(mtms_5s) if mtms_5s else 0.0
+        mtm_5s_color = "green" if avg_5s >= 0.0 else "yellow" if avg_5s >= -0.001 else "red"
+        
+        # 3. E/S Ratio
+        tot_edge = hft_metrics["total_taker_edge"]
+        tot_slip = hft_metrics["total_taker_slippage"]
+        es_ratio = tot_edge / tot_slip if tot_slip > 0.0 else (99.9 if tot_edge > 0.0 else 0.0)
+        es_color = "green" if es_ratio > 2.0 else "yellow" if es_ratio > 1.0 else "red"
+        
+        # 4. P&L Divergence
+        liq_val = 0.0
+        if qty_yes > 0.0:
+            bids = shadow_book.get_sorted_bids()
+            remaining = qty_yes
+            for p, q in bids:
+                fill = min(remaining, q)
+                liq_val += fill * p
+                remaining -= fill
+                if remaining <= 0.0:
+                    break
+            if remaining > 0.0:
+                last_p = bids[-1][0] if bids else 0.0
+                liq_val += remaining * last_p
+                
+        if qty_no > 0.0:
+            asks = shadow_book.get_sorted_asks()
+            remaining = qty_no
+            for p, q in asks:
+                fill = min(remaining, q)
+                liq_val += fill * (1.0 - p)
+                remaining -= fill
+                if remaining <= 0.0:
+                    break
+            if remaining > 0.0:
+                last_p = asks[-1][0] if asks else 1.0
+                liq_val += remaining * (1.0 - last_p)
+                
+        pnl_liq = cash + liq_val - config.arbitrage.INITIAL_CAPITAL
+        pnl_mid = cum_pnl
+        div = pnl_mid - pnl_liq
+        div_color = "green" if abs(div) < 50.0 else "yellow" if abs(div) < 200.0 else "red"
+        
+        # 5. OTR
+        total_msgs = hft_metrics["total_orders_sent"] + hft_metrics["total_orders_cancelled"]
+        total_tr = client.total_trades if hasattr(client, "total_trades") else hft_metrics.get("total_trades", 0)
+        if total_tr == 0:
+            total_tr = hft_metrics.get("total_trades", 0)
+        otr = total_msgs / total_tr if total_tr > 0 else 0.0
+        otr_color = "green" if otr < 50 else "yellow" if otr < 100 else "red"
+        
+        hft_table.add_row("Limit Fill Rate:", f"[{fill_color}]{fill_rate:.1%}[/] (exp >30%)")
+        hft_table.add_row("MTM Post-Fill (5s):", f"[{mtm_5s_color}]{avg_5s * 10000:+.1f} bps[/] (exp >=0)")
+        hft_table.add_row("Edge/Slippage Ratio:", f"[{es_color}]{es_ratio:.2f}[/] (exp >2.0)")
+        hft_table.add_row("PnL Divergence:", f"[{div_color}]${div:,.2f}[/] (Mid-Liq)")
+        hft_table.add_row("Order/Trade (OTR):", f"[{otr_color}]{otr:.1f}[/] (exp <50)")
+        
+        layout["hft_metrics"].update(Panel(hft_table, title="[bold]HFT Quality & Toxicity[/]", border_style="bright_black"))
+    else:
+        layout["hft_metrics"].update(Panel(Text("  Metrics loading...", style="dim"), title="[bold]HFT Quality & Toxicity[/]", border_style="bright_black"))
+
     # 6. Footer Layout
     layout["footer"].update(Text("   [q] Exit Dashboard  |  HFT Update Loop: 500ms  |  Modularity level: ultra", style="dim"))
 
@@ -258,7 +335,8 @@ async def run_terminal_dashboard(
     client: IExecutionClient,
     engine: ExecutionEngine,
     latest_decision_ref: List[Dict[str, Any]],  # mutable list reference to share engine updates
-    stop_event: asyncio.Event
+    stop_event: asyncio.Event,
+    orchestrator: Optional[Any] = None
 ) -> None:
     """Async loop printing and rendering rich dashboard layout."""
     if not RICH_AVAILABLE:
@@ -274,6 +352,7 @@ async def run_terminal_dashboard(
         while not stop_event.is_set():
             try:
                 latest_decision = latest_decision_ref[0] if latest_decision_ref else {"side": "HOLD", "size": 0.0}
+                hft_metrics = orchestrator.hft_metrics if orchestrator else None
                 
                 layout = build_dashboard(
                     config=config,
@@ -283,7 +362,8 @@ async def run_terminal_dashboard(
                     strategy=strategy,
                     client=client,
                     engine=engine,
-                    latest_decision=latest_decision
+                    latest_decision=latest_decision,
+                    hft_metrics=hft_metrics
                 )
                 live.update(layout)
             except Exception as e:
