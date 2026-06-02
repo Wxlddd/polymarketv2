@@ -470,12 +470,7 @@ class LiveOrchestrator:
                 self.log_message("info", "Ok, aspetto il prossimo ciclo...")
             return
 
-        # ── Execution guard — drop tick silently if a trade cycle is in flight ──
-        # This is checked BEFORE any evaluation, EMA update, or SIGNAL log.
-        # A SIGNAL must never be emitted unless we are ready to act on it.
-        if self._pending_trade_task is not None and not self._pending_trade_task.done():
-            return
-        # ────────────────────────────────────────────────────────────────────────
+
 
         # Periodic diagnostic warnings if we are missing critical feeds to proceed
         if self.spot_feed.price is None or self.strike_manager is None:
@@ -615,7 +610,9 @@ class LiveOrchestrator:
         # Record tick in Parquet database
         self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks)
         
-        # ── St        # Evaluate Trade Sizing and Execution
+        p_mkt = self._get_market_implied_price(p_yes)
+
+        # Evaluate Trade Sizing and Execution
         if self.config.maker.ENABLED:
             decision = {"side": "HOLD", "reason": "MAKER_QUOTING", "size": 0.0, "vwap": 0.0}
             self.latest_decision_ref[0] = decision
@@ -904,7 +901,11 @@ class LiveOrchestrator:
             self.latest_decision_ref[0] = decision
             
             for instr in instructions:
-                if instr.action == "NEW" and instr.regime == "B":
+                if instr.action == "NEW" and instr.regime in ("B", "PANIC"):
+                    # Gate taker execution if a trade task is already in flight
+                    if self._pending_trade_task is not None and not self._pending_trade_task.done():
+                        continue
+
                     # Check HFT safety cooldown to prevent infinite loop spamming
                     if t_now - self._last_rejection_time.get(instr.side, 0.0) < 1.5:
                         if t_now - getattr(self, "_last_cooldown_log_time", 0.0) >= 2.0:
@@ -912,20 +913,20 @@ class LiveOrchestrator:
                             self.log_message("warning", f"[COOLDOWN] Skipping {instr.side} taker trade execution due to recent rejection safety hold.")
                         continue
 
-                    # Taker execution in Regime B!
+                    # Taker execution in Regime B / PANIC!
                     self.total_trades += 1
-                    p_mkt = self._get_market_implied_price(p_yes)
+                    p_mkt_exec = p_mkt if p_mkt is not None else p_yes
                     self.recorder.record_signal(
                         timestamp=t_now,
                         spot_price=spot,
                         strike=active_strike,
                         model_prob=p_yes,
-                        implied_prob=p_mkt,
+                        implied_prob=p_mkt_exec,
                         kelly_size=instr.qty,
-                        status=f"TAKER_{instr.side}"
+                        status=f"TAKER_{instr.side}" if instr.regime == "B" else f"PANIC_{instr.side}"
                     )
                     
-                    self.log_message("info", f"[TAKER ORDER] Executing {instr.side} | Size: {instr.qty:.2f} | Price: {instr.price:.4f}")
+                    self.log_message("info", f"[{'TAKER' if instr.regime == 'B' else 'PANIC'} ORDER] Executing {instr.side} | Size: {instr.qty:.2f} | Price: {instr.price:.4f}")
                     decision_taker = {
                         "side": instr.side,
                         "size": instr.qty,
@@ -940,23 +941,35 @@ class LiveOrchestrator:
                         )
                     )
         else:
-            decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
-            self.latest_decision_ref[0] = decision
-            
-            # Check HFT safety cooldown to prevent infinite loop spamming
-            if decision["side"] != "HOLD" and t_now - self._last_rejection_time.get(decision["side"], 0.0) < 1.5:
-                if t_now - getattr(self, "_last_cooldown_log_time", 0.0) >= 2.0:
-                    self._last_cooldown_log_time = t_now
-                    self.log_message("warning", f"[COOLDOWN] Skipping {decision['side']} taker trade execution due to recent rejection safety hold.")
+            # Check if a taker trade task is already in flight
+            if self._pending_trade_task is not None and not self._pending_trade_task.done():
                 decision = {
                     "side": "HOLD",
-                    "reason": "SAFETY_COOLDOWN_ACTIVE",
+                    "reason": "TAKER_TASK_IN_FLIGHT",
                     "size": 0.0,
-                    "kelly_alloc": decision.get("kelly_alloc", 0.0),
-                    "vwap": decision.get("vwap", 0.5),
-                    "theoretical_edge_bps": decision.get("theoretical_edge_bps", 0.0)
+                    "kelly_alloc": 0.0,
+                    "vwap": p_mkt if p_mkt is not None else 0.5,
+                    "theoretical_edge_bps": 0.0
                 }
                 self.latest_decision_ref[0] = decision
+            else:
+                decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
+                self.latest_decision_ref[0] = decision
+                
+                # Check HFT safety cooldown to prevent infinite loop spamming
+                if decision["side"] != "HOLD" and t_now - self._last_rejection_time.get(decision["side"], 0.0) < 1.5:
+                    if t_now - getattr(self, "_last_cooldown_log_time", 0.0) >= 2.0:
+                        self._last_cooldown_log_time = t_now
+                        self.log_message("warning", f"[COOLDOWN] Skipping {decision['side']} taker trade execution due to recent rejection safety hold.")
+                    decision = {
+                        "side": "HOLD",
+                        "reason": "SAFETY_COOLDOWN_ACTIVE",
+                        "size": 0.0,
+                        "kelly_alloc": decision.get("kelly_alloc", 0.0),
+                        "vwap": decision.get("vwap", 0.5),
+                        "theoretical_edge_bps": decision.get("theoretical_edge_bps", 0.0)
+                    }
+                    self.latest_decision_ref[0] = decision
 
             if decision["side"] != "HOLD":
                 p_mkt_signal = p_mkt if p_mkt is not None else p_yes
