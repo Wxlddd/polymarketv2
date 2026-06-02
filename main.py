@@ -90,6 +90,9 @@ class LiveOrchestrator:
         # Timestamp of the previous p_yes update, needed to compute dt for alpha.
         self._smoothed_p_yes_ts: float = 0.0
 
+        # Safety cooldown tracking to prevent infinite rapid-fire taker order spamming on rejections
+        self._last_rejection_time: Dict[str, float] = {}
+
         # ── Strict Trade Queue ────────────────────────────────────────────────
         # Tracks the currently inflight trade execution.
         # No new signals will be evaluated until this task completes.
@@ -441,7 +444,7 @@ class LiveOrchestrator:
                 ui_type = "settle"
             elif level in ("warning", "error"):
                 ui_type = "warning"
-            elif any(x in message.lower() for x in ("signal", "execut", "trade")):
+            elif any(x in message.lower() for x in ("signal", "execut", "trade", "fill", "maker")):
                 ui_type = "trade"
             elif "settle" in message.lower():
                 ui_type = "settle"
@@ -902,6 +905,13 @@ class LiveOrchestrator:
             
             for instr in instructions:
                 if instr.action == "NEW" and instr.regime == "B":
+                    # Check HFT safety cooldown to prevent infinite loop spamming
+                    if t_now - self._last_rejection_time.get(instr.side, 0.0) < 1.5:
+                        if t_now - getattr(self, "_last_cooldown_log_time", 0.0) >= 2.0:
+                            self._last_cooldown_log_time = t_now
+                            self.log_message("warning", f"[COOLDOWN] Skipping {instr.side} taker trade execution due to recent rejection safety hold.")
+                        continue
+
                     # Taker execution in Regime B!
                     self.total_trades += 1
                     p_mkt = self._get_market_implied_price(p_yes)
@@ -932,6 +942,22 @@ class LiveOrchestrator:
         else:
             decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
             self.latest_decision_ref[0] = decision
+            
+            # Check HFT safety cooldown to prevent infinite loop spamming
+            if decision["side"] != "HOLD" and t_now - self._last_rejection_time.get(decision["side"], 0.0) < 1.5:
+                if t_now - getattr(self, "_last_cooldown_log_time", 0.0) >= 2.0:
+                    self._last_cooldown_log_time = t_now
+                    self.log_message("warning", f"[COOLDOWN] Skipping {decision['side']} taker trade execution due to recent rejection safety hold.")
+                decision = {
+                    "side": "HOLD",
+                    "reason": "SAFETY_COOLDOWN_ACTIVE",
+                    "size": 0.0,
+                    "kelly_alloc": decision.get("kelly_alloc", 0.0),
+                    "vwap": decision.get("vwap", 0.5),
+                    "theoretical_edge_bps": decision.get("theoretical_edge_bps", 0.0)
+                }
+                self.latest_decision_ref[0] = decision
+
             if decision["side"] != "HOLD":
                 p_mkt_signal = p_mkt if p_mkt is not None else p_yes
                 self.recorder.record_signal(
@@ -1031,6 +1057,7 @@ class LiveOrchestrator:
                     "warning", 
                     f"TRADE REJECTED: {result.get('reason')}"
                 )
+                self._last_rejection_time[decision["side"]] = time.time()
 
             if self.web_server:
                 self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
