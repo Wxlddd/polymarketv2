@@ -82,11 +82,11 @@ Il target effettivo è regolarizzato con un buffer $\delta = \text{taker fee mul
 Per eliminare la varianza terminale tipica delle opzioni 0-DTE a 5 minuti detenute fino alla scadenza, il motore implementa una macchina a stati dinamica basata sul tempo rimanente alla scadenza (TTE, Time-To-Expiry) e sullo spread corrente:
 - **Fase 1: Soft Unwind (Reduce-Only)** (TTE $\le 45.0$ secondi):
   Entra in modalità reduce-only. Vengono cancellati tutti gli ordini maker attivi che aumenterebbero l'inventario assoluto $|q|$. È consentito quotare o eseguire solo operazioni che riducono $|q|$ verso lo zero (se $q > 0$ si quota solo ASK per liquidare YES; se $q < 0$ si quota solo BID per coprire NO; se $q == 0$ si azzera l'attività di trading). Nei filtri taker, vengono bloccati tutti i trade tranne quelli diretti ad appiattire l'esposizione.
-- **Fase 2: Hard Liquidation Sweep (Panic Sweep)** (TTE $\le 15.0$ secondi OR (TTE $\le 45.0$ e spread $> \$0.10$)):
+- **Fase 2: Hard Liquidation Sweep (Panic Sweep)** (TTE $\le 15.0$ secondi OR (TTE $\le 45.0$ e spread > 0.10 USD)):
   Cancella istantaneamente qualsiasi quotazione maker pendente. Ignora completamente il sizing di Kelly e spara un ordine Taker Market aggressivo che incrocia il book per appiattire l'inventario istantaneamente a zero (vendendo YES se $q > 0$, o comprando YES se $q < 0$). Attiva uno stato di blocco (`locked`) che inibisce nuove aperture fino al rollover del ciclo successivo.
 
 ### 4. Parametro di Sizing Minimo Centralizzato
-Le soglie rigide di dimensione minima al dettaglio di $50 USD sono state rimosse e centralizzate nel parametro `MIN_ORDER_USD` (default `1.0` USD), consentendo al bot di eseguire micro-operazioni e micro-coperture da $5 o $10 per sintonizzare finemente l'inventario ottimale.
+Le soglie rigide di dimensione minima al dettaglio di 50 USD sono state rimosse e centralizzate nel parametro `MIN_ORDER_USD` (default `1.0` USD), consentendo al bot di eseguire micro-operazioni e micro-coperture da 5 USD o 10 USD per sintonizzare finemente l'inventario ottimale.
 
 ---
 
