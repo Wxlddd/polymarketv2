@@ -26,14 +26,15 @@ class DataRecorder(IDataRecorder):
         self.buffer_size = buffer_size
         
         # Resolve today's date (YYYY-MM-DD)
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        self.current_date = datetime.now().strftime("%Y-%m-%d")
         
         # Resolve run ID timestamp (YYYYMMDD_HHMMSS)
         if run_id is None:
             run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = run_id
             
         # Structure: logs/YYYY-MM-DD/strategy_name/run_id_timestamp/
-        self.log_dir = os.path.join(base_log_dir, today_str, strategy_name, run_id)
+        self.log_dir = os.path.join(base_log_dir, self.current_date, strategy_name, run_id)
         os.makedirs(self.log_dir, exist_ok=True)
         
         self.ticks_path = os.path.join(self.log_dir, "ticks.parquet")
@@ -45,6 +46,26 @@ class DataRecorder(IDataRecorder):
         
         # Initialize CSV files with headers
         self._init_csv_files()
+        
+    def _check_and_rollover_date(self) -> None:
+        """Midnight rollover: Dynamically switches the log directory if the date changes."""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if today_str != self.current_date:
+            # 1. Flush any buffered ticks first
+            self._flush_ticks_to_parquet()
+            
+            # 2. Update current date and logging directory
+            print(f"[DataRecorder] Midnight rollover detected. Moving from {self.current_date} to {today_str}")
+            self.current_date = today_str
+            self.log_dir = os.path.join(self.base_log_dir, today_str, self.strategy_name, self.run_id)
+            os.makedirs(self.log_dir, exist_ok=True)
+            
+            self.ticks_path = os.path.join(self.log_dir, "ticks.parquet")
+            self.signals_path = os.path.join(self.log_dir, "signals.csv")
+            self.trades_path = os.path.join(self.log_dir, "trades.csv")
+            
+            # 3. Re-initialize CSV files in the new directory
+            self._init_csv_files()
         
     def _init_csv_files(self) -> None:
         """Initializes CSV log files with column headers if they do not exist."""
@@ -91,6 +112,7 @@ class DataRecorder(IDataRecorder):
         asks_l2: List[Tuple[float, float]]
     ) -> None:
         """Logs a single market tick. Buffers tick in-memory and flushes periodically."""
+        self._check_and_rollover_date()
         best_bid = bids_l2[0][0] if bids_l2 else None
         best_bid_qty = bids_l2[0][1] if bids_l2 else None
         best_ask = asks_l2[0][0] if asks_l2 else None
@@ -125,6 +147,7 @@ class DataRecorder(IDataRecorder):
         status: str
     ) -> None:
         """Immediately appends strategy signals to CSV for human-readable inspection."""
+        self._check_and_rollover_date()
         try:
             with open(self.signals_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -156,6 +179,7 @@ class DataRecorder(IDataRecorder):
         capital: float
     ) -> None:
         """Immediately appends trade outcomes to CSV for human-readable inspection."""
+        self._check_and_rollover_date()
         try:
             with open(self.trades_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -200,7 +224,13 @@ class DataRecorder(IDataRecorder):
                 try:
                     existing_df = pl.read_parquet(self.ticks_path)
                     combined_df = pl.concat([existing_df, new_df])
-                    combined_df.write_parquet(self.ticks_path, compression="zstd")
+                    
+                    # Write to a temporary file first to avoid self-locking/read-locks on Windows
+                    temp_path = self.ticks_path + ".tmp"
+                    combined_df.write_parquet(temp_path, compression="zstd")
+                    
+                    # Atomic swap (guaranteed safe on Windows via os.replace)
+                    os.replace(temp_path, self.ticks_path)
                 except Exception as e:
                     # If reading or writing the main file fails (e.g. file lock on Windows),
                     # write to a new 'recovery' chunk to avoid losing data and prevent 

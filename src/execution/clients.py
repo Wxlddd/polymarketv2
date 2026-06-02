@@ -166,7 +166,7 @@ class MockExecutionClient(IExecutionClient):
 
         vwap_exec = total_usd / filled_qty if filled_qty > 0 else 0.0
         
-        if (filled_qty * vwap_exec) < 50.0:
+        if (filled_qty * vwap_exec) < self.config.arbitrage.MIN_ORDER_USD:
             logger.warning(f"[MockClient] IOC fill too small: {filled_qty:.2f} at ${vwap_exec:.4f}")
             return {"success": False, "reason": "IOC_FILL_TOO_SMALL"}
 

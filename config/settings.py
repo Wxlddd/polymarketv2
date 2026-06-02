@@ -44,7 +44,7 @@ class MertonJumpDiffusionConfig:
     OFI_NORM_EMA_ALPHA: float = field(default_factory=lambda: float(os.getenv("OFI_NORM_EMA_ALPHA", "0.1")))
     # Half-life (seconds) for the time-based EMA applied to raw p_yes before the engine.
     # Time-based EMA ensures consistent smoothing regardless of CLOB tick rate.
-    EMA_HALFLIFE_SEC: float = field(default_factory=lambda: float(os.getenv("EMA_HALFLIFE_SEC", "30.0")))
+    EMA_HALFLIFE_SEC: float = field(default_factory=lambda: float(os.getenv("EMA_HALFLIFE_SEC", "3.0")))
     
     # Hawkes stochastic intensity parameters
     HAWKES_LAMBDA_0: float = field(default_factory=lambda: float(os.getenv("HAWKES_LAMBDA_0", "4000.0")))
@@ -59,13 +59,14 @@ class MertonJumpDiffusionConfig:
 class ArbitrageConfig:
     """Trading and capital sizing configurations."""
     INITIAL_CAPITAL: float = field(default_factory=lambda: float(os.getenv("INITIAL_CAPITAL", "10000.0")))
-    KELLY_FRACTION: float = field(default_factory=lambda: float(os.getenv("KELLY_FRACTION", "0.15")))
+    KELLY_FRACTION: float = field(default_factory=lambda: float(os.getenv("KELLY_FRACTION", "0.05")))
     GAS_FEE_USD: float = field(default_factory=lambda: float(os.getenv("GAS_FEE_USD", "0.03")))
     TAKER_FEE_MULTIPLIER: float = field(default_factory=lambda: float(os.getenv("TAKER_FEE_MULTIPLIER", "0.072")))
     MIN_EXPECTED_VALUE: float = field(default_factory=lambda: float(os.getenv("MIN_EXPECTED_VALUE", "0.005")))
     MIN_ACCEPTABLE_MARGIN_BPS: float = field(default_factory=lambda: float(os.getenv("MIN_ACCEPTABLE_MARGIN_BPS", "5.0")))
     ABSOLUTE_MAX_SLIPPAGE_BPS: float = field(default_factory=lambda: float(os.getenv("ABSOLUTE_MAX_SLIPPAGE_BPS", "150.0")))
-    MAX_POSITION_SIZE_USD: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_USD", "5000.0")))
+    MAX_POSITION_SIZE_USD: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_USD", "250.0")))
+    MIN_ORDER_USD: float = field(default_factory=lambda: float(os.getenv("MIN_ORDER_USD", "1.0")))
 
 @dataclass(frozen=True)
 class RiskConfig:
@@ -81,11 +82,11 @@ class RiskConfig:
 class MarketMakerConfig:
     """Statistical market making and quoting configurations."""
     ENABLED: bool = field(default_factory=lambda: os.getenv("MM_ENABLED", "True").lower() == "true")
-    RISK_AVERSION: float = field(default_factory=lambda: float(os.getenv("MM_RISK_AVERSION", "0.1")))
+    RISK_AVERSION: float = field(default_factory=lambda: float(os.getenv("MM_RISK_AVERSION", "2.5")))
     MIN_FEE_BUFFER: float = field(default_factory=lambda: float(os.getenv("MM_MIN_FEE_BUFFER", "0.005")))
     TOXICITY_BUFFER: float = field(default_factory=lambda: float(os.getenv("MM_TOXICITY_BUFFER", "0.005")))
     MAKER_SIZE: float = field(default_factory=lambda: float(os.getenv("MM_MAKER_SIZE", "100.0")))
-    MAX_INVENTORY: float = field(default_factory=lambda: float(os.getenv("MM_MAX_INVENTORY", "5000.0")))
+    MAX_INVENTORY: float = field(default_factory=lambda: float(os.getenv("MM_MAX_INVENTORY", "500.0")))
     UNWIND_THRESHOLD: float = field(default_factory=lambda: float(os.getenv("MM_UNWIND_THRESHOLD", "0.01")))
     TAKER_EDGE_EPSILON: float = field(default_factory=lambda: float(os.getenv("MM_TAKER_EDGE_EPSILON", "0.015")))
     FIXED_HORIZON_SEC: float = field(default_factory=lambda: float(os.getenv("MM_FIXED_HORIZON_SEC", "300.0")))

@@ -104,6 +104,41 @@ class ExecutionEngine:
         """
         Runs portfolio-aware Kelly sizing, partial fill book walking, and HFT risk checks.
         """
+        # Call the underlying sizing engine
+        decision = self._evaluate_and_trade(p_yes, context, client)
+        
+        # Apply Phase 1 Soft Unwind Reduce-Only filter
+        tau_seconds = context.tau_seconds
+        if tau_seconds <= 45.0 and decision["side"] != "HOLD":
+            qty_yes = client.get_position_size("YES")
+            qty_no = client.get_position_size("NO")
+            q = qty_yes - qty_no
+            
+            if q > 0 and decision["side"] == "SELL_YES":
+                pass # Allowed
+            elif q < 0 and decision["side"] == "BUY_YES":
+                pass # Allowed
+            else:
+                # Blocked!
+                return {
+                    "side": "HOLD",
+                    "reason": "SOFT_UNWIND_REDUCE_ONLY",
+                    "size": 0.0,
+                    "kelly_alloc": decision.get("kelly_alloc", 0.0),
+                    "vwap": decision.get("vwap", 0.5),
+                    "theoretical_edge_bps": decision.get("theoretical_edge_bps", 0.0)
+                }
+        return decision
+
+    def _evaluate_and_trade(
+        self, 
+        p_yes: Optional[float], 
+        context: MarketContext, 
+        client: IExecutionClient
+    ) -> Dict[str, Any]:
+        """
+        Internal sizing engine carrying raw trade logic.
+        """
         # 1. Check if model resolved probability cleanly (Zero-Assumptions REST check)
         if p_yes is None:
             return {
@@ -129,6 +164,57 @@ class ExecutionEngine:
         # 1.6. Block trading if the order book has no executable levels on either side
         if not context.bids_l2 or not context.asks_l2:
             return {"side": "HOLD", "reason": "NO_BOOK_DATA", "size": 0.0}
+
+        # --- TWO-PHASE PRE-SETTLEMENT LIQUIDATION STATE MACHINE (PHASE 2 HARD SWEEP) ---
+        tau_seconds = context.tau_seconds
+        best_bid_val = context.bids_l2[0][0] if context.bids_l2 else 0.5
+        best_ask_val = context.asks_l2[0][0] if context.asks_l2 else 0.5
+        spread = best_ask_val - best_bid_val
+        
+        # Get current net position q
+        qty_yes = client.get_position_size("YES")
+        qty_no = client.get_position_size("NO")
+        q = qty_yes - qty_no
+        
+        # Phase 2: Hard Liquidation Sweep (Panic Sweep)
+        is_panic_unwind = (tau_seconds <= 15.0) or (tau_seconds <= 45.0 and spread > 0.10)
+        if is_panic_unwind:
+            if abs(q) > 0.0:
+                if q > 0:
+                    # We hold YES, must sell YES immediately
+                    return {
+                        "side": "SELL_YES",
+                        "size": float(qty_yes),
+                        "limit_price": float(best_bid_val),
+                        "vwap": float(best_bid_val),
+                        "ev": 999.0,
+                        "expected_slippage_bps": 0.0,
+                        "kelly_alloc": 0.0,
+                        "theoretical_edge_bps": 0.0,
+                        "reason": "PANIC_UNWIND"
+                    }
+                else:
+                    # We hold NO, must buy YES to flatten inventory
+                    return {
+                        "side": "BUY_YES",
+                        "size": float(qty_no),
+                        "limit_price": float(best_ask_val),
+                        "vwap": float(best_ask_val),
+                        "ev": 999.0,
+                        "expected_slippage_bps": 0.0,
+                        "kelly_alloc": 0.0,
+                        "theoretical_edge_bps": 0.0,
+                        "reason": "PANIC_UNWIND"
+                    }
+            else:
+                return {
+                    "side": "HOLD",
+                    "reason": "PANIC_UNWIND_LOCKED",
+                    "size": 0.0,
+                    "kelly_alloc": 0.0,
+                    "vwap": 0.5,
+                    "theoretical_edge_bps": 0.0
+                }
             
         t_now = context.timestamp
         self.spot_history.append((t_now, context.spot_price))
@@ -156,7 +242,7 @@ class ExecutionEngine:
         gamma = self.config.arbitrage.KELLY_FRACTION
         W = client.cash_balance
         gas = self.config.arbitrage.GAS_FEE_USD
-        min_order_usd = 50.0  # Polymarket CLOB minimum size
+        min_order_usd = self.config.arbitrage.MIN_ORDER_USD
         
         # Best prices on shadow book
         p_bid_yes = best_bid[0] if best_bid[0] else 0.5

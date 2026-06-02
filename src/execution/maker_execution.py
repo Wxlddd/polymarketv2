@@ -26,11 +26,50 @@ class OrderInstruction:
         return f"OrderInstruction(action={self.action}, side={self.side}, price={self.price:.4f}, qty={self.qty:.2f}, order_id={self.order_id}, regime={self.regime})"
 
 
+class MidPriceVolCalibrator:
+    """
+    Time-Sampled Exponentially Weighted Moving Average (EWMA) Volatility Calibrator.
+    Samples the contract's mid-price at fixed time intervals (e.g. 10s) and computes
+    log-return variance. Bypasses tick-by-tick bid-ask bounce noise.
+    """
+    __slots__ = ('sampling_interval', 'alpha', 'last_sample_time', 'last_sample_price', 'variance')
+    
+    def __init__(self, sampling_interval: float = 10.0, alpha: float = 0.05, initial_vol: float = 0.25):
+        self.sampling_interval = sampling_interval
+        self.alpha = alpha
+        self.last_sample_time = 0.0
+        self.last_sample_price = None
+        self.variance = initial_vol * initial_vol
+        
+    def update(self, current_price: float, t_now: float) -> float:
+        """
+        Conditionally updates the variance using EWMA log-returns if interval elapsed.
+        Returns the current variance (sigma^2).
+        """
+        if current_price is None or current_price <= 0.0:
+            return self.variance
+            
+        if self.last_sample_price is None:
+            self.last_sample_price = current_price
+            self.last_sample_time = t_now
+            return self.variance
+            
+        dt = t_now - self.last_sample_time
+        if dt >= self.sampling_interval:
+            import math
+            log_ret = math.log(current_price / self.last_sample_price)
+            self.variance = self.alpha * (log_ret * log_ret) + (1.0 - self.alpha) * self.variance
+            self.last_sample_price = current_price
+            self.last_sample_time = t_now
+            
+        return self.variance
+
+
 class InventoryManager:
     r"""
     Tracks net inventory risk and calculates the skewed Avellaneda-Stoikov Reservation Price.
     
-    $q_{norm} = q / Q_{max}$
+    $q_{norm} = \text{clamp}(q / Q_{max}, -1.0, 1.0)$
     $P_{res} = \hat{P} - \gamma \cdot q_{norm} \cdot \sigma^2$
     """
     __slots__ = ('gamma', 'fixed_horizon_sec', 'max_inventory')
@@ -45,21 +84,28 @@ class InventoryManager:
         return yes_shares - no_shares
 
     def calculate_reservation_price(
-        self, p_hat: float, q: float, sigma_sq: float, tau_seconds: float
+        self, p_hat: float, q: float, sigma_sq: float, tau_seconds: float = 0.0
     ) -> float:
         """
         Calculates the Reservation Price P_res skewed by inventory.
+        Implements asymptotic market making by completely omitting tau.
         
         Args:
             p_hat: Model's internal fair probability of YES [0.0, 1.0].
             q: Net inventory count (YES - NO).
-            sigma_sq: Instantaneous variance (volatility^2) annualized.
-            tau_seconds: Deprecated / unused for pure HFT instant risk.
+            sigma_sq: Mid-price EWMA variance.
+            tau_seconds: Deprecated / unused for asymptotic MM.
             
         Returns:
             Reservation price, clipped to [0.01, 0.99] to prevent illegal probability values.
         """
-        q_norm = q / self.max_inventory if self.max_inventory > 0.0 else q
+        # Strictly normalize inventory skew with Max Inventory limits and division guard
+        if self.max_inventory > 0.0:
+            q_norm = max(-1.0, min(1.0, q / self.max_inventory))
+        else:
+            q_norm = 0.0
+
+        # Asymptotic MM Reservation Price formula (tau completely removed)
         skew = self.gamma * q_norm * sigma_sq
         p_res = p_hat - skew
         
@@ -69,6 +115,7 @@ class InventoryManager:
         elif p_res > 0.99:
             return 0.99
         return p_res
+
 
 
 class ExecutionRouter:
@@ -87,7 +134,7 @@ class ExecutionRouter:
         'active_bid_id', 'active_bid_price', 'active_bid_qty',
         'active_ask_id', 'active_ask_price', 'active_ask_qty',
         # Order counter for mock ID generation
-        '_order_counter'
+        '_order_counter', 'min_order_usd', 'locked'
     )
 
     def __init__(
@@ -104,7 +151,8 @@ class ExecutionRouter:
         kelly_fraction: float = 0.15,
         fixed_horizon_sec: float = 300.0,
         gas_fee_usd: float = 0.03,
-        taker_fee_multiplier: float = 0.072
+        taker_fee_multiplier: float = 0.072,
+        min_order_usd: float = 1.0
     ):
         self.gamma = gamma
         self.min_fee_buffer = min_fee_buffer
@@ -119,6 +167,8 @@ class ExecutionRouter:
         self.fixed_horizon_sec = fixed_horizon_sec
         self.gas_fee_usd = gas_fee_usd
         self.taker_fee_multiplier = taker_fee_multiplier
+        self.min_order_usd = min_order_usd
+        self.locked = False
 
         # State memory
         self.active_bid_id: str = ""
@@ -139,6 +189,7 @@ class ExecutionRouter:
         self.active_ask_id = ""
         self.active_ask_price = 0.0
         self.active_ask_qty = 0.0
+        self.locked = False
 
     def calculate_spread(self, sigma_sq: float, tau_seconds: float) -> float:
         r"""
@@ -176,10 +227,75 @@ class ExecutionRouter:
         # Guard: Ensure we have order book data
         if not context.bids_l2 or not context.asks_l2:
             return instructions
+
+        # Lock check
+        if self.locked:
+            self._cancel_bid(instructions, "LOCKED")
+            self._cancel_ask(instructions, "LOCKED")
+            return instructions
             
         best_bid = context.bids_l2[0][0]
         best_ask = context.asks_l2[0][0]
         p_mid = 0.5 * (best_bid + best_ask)
+        current_spread = best_ask - best_bid
+        
+        # Get net position q
+        q = yes_shares - no_shares
+        tau_sec = context.tau_seconds
+
+        # Phase 2: Hard Liquidation Sweep (Panic Sweep)
+        is_panic = (tau_sec <= 15.0) or (tau_sec <= 45.0 and current_spread > 0.10)
+        if is_panic:
+            self._cancel_bid(instructions, "PANIC")
+            self._cancel_ask(instructions, "PANIC")
+            self.locked = True
+            
+            if q > 0:
+                # Aggressively sell all YES contracts
+                instructions.append(OrderInstruction("NEW", "SELL_YES", best_bid, yes_shares, "panic_sell_yes", regime="PANIC"))
+            elif q < 0:
+                # Aggressively buy YES contracts to cover NO position
+                instructions.append(OrderInstruction("NEW", "BUY_YES", best_ask, no_shares, "panic_buy_yes", regime="PANIC"))
+            return instructions
+
+        # Phase 1: Soft Unwind (Reduce-Only Regime)
+        is_reduce_only = (tau_sec <= 45.0)
+        if is_reduce_only:
+            # 1. Skew reservation price skewed by inventory
+            q_norm = q / self.max_inventory if self.max_inventory > 0.0 else q
+            p_res = p_hat - self.gamma * q_norm * sigma_sq
+            p_res = max(0.01, min(0.99, p_res))
+            
+            # 2. Calculate optimal spread and target quotes
+            delta = self.calculate_spread(sigma_sq, tau_sec)
+            inv_tick = 1.0 / self.tick_size
+            p_bid_target = round((p_res - delta) * inv_tick) / inv_tick
+            p_ask_target = round((p_res + delta) * inv_tick) / inv_tick
+            
+            if p_bid_target < 0.01:
+                p_bid_target = 0.01
+            if p_ask_target > 0.99:
+                p_ask_target = 0.99
+            if p_bid_target >= p_ask_target:
+                p_ask_target = p_bid_target + self.tick_size
+                
+            if q > 0:
+                # YES position -> Reduce-only means we only SELL YES. Cancel Bid.
+                self._cancel_bid(instructions, "REDUCE")
+                p_ask_post = max(p_ask_target, best_bid + self.tick_size)
+                p_ask_post = max(0.01, min(0.99, p_ask_post))
+                self._route_maker_ask(p_ask_post, instructions, "REDUCE", yes_shares, cash_balance)
+            elif q < 0:
+                # NO position -> Reduce-only means we only BUY YES to cover. Cancel Ask.
+                self._cancel_ask(instructions, "REDUCE")
+                p_bid_post = min(p_bid_target, best_ask - self.tick_size)
+                p_bid_post = max(0.01, min(0.99, p_bid_post))
+                self._route_maker_bid(p_bid_post, instructions, "REDUCE", cash_balance)
+            else:
+                # q == 0 -> We are perfectly flat! Cancel quotes on both sides to prevent any inventory.
+                self._cancel_bid(instructions, "REDUCE")
+                self._cancel_ask(instructions, "REDUCE")
+            return instructions
         
         # 1. Calculate net inventory and reservation price
         q = yes_shares - no_shares
@@ -343,16 +459,19 @@ class ExecutionRouter:
             self.active_ask_qty = 0.0
 
     def _route_maker_bid(self, p_bid_target: float, instructions: List[OrderInstruction], regime: str, cash_balance: float) -> None:
-        # Require enough cash to place a minimum sized bid order
-        cost = self.maker_size * p_bid_target
+        # Enforce minimum trade size of min_order_usd (qty * price >= min_order_usd)
+        min_qty = self.min_order_usd / p_bid_target if p_bid_target > 0.0 else 0.0
+        qty = max(self.maker_size, min_qty)
+        
+        # Check cash constraints
+        cost = qty * p_bid_target
         if cost + self.gas_fee_usd > cash_balance:
             max_qty = max(0.0, (cash_balance - self.gas_fee_usd) / p_bid_target)
-            if max_qty * p_bid_target < 5.0:
+            # If the maximum possible size under cash constraint is below min_order_usd, cancel bid and skip order
+            if max_qty * p_bid_target < self.min_order_usd:
                 self._cancel_bid(instructions, regime)
                 return
             qty = max_qty
-        else:
-            qty = self.maker_size
             
         if not self.active_bid_id:
             self._order_counter += 1
@@ -371,21 +490,36 @@ class ExecutionRouter:
                 self.active_bid_qty = qty
 
     def _route_maker_ask(self, p_ask_target: float, instructions: List[OrderInstruction], regime: str, yes_shares: float, cash_balance: float) -> None:
-        if yes_shares >= self.maker_size:
-            qty = self.maker_size
+        # Enforce minimum trade size of min_order_usd
+        # If we hold enough YES shares, we can quote up to yes_shares
+        min_qty = self.min_order_usd / p_ask_target if p_ask_target > 0.0 else 0.0
+        target_qty = max(self.maker_size, min_qty)
+        
+        if yes_shares >= target_qty:
+            qty = target_qty
         else:
-            # We need cash to buy NO for the remainder
-            rem_qty = self.maker_size - yes_shares
+            # We need to buy NO for the remainder (rem_qty = target_qty - yes_shares)
+            # Buying NO requires rem_qty * no_price >= min_order_usd
             no_price = 1.0 - p_ask_target
+            min_rem_qty = self.min_order_usd / no_price if no_price > 0.0 else 0.0
+            
+            # The remaining quantity of NO to buy must be at least min_rem_qty
+            rem_qty = max(target_qty - yes_shares, min_rem_qty)
             cost = rem_qty * no_price
+            
             if cost + self.gas_fee_usd > cash_balance:
                 max_rem = max(0.0, (cash_balance - self.gas_fee_usd) / no_price)
-                qty = yes_shares + max_rem
-                if qty < 1e-5 or (yes_shares == 0.0 and max_rem * no_price < 5.0):
+                if max_rem * no_price < self.min_order_usd and yes_shares * p_ask_target < self.min_order_usd:
+                    # If both the remaining NO buy and our YES holdings are too small, cancel ask and abort
                     self._cancel_ask(instructions, regime)
                     return
+                elif max_rem * no_price < self.min_order_usd:
+                    # If only YES holdings are above min_order_usd, quote only yes_shares
+                    qty = yes_shares
+                else:
+                    qty = yes_shares + max_rem
             else:
-                qty = self.maker_size
+                qty = yes_shares + rem_qty
                 
         if not self.active_ask_id:
             self._order_counter += 1
@@ -410,7 +544,7 @@ class MakerExecutionEngine:
     Interfaces with a generic BaseStrategy to extract probability predictions (P_hat)
     and uses the market context to fetch continuous volatility/variance.
     """
-    __slots__ = ('strategy', 'inventory_manager', 'execution_router', 'client')
+    __slots__ = ('strategy', 'inventory_manager', 'execution_router', 'client', 'mid_price_calibrator')
 
     def __init__(
         self,
@@ -440,8 +574,11 @@ class MakerExecutionEngine:
             kelly_fraction=config.arbitrage.KELLY_FRACTION,
             fixed_horizon_sec=config.maker.FIXED_HORIZON_SEC,
             gas_fee_usd=config.arbitrage.GAS_FEE_USD,
-            taker_fee_multiplier=config.arbitrage.TAKER_FEE_MULTIPLIER
+            taker_fee_multiplier=config.arbitrage.TAKER_FEE_MULTIPLIER,
+            min_order_usd=config.arbitrage.MIN_ORDER_USD
         )
+        # Time-sampled EWMA mid-price variance calibrator (10s sampling, alpha=0.05)
+        self.mid_price_calibrator = MidPriceVolCalibrator(sampling_interval=10.0, alpha=0.05)
 
     def evaluate_and_route(self, context: MarketContext) -> List[OrderInstruction]:
         """
@@ -457,9 +594,16 @@ class MakerExecutionEngine:
             self.execution_router._cancel_ask(instructions, "SAFE")
             return instructions
 
-        # 2. Extract realized continuous variance from context (volatility calibrator output)
-        sigma = context.volatility
-        sigma_sq = sigma * sigma
+        # 2. Compute contract mid-price and update time-sampled EWMA variance
+        mid_price = 0.5
+        if context.bids_l2 and context.asks_l2:
+            mid_price = 0.5 * (context.bids_l2[0][0] + context.asks_l2[0][0])
+        elif context.bids_l2:
+            mid_price = context.bids_l2[0][0]
+        elif context.asks_l2:
+            mid_price = context.asks_l2[0][0]
+            
+        sigma_sq = self.mid_price_calibrator.update(mid_price, context.timestamp)
 
         # 3. Position query from exchange client
         yes_shares = self.client.get_position_size("YES")
@@ -475,3 +619,4 @@ class MakerExecutionEngine:
             no_shares=no_shares,
             cash_balance=cash
         )
+

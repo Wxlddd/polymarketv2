@@ -66,6 +66,23 @@ class LiveOrchestrator:
         self.waiting_for_first_rollover = False
         self.total_trades = 0
         self._last_console_log_time = 0.0
+        
+        # Initialize HFT performance, toxicity and queue priority metrics
+        self.hft_metrics = {
+            "volume_sent_touched": 0.0,
+            "volume_executed": 0.0,
+            "pending_mtm_trades": [],   # List[dict]: {"timestamp", "side", "exec_price", "mtm_1s", "mtm_5s", "mtm_15s"}
+            "completed_mtm_trades": [], # List[dict]: historical resolved MTM trades
+            "total_taker_edge": 0.0,
+            "total_taker_slippage": 0.0,
+            "total_taker_trades": 0,
+            "total_orders_sent": 0,
+            "total_orders_cancelled": 0
+        }
+        self._current_active_orders = {
+            "bid": None, # dict or None: {"price": P, "qty": Q, "queue_ahead": qa, "prev_depth": pd}
+            "ask": None  # dict or None: {"price": P, "qty": Q, "queue_ahead": qa, "prev_depth": pd}
+        }
         # Minimum interval (seconds) between full shadow-book resets to prevent
         # CLOB reconnect bursts from triggering multiple independent snapshot fills.
         self._last_snapshot_ts: float = 0.0
@@ -150,7 +167,8 @@ class LiveOrchestrator:
                     client=self.client,
                     engine=self.engine,
                     latest_decision_ref=self.latest_decision_ref,
-                    stop_event=self._stop_event
+                    stop_event=self._stop_event,
+                    orchestrator=self
                 )
             ))
         else:
@@ -230,6 +248,21 @@ class LiveOrchestrator:
             self.clob_feed = None
             self.log_message("warning", "[Orchestrator] CLOB feed not started: YES/NO Token IDs are unresolved or missing.")
 
+    def _get_market_implied_price(self, p_fair: Optional[float] = None) -> Optional[float]:
+        """
+        Computes the market-implied probability robustly from the top of the book.
+        Handles single-sided or empty books cleanly by falling back to the single available side,
+        and finally to p_fair or None if no inputs exist.
+        """
+        top_b, top_a = self.shadow_book.get_market_top_of_book()
+        if top_b and top_a:
+            return 0.5 * (top_b[0] + top_a[0])
+        elif top_b:
+            return top_b[0]
+        elif top_a:
+            return top_a[0]
+        return p_fair
+
     def _update_web_state(
         self, 
         decision: Optional[Dict[str, Any]] = None,
@@ -257,6 +290,9 @@ class LiveOrchestrator:
         if tau_sec is None:
             tau_sec = max(0.0, self.market_manager.current_expiry - t_now) if self.market_manager.current_expiry else 300.0
             
+        if p_yes is None:
+            p_yes = getattr(self, "_smoothed_p_yes", None)
+            
         if p_yes is None and spot is not None and strike is not None:
             dummy_context = MarketContext(
                 timestamp=t_now,
@@ -279,11 +315,83 @@ class LiveOrchestrator:
         equity = cash + pos_val
         pnl = equity - self.config.arbitrage.INITIAL_CAPITAL
         
-        p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else None
+        p_mkt = self._get_market_implied_price(None)
         edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
         
         if decision is None:
             decision = self.latest_decision_ref[0]
+            
+        # Update / Compute live HFT metrics
+        
+        # 1. Limit Order Fill Rate
+        vol_touched = self.hft_metrics["volume_sent_touched"]
+        vol_executed = self.hft_metrics["volume_executed"]
+        fill_rate = vol_executed / vol_touched if vol_touched > 0.0 else (1.0 if self.config.maker.ENABLED else 0.0)
+        
+        # 2. MTM Post-Fill (1s, 5s, 15s)
+        all_mtm_trades = self.hft_metrics["completed_mtm_trades"] + self.hft_metrics["pending_mtm_trades"]
+        mtms_1s = [t["mtm_1s"] for t in all_mtm_trades if t["mtm_1s"] is not None]
+        mtms_5s = [t["mtm_5s"] for t in all_mtm_trades if t["mtm_5s"] is not None]
+        mtms_15s = [t["mtm_15s"] for t in all_mtm_trades if t["mtm_15s"] is not None]
+        
+        avg_mtm_1s = sum(mtms_1s) / len(mtms_1s) if mtms_1s else 0.0
+        avg_mtm_5s = sum(mtms_5s) / len(mtms_5s) if mtms_5s else 0.0
+        avg_mtm_15s = sum(mtms_15s) / len(mtms_15s) if mtms_15s else 0.0
+        
+        # 3. Edge-to-Slippage Ratio
+        tot_edge = self.hft_metrics["total_taker_edge"]
+        tot_slip = self.hft_metrics["total_taker_slippage"]
+        es_ratio = tot_edge / tot_slip if tot_slip > 0.0 else (99.9 if tot_edge > 0.0 else 0.0)
+        
+        # 4. PnL Divergence (walk the L2 order book bids/asks for precise liquidation)
+        liq_val = 0.0
+        if pos_qty_yes > 0.0:
+            bids = self.shadow_book.get_sorted_bids()
+            remaining = pos_qty_yes
+            for p, q in bids:
+                fill = min(remaining, q)
+                liq_val += fill * p
+                remaining -= fill
+                if remaining <= 0.0:
+                    break
+            if remaining > 0.0:
+                last_p = bids[-1][0] if bids else 0.0
+                liq_val += remaining * last_p
+                
+        if pos_qty_no > 0.0:
+            asks = self.shadow_book.get_sorted_asks()
+            remaining = pos_qty_no
+            for p, q in asks:
+                fill = min(remaining, q)
+                liq_val += fill * (1.0 - p) # Complementary NO price walk
+                remaining -= fill
+                if remaining <= 0.0:
+                    break
+            if remaining > 0.0:
+                last_p = asks[-1][0] if asks else 1.0
+                liq_val += remaining * (1.0 - last_p)
+                
+        pnl_liq = cash + liq_val - self.config.arbitrage.INITIAL_CAPITAL
+        pnl_mid = pnl
+        pnl_divergence = pnl_mid - pnl_liq
+        
+        # 5. Order-to-Trade Ratio (OTR)
+        total_msgs = self.hft_metrics["total_orders_sent"] + self.hft_metrics["total_orders_cancelled"]
+        otr = total_msgs / self.total_trades if self.total_trades > 0 else 0.0
+        
+        hft_payload = {
+            "fill_rate": fill_rate,
+            "avg_mtm_1s": avg_mtm_1s,
+            "avg_mtm_5s": avg_mtm_5s,
+            "avg_mtm_15s": avg_mtm_15s,
+            "es_ratio": es_ratio,
+            "pnl_mid": pnl_mid,
+            "pnl_liq": pnl_liq,
+            "pnl_divergence": pnl_divergence,
+            "otr": otr,
+            "total_orders_sent": self.hft_metrics["total_orders_sent"],
+            "total_orders_cancelled": self.hft_metrics["total_orders_cancelled"]
+        }
             
         state = {
             "type": "portfolio_state",
@@ -308,7 +416,8 @@ class LiveOrchestrator:
             "asks_l2": self.shadow_book.get_sorted_asks()[:5],
             "latest_decision": decision,
             "pos_qty_yes": pos_qty_yes,
-            "pos_qty_no": pos_qty_no
+            "pos_qty_no": pos_qty_no,
+            "hft_metrics": hft_payload
         }
         self.web_server.update_state(state)
 
@@ -391,6 +500,47 @@ class LiveOrchestrator:
         # Reconcile local shadow order book
         ofi = self.shadow_book.update_book(bids, asks, is_snapshot, timestamp=t_now)
         
+        # Update MTM Post-Fill calculations for both Maker and Taker trades
+        top_b_mtm, top_a_mtm = self.shadow_book.get_market_top_of_book()
+        if top_b_mtm and top_a_mtm:
+            p_mid_mtm = 0.5 * (top_b_mtm[0] + top_a_mtm[0])
+            for trade in self.hft_metrics["pending_mtm_trades"][:]:
+                dt = t_now - trade["timestamp"]
+                
+                # Determine direction in YES terms
+                side = trade["side"]
+                exec_p = trade["exec_price"]
+                if side == "BUY_YES":
+                    dir_val = 1.0
+                    ref_p = exec_p
+                elif side == "BUY_NO":
+                    dir_val = -1.0
+                    ref_p = 1.0 - exec_p
+                elif side == "SELL_YES":
+                    dir_val = -1.0
+                    ref_p = exec_p
+                elif side == "SELL_NO":
+                    dir_val = 1.0
+                    ref_p = 1.0 - exec_p
+                else:
+                    dir_val = 1.0
+                    ref_p = exec_p
+                    
+                if trade["mtm_1s"] is None and dt >= 1.0:
+                    trade["mtm_1s"] = dir_val * (p_mid_mtm - ref_p)
+                if trade["mtm_5s"] is None and dt >= 5.0:
+                    trade["mtm_5s"] = dir_val * (p_mid_mtm - ref_p)
+                if trade["mtm_15s"] is None and dt >= 15.0:
+                    trade["mtm_15s"] = dir_val * (p_mid_mtm - ref_p)
+                    # Fully resolved, move to completed list
+                    try:
+                        self.hft_metrics["pending_mtm_trades"].remove(trade)
+                        self.hft_metrics["completed_mtm_trades"].append(trade)
+                        if len(self.hft_metrics["completed_mtm_trades"]) > 200:
+                            self.hft_metrics["completed_mtm_trades"].pop(0)
+                    except ValueError:
+                        pass
+        
         # Resolve active Strike Price only after the cycle has actually started
         if self.strike_manager and (self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0):
             if self.market_manager.current_expiry is not None:
@@ -462,27 +612,111 @@ class LiveOrchestrator:
         # Record tick in Parquet database
         self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks)
         
-        # ── Strict Execution Queue ──
-        # Do not evaluate new signals if a trade is currently inflight.
-        # This prevents spamming and correctly simulates network wait times
-        # before considering the order book updated.
-        if self._pending_trade_task is not None and not self._pending_trade_task.done():
-            return
-            
-        # Evaluate Trade Sizing and Execution
+        # ── St        # Evaluate Trade Sizing and Execution
         if self.config.maker.ENABLED:
             decision = {"side": "HOLD", "reason": "MAKER_QUOTING", "size": 0.0, "vwap": 0.0}
             self.latest_decision_ref[0] = decision
             
-            # A. Simulate limit order fills first (for paper/mock live trading)
+            # A. Simulate limit order fills first (using the Pro-Rata Queue Priority Model)
             top_b, top_a = self.shadow_book.get_market_top_of_book()
             best_bid_p = top_b[0] if top_b else None
             best_ask_p = top_a[0] if top_a else None
             
-            # Check active buy limit order (bid) fill
             active_bid_p = self.engine.execution_router.active_bid_price
             active_bid_q = self.engine.execution_router.active_bid_qty
-            if active_bid_p > 0.0 and best_ask_p is not None and best_ask_p <= active_bid_p:
+            active_ask_p = self.engine.execution_router.active_ask_price
+            active_ask_q = self.engine.execution_router.active_ask_qty
+            
+            # 1. Update Bid Order Queue Priority State
+            if active_bid_p > 0.0:
+                cur_depth = self.shadow_book.q_real_bids.get(active_bid_p, 0.0)
+                if self._current_active_orders["bid"] is None or self._current_active_orders["bid"]["price"] != active_bid_p:
+                    self._current_active_orders["bid"] = {
+                        "price": active_bid_p,
+                        "qty": active_bid_q,
+                        "queue_ahead": cur_depth,
+                        "prev_depth": cur_depth,
+                        "touched": False
+                    }
+                else:
+                    self._current_active_orders["bid"]["qty"] = active_bid_q
+                    
+                order = self._current_active_orders["bid"]
+                if best_ask_p is not None:
+                    if best_ask_p < active_bid_p:
+                        order["queue_ahead"] = 0.0
+                        order["touched"] = True
+                    elif best_ask_p == active_bid_p:
+                        order["touched"] = True
+                        delta_depth = order["prev_depth"] - cur_depth
+                        if delta_depth > 0:
+                            alpha = 0.40 # 40% trades, 60% cancels
+                            v_traded = alpha * delta_depth
+                            c_cancels = (1.0 - alpha) * delta_depth
+                            ratio = order["queue_ahead"] / order["prev_depth"] if order["prev_depth"] > 0 else 0.0
+                            v_cancelled_ahead = c_cancels * ratio
+                            order["queue_ahead"] = max(0.0, order["queue_ahead"] - v_traded - v_cancelled_ahead)
+                        
+                        # Polygon sequencer gas priority-jump stochastical decay (2% per tick)
+                        stoch_decay = 0.02 * order["queue_ahead"]
+                        order["queue_ahead"] = max(0.0, order["queue_ahead"] - stoch_decay)
+                        order["prev_depth"] = cur_depth
+            else:
+                self._current_active_orders["bid"] = None
+                
+            # 2. Update Ask Order Queue Priority State
+            if active_ask_p > 0.0:
+                cur_depth = self.shadow_book.q_real_asks.get(active_ask_p, 0.0)
+                if self._current_active_orders["ask"] is None or self._current_active_orders["ask"]["price"] != active_ask_p:
+                    self._current_active_orders["ask"] = {
+                        "price": active_ask_p,
+                        "qty": active_ask_q,
+                        "queue_ahead": cur_depth,
+                        "prev_depth": cur_depth,
+                        "touched": False
+                    }
+                else:
+                    self._current_active_orders["ask"]["qty"] = active_ask_q
+                    
+                order = self._current_active_orders["ask"]
+                if best_bid_p is not None:
+                    if best_bid_p > active_ask_p:
+                        order["queue_ahead"] = 0.0
+                        order["touched"] = True
+                    elif best_bid_p == active_ask_p:
+                        order["touched"] = True
+                        delta_depth = order["prev_depth"] - cur_depth
+                        if delta_depth > 0:
+                            alpha = 0.40
+                            v_traded = alpha * delta_depth
+                            c_cancels = (1.0 - alpha) * delta_depth
+                            ratio = order["queue_ahead"] / order["prev_depth"] if order["prev_depth"] > 0 else 0.0
+                            v_cancelled_ahead = c_cancels * ratio
+                            order["queue_ahead"] = max(0.0, order["queue_ahead"] - v_traded - v_cancelled_ahead)
+                        
+                        stoch_decay = 0.02 * order["queue_ahead"]
+                        order["queue_ahead"] = max(0.0, order["queue_ahead"] - stoch_decay)
+                        order["prev_depth"] = cur_depth
+            else:
+                self._current_active_orders["ask"] = None
+
+            # Track total Limit Volume Sent when Touched/Crossed
+            for side in ["bid", "ask"]:
+                ord_info = self._current_active_orders[side]
+                if ord_info is not None and ord_info["touched"] and not ord_info.get("recorded_touch", False):
+                    self.hft_metrics["volume_sent_touched"] += ord_info["qty"]
+                    ord_info["recorded_touch"] = True
+
+            # 3. Simulate fills (only when crossed or touched and Q_ahead <= 0)
+            order_bid = self._current_active_orders["bid"]
+            is_buy_fill = False
+            if active_bid_p > 0.0 and best_ask_p is not None and order_bid is not None:
+                is_crossed = best_ask_p < active_bid_p
+                is_touched_and_front = best_ask_p == active_bid_p and order_bid["queue_ahead"] <= 0.0
+                if is_crossed or is_touched_and_front:
+                    is_buy_fill = True
+                    
+            if is_buy_fill:
                 fee = active_bid_q * self.engine.execution_router.taker_fee_multiplier * active_bid_p * (1.0 - active_bid_p)
                 cost = active_bid_q * active_bid_p + self.config.arbitrage.GAS_FEE_USD + fee
                 if cost > self.client.cash_balance:
@@ -495,10 +729,24 @@ class LiveOrchestrator:
                         self.engine.execution_router.active_bid_price = 0.0
                         self.engine.execution_router.active_bid_qty = 0.0
                         active_bid_p = 0.0
+                        self._current_active_orders["bid"] = None
+                        is_buy_fill = False
                         
-                if active_bid_p > 0.0:
+                if is_buy_fill and active_bid_p > 0.0:
                     # Buy Fill!
                     self.total_trades += 1
+                    self.hft_metrics["volume_executed"] += active_bid_q
+                    
+                    # Record post-fill trade for MTM toxicity tracking
+                    self.hft_metrics["pending_mtm_trades"].append({
+                        "timestamp": t_now,
+                        "side": "BUY_YES",
+                        "exec_price": active_bid_p,
+                        "mtm_1s": None,
+                        "mtm_5s": None,
+                        "mtm_15s": None
+                    })
+                    
                     p_mkt = best_ask_p
                     self.recorder.record_signal(
                         timestamp=t_now,
@@ -510,7 +758,7 @@ class LiveOrchestrator:
                         status="MAKER_FILL_BUY"
                     )
                     
-                    self.log_message("info", f"[MAKER FILL] BUY_YES filled at limit price: {active_bid_p:.4f} | Size: {active_bid_q:.2f}")
+                    self.log_message("info", f"[MAKER FILL] BUY_YES filled at limit price: {active_bid_p:.4f} | Size: {active_bid_q:.2f} (Queue cleared)")
                     if self.web_server:
                         self.web_server.broadcast_message({
                             "type": "trade_signal",
@@ -528,11 +776,18 @@ class LiveOrchestrator:
                     self.engine.execution_router.active_bid_id = ""
                     self.engine.execution_router.active_bid_price = 0.0
                     self.engine.execution_router.active_bid_qty = 0.0
+                    self._current_active_orders["bid"] = None
 
-            # Check active sell limit order (ask) fill
-            active_ask_p = self.engine.execution_router.active_ask_price
-            active_ask_q = self.engine.execution_router.active_ask_qty
-            if active_ask_p > 0.0 and best_bid_p is not None and best_bid_p >= active_ask_p:
+            # Check Sell Fill
+            order_ask = self._current_active_orders["ask"]
+            is_sell_fill = False
+            if active_ask_p > 0.0 and best_bid_p is not None and order_ask is not None:
+                is_crossed = best_bid_p > active_ask_p
+                is_touched_and_front = best_bid_p == active_ask_p and order_ask["queue_ahead"] <= 0.0
+                if is_crossed or is_touched_and_front:
+                    is_sell_fill = True
+                    
+            if is_sell_fill:
                 yes_shares = self.client.get_position_size("YES")
                 if yes_shares < active_ask_q:
                     rem_qty = active_ask_q - yes_shares
@@ -548,10 +803,24 @@ class LiveOrchestrator:
                             self.engine.execution_router.active_ask_price = 0.0
                             self.engine.execution_router.active_ask_qty = 0.0
                             active_ask_p = 0.0
+                            self._current_active_orders["ask"] = None
+                            is_sell_fill = False
                             
-                if active_ask_p > 0.0:
+                if is_sell_fill and active_ask_p > 0.0:
                     # Sell Fill!
                     self.total_trades += 1
+                    self.hft_metrics["volume_executed"] += active_ask_q
+                    
+                    # Record post-fill trade for MTM toxicity tracking
+                    self.hft_metrics["pending_mtm_trades"].append({
+                        "timestamp": t_now,
+                        "side": "SELL_YES",
+                        "exec_price": active_ask_p,
+                        "mtm_1s": None,
+                        "mtm_5s": None,
+                        "mtm_15s": None
+                    })
+                    
                     p_mkt = best_bid_p
                     self.recorder.record_signal(
                         timestamp=t_now,
@@ -563,7 +832,7 @@ class LiveOrchestrator:
                         status="MAKER_FILL_SELL"
                     )
                     
-                    self.log_message("info", f"[MAKER FILL] SELL_YES filled at limit price: {active_ask_p:.4f} | Size: {active_ask_q:.2f}")
+                    self.log_message("info", f"[MAKER FILL] SELL_YES filled at limit price: {active_ask_p:.4f} | Size: {active_ask_q:.2f} (Queue cleared)")
                     if self.web_server:
                         self.web_server.broadcast_message({
                             "type": "trade_signal",
@@ -603,9 +872,20 @@ class LiveOrchestrator:
                     self.engine.execution_router.active_ask_id = ""
                     self.engine.execution_router.active_ask_price = 0.0
                     self.engine.execution_router.active_ask_qty = 0.0
+                    self._current_active_orders["ask"] = None
 
             # B. Generate and process new quoting instructions
             instructions = self.engine.evaluate_and_route(context)
+            
+            # Count instructions for OTR tracking
+            for instr in instructions:
+                if instr.action == "NEW":
+                    self.hft_metrics["total_orders_sent"] += 1
+                elif instr.action == "CANCEL":
+                    self.hft_metrics["total_orders_cancelled"] += 1
+                elif instr.action == "REPLACE":
+                    self.hft_metrics["total_orders_sent"] += 1
+                    self.hft_metrics["total_orders_cancelled"] += 1
             
             # Format diagnostic decision for the dashboard & web state
             bid_p = self.engine.execution_router.active_bid_price
@@ -624,8 +904,7 @@ class LiveOrchestrator:
                 if instr.action == "NEW" and instr.regime == "B":
                     # Taker execution in Regime B!
                     self.total_trades += 1
-                    top_b, top_a = self.shadow_book.get_market_top_of_book()
-                    p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
+                    p_mkt = self._get_market_implied_price(p_yes)
                     self.recorder.record_signal(
                         timestamp=t_now,
                         spot_price=spot,
@@ -637,12 +916,6 @@ class LiveOrchestrator:
                     )
                     
                     self.log_message("info", f"[TAKER ORDER] Executing {instr.side} | Size: {instr.qty:.2f} | Price: {instr.price:.4f}")
-                    if self.web_server:
-                        self.web_server.broadcast_message({
-                            "type": "trade_signal",
-                            "signal": {"side": instr.side, "size": instr.qty, "vwap": instr.price, "ev": p_yes - instr.price if "BUY" in instr.side else instr.price - p_yes if p_yes is not None else 0.0}
-                        })
-                        
                     decision_taker = {
                         "side": instr.side,
                         "size": instr.qty,
@@ -686,8 +959,7 @@ class LiveOrchestrator:
                 )
         
         # Get Implied Market price and Edge — use REAL market book (q_real), never depleted
-        top_b, top_a = self.shadow_book.get_market_top_of_book()
-        p_mkt = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else None
+        p_mkt = self._get_market_implied_price(p_yes)
         edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
         
         # Throttled console logger for pure console mode
@@ -706,36 +978,7 @@ class LiveOrchestrator:
         if self.web_server:
             self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
             
-        if decision["side"] != "HOLD":
-            self.total_trades += 1
 
-            # Record strategy signal
-            top_b, top_a = self.shadow_book.get_market_top_of_book()
-            p_mkt_signal = 0.5 * (top_b[0] + top_a[0]) if top_b and top_a else p_yes
-
-            self.recorder.record_signal(
-                timestamp=t_now,
-                spot_price=spot,
-                strike=active_strike,
-                model_prob=p_yes,
-                implied_prob=p_mkt_signal,
-                kelly_size=decision["size"],
-                status=decision["side"]
-            )
-
-            # Log SIGNAL — single source of truth
-            self.log_message(
-                "info",
-                f"SIGNAL: {decision['side']} | Size: {decision['size']:.2f}"
-                f" | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}"
-            )
-
-            # Dispatch the execution to background queue
-            self._pending_trade_task = asyncio.create_task(
-                self._execute_trade_async(
-                    decision, spot, active_strike, ofi, vol, tau_sec, p_yes, t_now
-                )
-            )
 
     async def _execute_trade_async(self, decision, spot, active_strike, ofi, vol, tau_sec, p_yes, t_signal):
         """Background task that executes the trade and updates the UI afterward."""
@@ -760,6 +1003,29 @@ class LiveOrchestrator:
                     f"EXECUTED {result['side']} | Qty: {result['qty']:.2f} | Price: ${result['price']:.4f} "
                     f"| PnL: ${result['pnl']:+.2f}"
                 )
+                
+                # Increment total trades in non-maker mode
+                if not self.config.maker.ENABLED:
+                    self.total_trades += 1
+                    
+                # Track Edge-to-Slippage metric for Taker Trades
+                actual_price = result["price"]
+                target_price = decision["vwap"]
+                slippage = abs(actual_price - target_price)
+                
+                self.hft_metrics["total_taker_edge"] += abs(decision["ev"])
+                self.hft_metrics["total_taker_slippage"] += slippage
+                self.hft_metrics["total_taker_trades"] += 1
+                
+                # Append fill to MTM lag tracking queue
+                self.hft_metrics["pending_mtm_trades"].append({
+                    "timestamp": time.time(),
+                    "side": result["side"],
+                    "exec_price": actual_price,
+                    "mtm_1s": None,
+                    "mtm_5s": None,
+                    "mtm_15s": None
+                })
             else:
                 self.log_message(
                     "warning", 
