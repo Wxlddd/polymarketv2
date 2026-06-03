@@ -580,6 +580,10 @@ class MakerExecutionEngine:
         # Time-sampled EWMA mid-price variance calibrator (10s sampling, alpha=0.05)
         self.mid_price_calibrator = MidPriceVolCalibrator(sampling_interval=10.0, alpha=0.05)
 
+    def reset(self) -> None:
+        """Resets the execution router's active orders state (e.g. on market rollover)."""
+        self.execution_router.reset_active_orders()
+
     def evaluate_and_route(self, context: MarketContext) -> List[OrderInstruction]:
         """
         Receives raw context ticks, requests strategy predictions, coordinates 

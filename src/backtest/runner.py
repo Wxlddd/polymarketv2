@@ -182,6 +182,8 @@ class BacktestRunner:
                 p_yes_ema = None
                 p_yes_ema_ts = 0.0
                 strategy.reset()
+                if maker_engine is not None:
+                    maker_engine.reset()
             
             # 3. Update shadow order book proxy.
             # First tick of each cycle: full snapshot (clears stale residuals from old cycle).

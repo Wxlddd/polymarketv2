@@ -470,6 +470,11 @@ class LiveOrchestrator:
                 self.log_message("info", "Ok, aspetto il prossimo ciclo...")
             return
 
+        # Guard: If the current time is at or past the expiration of the current cycle,
+        # we have expired. Do not simulate fills, do not quote, do not execute anything.
+        if self.strike_manager and t_now >= self.strike_manager.expiration_timestamp:
+            return
+
 
 
         # Periodic diagnostic warnings if we are missing critical feeds to proceed
@@ -1223,6 +1228,10 @@ class LiveOrchestrator:
                     self._smoothed_p_yes = None
                     self._smoothed_p_yes_ts = 0.0
                     self.strategy.reset()
+                    if self.config.maker.ENABLED and hasattr(self.engine, "reset"):
+                        self.engine.reset()
+                    self._current_active_orders = {"bid": None, "ask": None}
+
 
                     # 3. Restart CLOB feed to subscribe to new tokens
                     await self._restart_clob_feed()
