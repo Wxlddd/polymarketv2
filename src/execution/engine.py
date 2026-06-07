@@ -1,634 +1,656 @@
 import logging
-import time
-import numpy as np
 from typing import Dict, Any, Tuple, Optional, List
-from config.settings import SystemConfig
 from src.core.market_context import MarketContext
-from src.core.interfaces import IExecutionClient
-from src.execution.divergence_filter import DivergenceVelocityFilter
+from src.core.base_strategy import BaseStrategy
+from src.core.interfaces import IExecutionClient, OrderInstruction
+from config.settings import SystemConfig
+import logging
 
-logger = logging.getLogger("ExecutionEngine")
+logger = logging.getLogger("MakerExecution")
+class MidPriceVolCalibrator:
+    """
+    Time-Sampled Exponentially Weighted Moving Average (EWMA) Volatility Calibrator.
+    Samples the contract's mid-price at fixed time intervals (e.g. 10s) and computes
+    log-return variance. Bypasses tick-by-tick bid-ask bounce noise.
+    """
+    __slots__ = ('sampling_interval', 'alpha', 'last_sample_time', 'last_sample_price', 'variance')
+    
+    def __init__(self, sampling_interval: float = 10.0, alpha: float = 0.05, initial_vol: float = 0.25):
+        self.sampling_interval = sampling_interval
+        self.alpha = alpha
+        self.last_sample_time = 0.0
+        self.last_sample_price = None
+        self.variance = initial_vol * initial_vol
+        
+    def update(self, current_price: float, t_now: float) -> float:
+        """
+        Conditionally updates the variance using EWMA log-returns if interval elapsed.
+        Returns the current variance (sigma^2).
+        """
+        if current_price is None or current_price <= 0.0:
+            return self.variance
+            
+        if self.last_sample_price is None:
+            self.last_sample_price = current_price
+            self.last_sample_time = t_now
+            return self.variance
+            
+        dt = t_now - self.last_sample_time
+        if dt >= self.sampling_interval:
+            import math
+            log_ret = math.log(current_price / self.last_sample_price)
+            self.variance = self.alpha * (log_ret * log_ret) + (1.0 - self.alpha) * self.variance
+            self.last_sample_price = current_price
+            self.last_sample_time = t_now
+            
+        return self.variance
+
+
+class InventoryManager:
+    r"""
+    Tracks net inventory risk and calculates the skewed Avellaneda-Stoikov Reservation Price.
+    
+    $q_{norm} = \text{clamp}(q / Q_{max}, -1.0, 1.0)$
+    $P_{res} = \hat{P} - \gamma \cdot q_{norm} \cdot \sigma^2$
+    """
+    __slots__ = ('gamma', 'fixed_horizon_sec', 'max_inventory')
+
+    def __init__(self, gamma: float = 0.1, fixed_horizon_sec: float = 300.0, max_inventory: float = 5000.0):
+        self.gamma = gamma
+        self.fixed_horizon_sec = fixed_horizon_sec
+        self.max_inventory = max_inventory
+
+    def get_inventory(self, yes_shares: float, no_shares: float) -> float:
+        """Returns the net inventory risk q."""
+        return yes_shares - no_shares
+
+    def calculate_reservation_price(
+        self, p_hat: float, q: float, sigma_sq: float, tau_seconds: float = 0.0
+    ) -> float:
+        """
+        Calculates the Reservation Price P_res skewed by inventory.
+        Implements asymptotic market making by completely omitting tau.
+        
+        Args:
+            p_hat: Model's internal fair probability of YES [0.0, 1.0].
+            q: Net inventory count (YES - NO).
+            sigma_sq: Mid-price EWMA variance.
+            tau_seconds: Deprecated / unused for asymptotic MM.
+            
+        Returns:
+            Reservation price, clipped to [0.01, 0.99] to prevent illegal probability values.
+        """
+        # Strictly normalize inventory skew with Max Inventory limits and division guard
+        if self.max_inventory > 0.0:
+            q_norm = max(-1.0, min(1.0, q / self.max_inventory))
+        else:
+            q_norm = 0.0
+
+        # Asymptotic MM Reservation Price formula (tau completely removed)
+        skew = self.gamma * q_norm * sigma_sq
+        p_res = p_hat - skew
+        
+        # Clip to valid probability bounds
+        if p_res < 0.01:
+            return 0.01
+        elif p_res > 0.99:
+            return 0.99
+        return p_res
+
+
+
+class ExecutionRouter:
+    r"""
+    Handles quoting calculations, evaluates execution regimes, and issues cancel/replace/new order routing commands.
+    
+    Regime A (Maker Mode): Maintain POST_ONLY limit orders at P_res +/- delta.
+    Regime B (Taker Mode): Aggressively cross spread when edge exceeds epsilon, using worst-case Kelly sizing.
+    Regime C (Unwind): Cancel quotes on expanding side and quote exclusively to reduce inventory.
+    """
+    __slots__ = (
+        'gamma', 'min_fee_buffer', 'toxicity_buffer', 'maker_size', 'max_inventory',
+        'unwind_threshold', 'taker_edge_epsilon', 'tick_size', 'requote_threshold',
+        'kelly_fraction', 'fixed_horizon_sec', 'gas_fee_usd', 'taker_fee_multiplier',
+        # Active order tracking (single bid/ask for YES contract)
+        'active_bid_id', 'active_bid_price', 'active_bid_qty',
+        'active_ask_id', 'active_ask_price', 'active_ask_qty',
+        # Order counter for mock ID generation
+        '_order_counter', 'min_order_usd', 'locked', 'panic_concession'
+    )
+
+    def __init__(
+        self,
+        gamma: float = 0.1,
+        min_fee_buffer: float = 0.005,
+        toxicity_buffer: float = 0.005,
+        maker_size: float = 100.0,
+        max_inventory: float = 5000.0,
+        unwind_threshold: float = 0.01,
+        taker_edge_epsilon: float = 0.015,
+        tick_size: float = 0.01,
+        requote_threshold: float = 0.01,
+        kelly_fraction: float = 0.15,
+        fixed_horizon_sec: float = 300.0,
+        gas_fee_usd: float = 0.03,
+        taker_fee_multiplier: float = 0.072,
+        min_order_usd: float = 1.0,
+        panic_concession: float = 0.15
+    ):
+        self.gamma = gamma
+        self.min_fee_buffer = min_fee_buffer
+        self.toxicity_buffer = toxicity_buffer
+        self.maker_size = maker_size
+        self.max_inventory = max_inventory
+        self.unwind_threshold = unwind_threshold
+        self.taker_edge_epsilon = taker_edge_epsilon
+        self.tick_size = tick_size
+        self.requote_threshold = requote_threshold
+        self.kelly_fraction = kelly_fraction
+        self.fixed_horizon_sec = fixed_horizon_sec
+        self.gas_fee_usd = gas_fee_usd
+        self.taker_fee_multiplier = taker_fee_multiplier
+        self.min_order_usd = min_order_usd
+        self.locked = False
+        self.panic_concession = panic_concession
+
+        # State memory
+        self.active_bid_id: str = ""
+        self.active_bid_price: float = 0.0
+        self.active_bid_qty: float = 0.0
+
+        self.active_ask_id: str = ""
+        self.active_ask_price: float = 0.0
+        self.active_ask_qty: float = 0.0
+        
+        self._order_counter: int = 0
+
+    def reset_active_orders(self) -> None:
+        """Resets active tracking memory (e.g. on market rollover)."""
+        self.active_bid_id = ""
+        self.active_bid_price = 0.0
+        self.active_bid_qty = 0.0
+        self.active_ask_id = ""
+        self.active_ask_price = 0.0
+        self.active_ask_qty = 0.0
+        self.locked = False
+
+    def calculate_spread(self, sigma_sq: float, tau_seconds: float) -> float:
+        r"""
+        Calculates optimal half-spread (delta):
+        $\delta = \text{min\_fee\_buffer} + 0.5 \cdot \gamma \cdot \sigma^2 \cdot \tau + \text{toxicity\_buffer}$
+        """
+        tau_years = tau_seconds / (365.25 * 24.0 * 3600.0) if tau_seconds > 0.0 else (self.fixed_horizon_sec / (365.25 * 24.0 * 3600.0))
+        return self.min_fee_buffer + 0.5 * self.gamma * sigma_sq * tau_years + self.toxicity_buffer
+
+    def evaluate_regimes(
+        self,
+        p_hat: float,
+        sigma_sq: float,
+        context: MarketContext,
+        yes_shares: float,
+        no_shares: float,
+        cash_balance: float,
+        divergence_scale: float = 1.0
+    ) -> List[OrderInstruction]:
+        """
+        Evaluates execution regimes tick-by-tick and yields a list of OrderInstructions.
+        
+        Args:
+            p_hat: Internal fair model probability.
+            sigma_sq: Realized variance.
+            context: MarketContext carrying L2 order book (bids_l2, asks_l2) and tau.
+            yes_shares: Current YES shares held.
+            no_shares: Current NO shares held.
+            cash_balance: Available USD cash.
+            divergence_scale: Sizing scale factor [0, 1] from the divergence velocity filter.
+            
+        Returns:
+            List of OrderInstruction objects.
+        """
+        instructions: List[OrderInstruction] = []
+        
+        # Guard: Ensure we have order book data
+        if not context.bids_l2 or not context.asks_l2:
+            return instructions
+
+        # Toxic Flow Guard: if divergence velocity is high, cancel quotes and do not trade
+        if divergence_scale <= 0.01:
+            self._cancel_bid(instructions, "SAFE")
+            self._cancel_ask(instructions, "SAFE")
+            return instructions
+
+        # Lock check
+        if self.locked:
+            self._cancel_bid(instructions, "LOCKED")
+            self._cancel_ask(instructions, "LOCKED")
+            return instructions
+            
+        best_bid = context.bids_l2[0][0]
+        best_ask = context.asks_l2[0][0]
+        p_mid = 0.5 * (best_bid + best_ask)
+        current_spread = best_ask - best_bid
+        
+        # Get net position q
+        q = yes_shares - no_shares
+        tau_sec = context.tau_seconds
+
+        # Phase 2: Hard Liquidation Sweep (Panic Sweep)
+        is_panic = (tau_sec <= 15.0) or (tau_sec <= 45.0 and current_spread > 0.10)
+        if is_panic:
+            self._cancel_bid(instructions, "PANIC")
+            self._cancel_ask(instructions, "PANIC")
+            self.locked = True
+            
+            if q > 0:
+                # Aggressively sell all YES contracts
+                limit_p = max(0.01, p_hat - self.panic_concession)
+                instructions.append(OrderInstruction("NEW", "SELL_YES", limit_p, yes_shares, "panic_sell_yes", regime="PANIC"))
+            elif q < 0:
+                # Aggressively buy YES contracts to cover NO position
+                limit_p = min(0.99, p_hat + self.panic_concession)
+                instructions.append(OrderInstruction("NEW", "BUY_YES", limit_p, no_shares, "panic_buy_yes", regime="PANIC"))
+            return instructions
+
+        # Phase 1: Soft Unwind (Reduce-Only Regime)
+        is_reduce_only = (tau_sec <= 45.0)
+        if is_reduce_only:
+            # 1. reservation price calculation
+            # Skew target reservation price by inventory
+            # Normalize q
+            q_norm = 0.0
+            if self.max_inventory > 0.0:
+                q_norm = max(-1.0, min(1.0, q / self.max_inventory))
+                
+            # P_res calculation using the pure HFT instant risk formula recommended by the user
+            p_res = p_hat - self.gamma * q_norm * sigma_sq
+            if p_res < 0.01:
+                p_res = 0.01
+            elif p_res > 0.99:
+                p_res = 0.99
+            
+            # 2. Calculate optimal spread and target quotes
+            delta = self.calculate_spread(sigma_sq, tau_sec)
+            inv_tick = 1.0 / self.tick_size
+            p_bid_target = round((p_res - delta) * inv_tick) / inv_tick
+            p_ask_target = round((p_res + delta) * inv_tick) / inv_tick
+            
+            if p_bid_target < 0.01:
+                p_bid_target = 0.01
+            if p_ask_target > 0.99:
+                p_ask_target = 0.99
+            if p_bid_target >= p_ask_target:
+                p_ask_target = p_bid_target + self.tick_size
+                
+            if q > 0:
+                # YES position -> Reduce-only means we only SELL YES. Cancel Bid.
+                self._cancel_bid(instructions, "REDUCE")
+                p_ask_post = max(p_ask_target, best_bid + self.tick_size)
+                p_ask_post = max(0.01, min(0.99, p_ask_post))
+                self._route_maker_ask(p_ask_post, instructions, "REDUCE", yes_shares, cash_balance, 1.0)
+            elif q < 0:
+                # NO position -> Reduce-only means we only BUY YES to cover. Cancel Ask.
+                self._cancel_ask(instructions, "REDUCE")
+                p_bid_post = min(p_bid_target, best_ask - self.tick_size)
+                p_bid_post = max(0.01, min(0.99, p_bid_post))
+                self._route_maker_bid(p_bid_post, instructions, "REDUCE", yes_shares, no_shares, cash_balance, 1.0)
+            else:
+                # q == 0 -> We are perfectly flat! Cancel quotes on both sides to prevent any inventory.
+                self._cancel_bid(instructions, "REDUCE")
+                self._cancel_ask(instructions, "REDUCE")
+            return instructions
+        
+        # 1. Calculate net inventory and reservation price
+        q = yes_shares - no_shares
+        q_norm = q / self.max_inventory if self.max_inventory > 0.0 else q
+        tau_sec = context.tau_seconds
+        
+        # P_res calculation using the pure HFT instant risk formula recommended by the user
+        p_res = p_hat - self.gamma * q_norm * sigma_sq
+        if p_res < 0.01:
+            p_res = 0.01
+        elif p_res > 0.99:
+            p_res = 0.99
+            
+        # 2. Calculate optimal half spread and target prices
+        delta = self.calculate_spread(sigma_sq, tau_sec)
+        
+        # Round target quotes to tick size
+        inv_tick = 1.0 / self.tick_size
+        p_bid_target = round((p_res - delta) * inv_tick) / inv_tick
+        p_ask_target = round((p_res + delta) * inv_tick) / inv_tick
+        
+        # Keep quotes within bounds
+        if p_bid_target < 0.01:
+            p_bid_target = 0.01
+        if p_ask_target > 0.99:
+            p_ask_target = 0.99
+        if p_bid_target >= p_ask_target:
+            p_ask_target = p_bid_target + self.tick_size
+            
+        # Portfolio wealth for Kelly sizing
+        wealth = cash_balance + yes_shares * p_mid + no_shares * (1.0 - p_mid)
+        
+        # REGIME DETERMINATION
+        abs_q = abs(q)
+        realigned = abs(p_mid - p_hat) < self.unwind_threshold
+        should_unwind = (abs_q > self.max_inventory) or (realigned and abs_q > 0.0)
+        
+        if should_unwind:
+            # REGIME C: Unwind / Take Profit
+            regime = "C"
+            if q > 0:
+                # We have YES inventory. Reducing side is Ask (selling YES). Cancel Bid.
+                self._cancel_bid(instructions, regime)
+                p_ask_post = max(p_ask_target, best_bid + self.tick_size)
+                p_ask_post = max(0.01, min(0.99, p_ask_post))
+                self._route_maker_ask(p_ask_post, instructions, regime, yes_shares, cash_balance, 1.0)
+            elif q < 0:
+                # We have NO inventory. Reducing side is Bid (buying YES). Cancel Ask.
+                self._cancel_ask(instructions, regime)
+                p_bid_post = min(p_bid_target, best_ask - self.tick_size)
+                p_bid_post = max(0.01, min(0.99, p_bid_post))
+                self._route_maker_bid(p_bid_post, instructions, regime, yes_shares, no_shares, cash_balance, 1.0)
+                
+        else:
+            # Check for REGIME B: Taker crossing conditions
+            taker_buy_yes = p_bid_target > best_ask + self.taker_edge_epsilon
+            taker_buy_no = p_ask_target < best_bid - self.taker_edge_epsilon
+            
+            if taker_buy_yes:
+                # Massive edge buying YES shares
+                regime = "B"
+                edge = p_hat - best_ask
+                denom = 1.0 - best_ask
+                if edge > 0.0 and denom > 0.0:
+                    f_star = self.kelly_fraction * (edge / denom)
+                    f_star = min(0.50, max(0.0, f_star)) # Cap Kelly at 50%
+                    
+                    target_qty = (f_star * wealth) / best_ask
+                    
+                    # Clip target quantity by available cash balance (taking fee into account)
+                    cost_per_share = best_ask * (1.0 + self.taker_fee_multiplier * (1.0 - best_ask))
+                    max_qty_by_cash = max(0.0, (cash_balance - self.gas_fee_usd) / cost_per_share)
+                    
+                    max_add_by_inventory = max(0.0, self.max_inventory - q)
+                    if max_qty_by_cash < self.maker_size:
+                        target_qty = 0.0
+                    else:
+                        target_qty = max(self.maker_size, min(target_qty, max_qty_by_cash))
+                        target_qty = min(target_qty, max_add_by_inventory)
+                    
+                    # Cancel all maker quotes to prevent fills during taker executions
+                    self._cancel_bid(instructions, regime)
+                    self._cancel_ask(instructions, regime)
+                    
+                    # Route taker execution instruction (min 5 USD size check)
+                    if target_qty > 0.0 and (target_qty * best_ask) >= 5.0:
+                        instructions.append(OrderInstruction("NEW", "BUY_YES", best_ask, target_qty, "", regime))
+                    
+            elif taker_buy_no:
+                # Massive edge selling YES / buying NO
+                regime = "B"
+                edge = best_bid - p_hat
+                denom = best_bid
+                if edge > 0.0 and denom > 0.0:
+                    f_star = self.kelly_fraction * (edge / denom)
+                    f_star = min(0.50, max(0.0, f_star))
+                    
+                    target_qty = (f_star * wealth) / (1.0 - best_bid)
+                    
+                    # Clip target quantity by available cash balance (if buying NO)
+                    if yes_shares < target_qty:
+                        rem_qty = target_qty - yes_shares
+                        max_rem_by_inventory = max(0.0, self.max_inventory)
+                        rem_qty = min(rem_qty, max_rem_by_inventory)
+                        
+                        no_price = 1.0 - best_bid
+                        cost_per_share_no = no_price * (1.0 + self.taker_fee_multiplier * best_bid)
+                        max_rem_by_cash = max(0.0, (cash_balance - self.gas_fee_usd) / cost_per_share_no)
+                        
+                        if max_rem_by_cash < (self.maker_size - yes_shares):
+                            target_qty = yes_shares
+                        else:
+                            target_qty = yes_shares + min(rem_qty, max_rem_by_cash)
+                            
+                    if yes_shares == 0.0:
+                        max_add_by_inventory = max(0.0, self.max_inventory + q)
+                        target_qty = min(target_qty, max_add_by_inventory)
+                        
+                    if target_qty < self.maker_size and yes_shares == 0.0:
+                        target_qty = 0.0
+                    else:
+                        target_qty = max(self.maker_size, target_qty)
+                    
+                    # Cancel all maker quotes
+                    self._cancel_bid(instructions, regime)
+                    self._cancel_ask(instructions, regime)
+                    
+                    # If we hold YES, we should sell YES at best_bid.
+                    # Otherwise, buy NO at (1.0 - best_bid).
+                    if yes_shares > 0.0:
+                        sell_qty = min(yes_shares, target_qty)
+                        if sell_qty > 0.0 and (sell_qty * best_bid) >= 5.0:
+                            instructions.append(OrderInstruction("NEW", "SELL_YES", best_bid, sell_qty, "", regime))
+                    else:
+                        if target_qty > 0.0 and (target_qty * (1.0 - best_bid)) >= 5.0:
+                            instructions.append(OrderInstruction("NEW", "BUY_NO", 1.0 - best_bid, target_qty, "", regime))
+                        
+            else:
+                # REGIME A: Maker Mode
+                regime = "A"
+                # Clip quotes to be strictly post-only (at least 1 tick inside the spread)
+                p_bid_post = min(p_bid_target, best_ask - self.tick_size)
+                p_ask_post = max(p_ask_target, best_bid + self.tick_size)
+                
+                # Keep quotes within valid bounds [0.01, 0.99]
+                p_bid_post = max(0.01, min(0.99, p_bid_post))
+                p_ask_post = max(0.01, min(0.99, p_ask_post))
+                if p_bid_post >= p_ask_post:
+                    p_ask_post = p_bid_post + self.tick_size
+                    
+                self._route_maker_bid(p_bid_post, instructions, regime, yes_shares, no_shares, cash_balance, divergence_scale)
+                self._route_maker_ask(p_ask_post, instructions, regime, yes_shares, cash_balance, divergence_scale)
+                
+        return instructions
+
+    # Private Helpers for clean routing logic
+
+    def _cancel_bid(self, instructions: List[OrderInstruction], regime: str) -> None:
+        if self.active_bid_id:
+            instructions.append(OrderInstruction("CANCEL", "BUY_YES", 0.0, 0.0, self.active_bid_id, regime))
+            self.active_bid_id = ""
+            self.active_bid_price = 0.0
+            self.active_bid_qty = 0.0
+
+    def _cancel_ask(self, instructions: List[OrderInstruction], regime: str) -> None:
+        if self.active_ask_id:
+            instructions.append(OrderInstruction("CANCEL", "SELL_YES", 0.0, 0.0, self.active_ask_id, regime))
+            self.active_ask_id = ""
+            self.active_ask_price = 0.0
+            self.active_ask_qty = 0.0
+
+    def _route_maker_bid(
+        self,
+        p_bid_target: float,
+        instructions: List[OrderInstruction],
+        regime: str,
+        yes_shares: float,
+        no_shares: float,
+        cash_balance: float,
+        divergence_scale: float = 1.0
+    ) -> None:
+        # Enforce maximum total inventory capacity constraint (max_inventory)
+        q = yes_shares - no_shares
+        target_qty = max(0.0, self.max_inventory - q)
+        
+        # Scale target quantity by divergence scale for toxic flow protection
+        scaled_target = target_qty * divergence_scale
+        
+        # Enforce minimum trade size of min_order_usd (qty * price >= min_order_usd)
+        min_qty = self.min_order_usd / p_bid_target if p_bid_target > 0.0 else 0.0
+        if scaled_target < min_qty:
+            self._cancel_bid(instructions, regime)
+            return
+            
+        qty = scaled_target
+        
+        # Check cash constraints
+        cost = qty * p_bid_target
+        if cost + self.gas_fee_usd > cash_balance:
+            max_qty = max(0.0, (cash_balance - self.gas_fee_usd) / p_bid_target)
+            if max_qty * p_bid_target < self.min_order_usd:
+                self._cancel_bid(instructions, regime)
+                return
+            qty = max_qty
+            
+        if not self.active_bid_id:
+            self._order_counter += 1
+            mock_id = f"mock_bid_{self._order_counter}"
+            instructions.append(OrderInstruction("NEW", "BUY_YES", p_bid_target, qty, mock_id, regime))
+            self.active_bid_id = mock_id
+            self.active_bid_price = p_bid_target
+            self.active_bid_qty = qty
+        else:
+            if abs(self.active_bid_price - p_bid_target) >= self.requote_threshold or abs(self.active_bid_qty - qty) > 1e-5:
+                self._order_counter += 1
+                new_id = f"mock_bid_{self._order_counter}"
+                instructions.append(OrderInstruction("REPLACE", "BUY_YES", p_bid_target, qty, self.active_bid_id, regime))
+                self.active_bid_id = new_id
+                self.active_bid_price = p_bid_target
+                self.active_bid_qty = qty
+
+    def _route_maker_ask(
+        self,
+        p_ask_target: float,
+        instructions: List[OrderInstruction],
+        regime: str,
+        yes_shares: float,
+        cash_balance: float,
+        divergence_scale: float = 1.0
+    ) -> None:
+        # We can ONLY sell YES tokens we actually hold
+        if yes_shares <= 0.0:
+            self._cancel_ask(instructions, regime)
+            return
+            
+        # Scale quoting ask size by the divergence scale
+        target_qty = yes_shares * divergence_scale
+        
+        # Enforce minimum trade size
+        min_qty = self.min_order_usd / p_ask_target if p_ask_target > 0.0 else 0.0
+        if target_qty < min_qty:
+            self._cancel_ask(instructions, regime)
+            return
+            
+        qty = target_qty
+        
+        if not self.active_ask_id:
+            self._order_counter += 1
+            mock_id = f"mock_ask_{self._order_counter}"
+            instructions.append(OrderInstruction("NEW", "SELL_YES", p_ask_target, qty, mock_id, regime))
+            self.active_ask_id = mock_id
+            self.active_ask_price = p_ask_target
+            self.active_ask_qty = qty
+        else:
+            if abs(self.active_ask_price - p_ask_target) >= self.requote_threshold or abs(self.active_ask_qty - qty) > 1e-5:
+                self._order_counter += 1
+                new_id = f"mock_ask_{self._order_counter}"
+                instructions.append(OrderInstruction("REPLACE", "SELL_YES", p_ask_target, qty, self.active_ask_id, regime))
+                self.active_ask_id = new_id
+                self.active_ask_price = p_ask_target
+                self.active_ask_qty = qty
+
 
 class ExecutionEngine:
     """
-    Execution and Sizing Engine for Polymarket V2.
-    Translates model probabilities into trade sizing using Fractional Kelly,
-    sweeps L2 order books for optimal partial fills, and enforces multi-layered HFT risk filters.
+    High-Frequency Trading Execution Engine wrapping InventoryManager and ExecutionRouter.
+    Interfaces with a generic BaseStrategy to extract probability predictions (P_hat)
+    and uses the market context to fetch continuous volatility/variance.
     """
-    
-    def __init__(self, config: SystemConfig):
-        self.config = config
-        self.divergence_filter = DivergenceVelocityFilter(config)
-        self.spot_history: List[Tuple[float, float]] = []  # (timestamp, price)
+    __slots__ = ('strategy', 'inventory_manager', 'execution_router', 'client', 'mid_price_calibrator')
 
-        # Staleness track memory
-        self.last_bid_price: Optional[float] = None
-        self.last_bid_qty: Optional[float] = None
-        self.last_bid_updated_at: float = 0.0
+    def __init__(
+        self,
+        strategy: BaseStrategy,
+        client: IExecutionClient,
+        config: SystemConfig
+    ):
+        self.strategy = strategy
+        self.client = client
+        
+        self.inventory_manager = InventoryManager(
+            gamma=config.maker.RISK_AVERSION,
+            fixed_horizon_sec=config.maker.FIXED_HORIZON_SEC,
+            max_inventory=config.maker.MAX_INVENTORY
+        )
+        
+        self.execution_router = ExecutionRouter(
+            gamma=config.maker.RISK_AVERSION,
+            min_fee_buffer=config.maker.MIN_FEE_BUFFER,
+            toxicity_buffer=config.maker.TOXICITY_BUFFER,
+            maker_size=config.maker.MAKER_SIZE,
+            max_inventory=config.maker.MAX_INVENTORY,
+            unwind_threshold=config.maker.UNWIND_THRESHOLD,
+            taker_edge_epsilon=config.maker.TAKER_EDGE_EPSILON,
+            tick_size=config.maker.TICK_SIZE,
+            requote_threshold=config.maker.REQUOTE_THRESHOLD,
+            kelly_fraction=config.arbitrage.KELLY_FRACTION,
+            fixed_horizon_sec=config.maker.FIXED_HORIZON_SEC,
+            gas_fee_usd=config.arbitrage.GAS_FEE_USD,
+            taker_fee_multiplier=config.arbitrage.TAKER_FEE_MULTIPLIER,
+            min_order_usd=config.arbitrage.MIN_ORDER_USD,
+            panic_concession=config.arbitrage.PANIC_CONCESSION
+        )
+        # Time-sampled EWMA mid-price variance calibrator (10s sampling, alpha=0.05)
+        self.mid_price_calibrator = MidPriceVolCalibrator(sampling_interval=10.0, alpha=0.05)
 
-        self.last_ask_price: Optional[float] = None
-        self.last_ask_qty: Optional[float] = None
-        self.last_ask_updated_at: float = 0.0
-        self._last_stale_log_time: float = 0.0
+    def reset(self) -> None:
+        """Resets the execution router's active orders state (e.g. on market rollover)."""
+        self.execution_router.reset_active_orders()
 
-    def walk_order_book(
-        self, 
-        levels: List[Tuple[float, float]], 
-        fair_price: float, 
-        max_kelly_qty: float, 
-        max_slippage_bps: float, 
-        is_buy: bool
-    ) -> Tuple[float, float, float]:
+    def evaluate_and_route(self, context: MarketContext) -> List[OrderInstruction]:
         """
-        Walks the L2 order book levels and consumes them marginally.
-        Stops when marginal EV becomes zero/negative, slippage limits are violated, 
-        or the target Kelly quantity is filled.
-        
-        Returns:
-            Tuple of (optimal_qty, vwap_price, final_slippage_bps)
+        Receives raw context ticks, requests strategy predictions, coordinates 
+        inventory skews, and returns the low-overhead list of quoting operations.
         """
-        if not levels or max_kelly_qty <= 0.0:
-            return 0.0, 0.0, 0.0
-            
-        best_price = float(levels[0][0])
-        if best_price <= 0.0 or best_price >= 1.0:
-            return 0.0, 0.0, 0.0
-            
-        filled_qty = 0.0
-        total_cost_or_revenue = 0.0
-        
-        for price, qty in levels:
-            price = float(price)
-            qty = float(qty)
-            
-            # 1. Compute marginal slippage and edge
-            if is_buy:
-                marginal_slippage_bps = ((price - best_price) / best_price) * 10000.0
-                marginal_edge = fair_price - price
-            else:
-                marginal_slippage_bps = ((best_price - price) / best_price) * 10000.0
-                marginal_edge = price - fair_price
-                
-            # 2. Stop condition: no marginal edge or slippage exceeds dynamic threshold
-            if marginal_edge <= 0.0 or marginal_slippage_bps > max_slippage_bps:
-                break
-                
-            # 3. Stop if we filled our target allocation
-            remaining = max_kelly_qty - filled_qty
-            if remaining <= 1e-9:
-                break
-                
-            fill = min(qty, remaining)
-            filled_qty += fill
-            total_cost_or_revenue += fill * price
-            
-            if filled_qty >= max_kelly_qty - 1e-9:
-                break
-                
-        if filled_qty <= 0.0:
-            return 0.0, 0.0, 0.0
-            
-        vwap_price = total_cost_or_revenue / filled_qty
-        
-        if is_buy:
-            final_slippage_bps = ((vwap_price - best_price) / best_price) * 10000.0
-        else:
-            final_slippage_bps = ((best_price - vwap_price) / best_price) * 10000.0
-            
-        return float(filled_qty), float(vwap_price), float(final_slippage_bps)
+        # 1. Strategy pricing interface
+        p_hat = self.strategy.get_probability(context)
+        if p_hat is None:
+            # If strategy fails to resolve price, immediately cancel active quotes to remain flat and safe
+            instructions: List[OrderInstruction] = []
+            self.execution_router._cancel_bid(instructions, "SAFE")
+            self.execution_router._cancel_ask(instructions, "SAFE")
+            return instructions
 
-    def evaluate_and_trade(
-        self, 
-        p_yes: Optional[float], 
-        context: MarketContext, 
-        client: IExecutionClient
-    ) -> Dict[str, Any]:
-        """
-        Runs portfolio-aware Kelly sizing, partial fill book walking, and HFT risk checks.
-        """
-        # Call the underlying sizing engine
-        decision = self._evaluate_and_trade(p_yes, context, client)
-        
-        # Apply Phase 1 Soft Unwind Reduce-Only filter
-        tau_seconds = context.tau_seconds
-        if tau_seconds <= 45.0 and decision["side"] != "HOLD":
-            qty_yes = client.get_position_size("YES")
-            qty_no = client.get_position_size("NO")
-            q = qty_yes - qty_no
+        # 2. Compute contract mid-price and update time-sampled EWMA variance
+        mid_price = 0.5
+        if context.bids_l2 and context.asks_l2:
+            mid_price = 0.5 * (context.bids_l2[0][0] + context.asks_l2[0][0])
+        elif context.bids_l2:
+            mid_price = context.bids_l2[0][0]
+        elif context.asks_l2:
+            mid_price = context.asks_l2[0][0]
             
-            if q > 0 and decision["side"] == "SELL_YES":
-                pass # Allowed
-            elif q < 0 and decision["side"] == "BUY_YES":
-                pass # Allowed
-            else:
-                # Blocked!
-                return {
-                    "side": "HOLD",
-                    "reason": "SOFT_UNWIND_REDUCE_ONLY",
-                    "size": 0.0,
-                    "kelly_alloc": decision.get("kelly_alloc", 0.0),
-                    "vwap": decision.get("vwap", 0.5),
-                    "theoretical_edge_bps": decision.get("theoretical_edge_bps", 0.0)
-                }
-        return decision
+        sigma_sq = self.mid_price_calibrator.update(mid_price, context.timestamp)
 
-    def _evaluate_and_trade(
-        self, 
-        p_yes: Optional[float], 
-        context: MarketContext, 
-        client: IExecutionClient
-    ) -> Dict[str, Any]:
-        """
-        Internal sizing engine carrying raw trade logic.
-        """
-        # 1. Check if model resolved probability cleanly (Zero-Assumptions REST check)
-        if p_yes is None:
-            return {
-                "side": "HOLD", 
-                "reason": "STRATEGY_UNRESOLVED_PROBABILITY", 
-                "size": 0.0,
-                "kelly_alloc": 0.0,
-                "vwap": 0.0,
-                "theoretical_edge_bps": 0.0
-            }
-            
-        # 1.5. Block trading if strike price is unresolved or zero
-        if context.strike_price is None or context.strike_price <= 0.0:
-            return {
-                "side": "HOLD",
-                "reason": "WAITING_FOR_STRIKE_RESOLUTION",
-                "size": 0.0,
-                "kelly_alloc": 0.0,
-                "vwap": 0.0,
-                "theoretical_edge_bps": 0.0
-            }
+        # 3. Position query from exchange client
+        yes_shares = self.client.get_position_size("YES")
+        no_shares = self.client.get_position_size("NO")
+        cash = self.client.cash_balance
 
-        # 1.6. Block trading if the order book has no executable levels on either side
-        if not context.bids_l2 or not context.asks_l2:
-            return {"side": "HOLD", "reason": "NO_BOOK_DATA", "size": 0.0}
+        # 4. Get divergence scale from the shared/assigned divergence filter
+        divergence_scale = 1.0
+        if hasattr(self, "divergence_filter") and self.divergence_filter is not None:
+            divergence_scale = self.divergence_filter.last_scale
 
-        # --- TWO-PHASE PRE-SETTLEMENT LIQUIDATION STATE MACHINE (PHASE 2 HARD SWEEP) ---
-        tau_seconds = context.tau_seconds
-        best_bid_val = context.bids_l2[0][0] if context.bids_l2 else 0.5
-        best_ask_val = context.asks_l2[0][0] if context.asks_l2 else 0.5
-        spread = best_ask_val - best_bid_val
-        
-        # Get current net position q
-        qty_yes = client.get_position_size("YES")
-        qty_no = client.get_position_size("NO")
-        q = qty_yes - qty_no
-        
-        # Phase 2: Hard Liquidation Sweep (Panic Sweep)
-        is_panic_unwind = (tau_seconds <= 15.0) or (tau_seconds <= 45.0 and spread > 0.10)
-        if is_panic_unwind:
-            concession = self.config.arbitrage.PANIC_CONCESSION
-            if abs(q) > 0.0:
-                if q > 0:
-                    # We hold YES, must sell YES immediately
-                    limit_price = max(0.01, p_yes - concession)
-                    return {
-                        "side": "SELL_YES",
-                        "size": float(qty_yes),
-                        "limit_price": float(limit_price),
-                        "vwap": float(best_bid_val),
-                        "ev": 999.0,
-                        "expected_slippage_bps": 0.0,
-                        "kelly_alloc": 0.0,
-                        "theoretical_edge_bps": 0.0,
-                        "reason": "PANIC_UNWIND"
-                    }
-                else:
-                    # We hold NO, must buy YES to flatten inventory
-                    limit_price = min(0.99, p_yes + concession)
-                    return {
-                        "side": "BUY_YES",
-                        "size": float(qty_no),
-                        "limit_price": float(limit_price),
-                        "vwap": float(best_ask_val),
-                        "ev": 999.0,
-                        "expected_slippage_bps": 0.0,
-                        "kelly_alloc": 0.0,
-                        "theoretical_edge_bps": 0.0,
-                        "reason": "PANIC_UNWIND"
-                    }
-            else:
-                return {
-                    "side": "HOLD",
-                    "reason": "PANIC_UNWIND_LOCKED",
-                    "size": 0.0,
-                    "kelly_alloc": 0.0,
-                    "vwap": 0.5,
-                    "theoretical_edge_bps": 0.0
-                }
-            
-        t_now = context.timestamp
-        self.spot_history.append((t_now, context.spot_price))
-        # Keep spot history pruned to 60s using binary search
-        import bisect
-        cutoff = t_now - 60.0
-        idx = bisect.bisect_left(self.spot_history, (cutoff,))
-        if idx > 0:
-            self.spot_history = self.spot_history[idx:]
-        
-        # Track L2 update stale ages
-        best_bid, best_ask = context.bids_l2[0] if context.bids_l2 else (None, None), context.asks_l2[0] if context.asks_l2 else (None, None)
-        
-        if best_bid[0] is not None and (best_bid[0] != self.last_bid_price or best_bid[1] != self.last_bid_qty):
-            self.last_bid_price = best_bid[0]
-            self.last_bid_qty = best_bid[1]
-            self.last_bid_updated_at = t_now
-            
-        if best_ask[0] is not None and (best_ask[0] != self.last_ask_price or best_ask[1] != self.last_ask_qty):
-            self.last_ask_price = best_ask[0]
-            self.last_ask_qty = best_ask[1]
-            self.last_ask_updated_at = t_now
-
-        # 4. Sizing Calculations via Fractional Kelly (Pre-computed for UI reporting on HOLD)
-        gamma = self.config.arbitrage.KELLY_FRACTION
-        W = client.cash_balance
-        gas = self.config.arbitrage.GAS_FEE_USD
-        min_order_usd = self.config.arbitrage.MIN_ORDER_USD
-        
-        # Best prices on shadow book
-        p_bid_yes = best_bid[0] if best_bid[0] else 0.5
-        p_ask_yes = best_ask[0] if best_ask[0] else 0.5
-        p_ask_no = 1.0 - p_bid_yes
-        
-        # Retrieve current position counts
-        qty_yes = client.get_position_size("YES")
-        qty_no = client.get_position_size("NO")
-        
-        # Calculate current total portfolio wealth/equity
-        wealth = W + (qty_yes * p_ask_yes) + (qty_no * p_ask_no)
-        
-        # Current weights as fraction of wealth
-        w_current_yes = (qty_yes * p_ask_yes) / wealth if wealth > 0.0 else 0.0
-        w_current_no = (qty_no * p_ask_no) / wealth if wealth > 0.0 else 0.0
-        
-        # Raw unconstrained Kelly targets (can be negative if overvalued)
-        f_star_yes_raw = gamma * (p_yes - p_ask_yes) / (1.0 - p_ask_yes) if p_ask_yes < 1.0 else 0.0
-        
-        p_no = 1.0 - p_yes
-        f_star_no_raw = gamma * (p_no - p_ask_no) / (1.0 - p_ask_no) if p_ask_no < 1.0 else 0.0
-
-        # Compute market implied price to feed to the divergence filter
-        if best_bid[0] is not None and best_ask[0] is not None:
-            p_mkt = 0.5 * (best_bid[0] + best_ask[0])
-        elif best_bid[0] is not None:
-            p_mkt = best_bid[0]
-        elif best_ask[0] is not None:
-            p_mkt = best_ask[0]
-        else:
-            p_mkt = p_yes
-
-        divergence_scale, v_t, a_t = self.divergence_filter.get_scale(p_yes, p_mkt, t_now)
-
-        # Scale Kelly fraction
-        f_star_yes = f_star_yes_raw * divergence_scale
-        f_star_no = f_star_no_raw * divergence_scale
-        
-        # Apply 2026 Polymarket taker fee regularization buffer delta = taker_fee_multiplier * gamma
-        taker_fee_multiplier = self.config.arbitrage.TAKER_FEE_MULTIPLIER
-        delta_buffer = taker_fee_multiplier * gamma
-        
-        # YES regularized target weight
-        if f_star_yes > w_current_yes + delta_buffer:
-            target_w_yes = f_star_yes - delta_buffer
-        elif f_star_yes < w_current_yes - delta_buffer:
-            target_w_yes = f_star_yes + delta_buffer
-        else:
-            target_w_yes = w_current_yes
-            
-        # NO regularized target weight
-        if f_star_no > w_current_no + delta_buffer:
-            target_w_no = f_star_no - delta_buffer
-        elif f_star_no < w_current_no - delta_buffer:
-            target_w_no = f_star_no + delta_buffer
-        else:
-            target_w_no = w_current_no
-            
-        # Clip regularized target weights to standard safety bounds [0, 50%]
-        target_w_yes = float(np.clip(target_w_yes, 0.0, 0.50))
-        target_w_no = float(np.clip(target_w_no, 0.0, 0.50))
-        
-        # Determine active sizing metrics for UI reporting even on HOLD
-        edge_yes = p_yes - p_ask_yes
-        edge_no = p_no - p_ask_no
-        
-        if edge_yes > edge_no and edge_yes > 0.0:
-            theoretical_edge_bps = edge_yes * 10000.0
-            kelly_alloc = target_w_yes
-            target_price = p_yes
-            active_raw_kelly = f_star_yes_raw
-            active_side = "YES"
-        elif edge_no > edge_yes and edge_no > 0.0:
-            theoretical_edge_bps = edge_no * 10000.0
-            kelly_alloc = target_w_no
-            target_price = p_no
-            active_raw_kelly = f_star_no_raw
-            active_side = "NO"
-        else:
-            if edge_yes > edge_no:
-                theoretical_edge_bps = max(0.0, edge_yes) * 10000.0
-                kelly_alloc = target_w_yes
-                target_price = p_yes
-                active_raw_kelly = f_star_yes_raw
-                active_side = "YES"
-            else:
-                theoretical_edge_bps = max(0.0, edge_no) * 10000.0
-                kelly_alloc = target_w_no
-                target_price = p_no
-                active_raw_kelly = f_star_no_raw
-                active_side = "NO"
-
-        adjusted_kelly_fraction = active_raw_kelly * divergence_scale
-
-        logger.info(
-            f"[DivergenceFilter] Tick: v_t={v_t:.6f}, a_t={a_t:.6f}, scale={divergence_scale:.4f}, "
-            f"adj_kelly={adjusted_kelly_fraction:.4f}"
+        # 5. Delegate to state-machine router
+        return self.execution_router.evaluate_regimes(
+            p_hat=p_hat,
+            sigma_sq=sigma_sq,
+            context=context,
+            yes_shares=yes_shares,
+            no_shares=no_shares,
+            cash_balance=cash,
+            divergence_scale=divergence_scale
         )
 
-        min_kelly = self.config.risk.MIN_KELLY_THRESHOLD
-        if adjusted_kelly_fraction < min_kelly and active_raw_kelly > 0.0:
-            logger.warning(
-                f"[DivergenceFilter] Execution BLOCKED: side={active_side}, "
-                f"adj_kelly={adjusted_kelly_fraction:.4f} < min_threshold={min_kelly:.4f} "
-                f"(raw_kelly={active_raw_kelly:.4f}, v_t={v_t:.6f}, a_t={a_t:.6f}, scale={divergence_scale:.4f})"
-            )
-            return {
-                "side": "HOLD",
-                "reason": "REJECT_DIVERGENCE_VELOCITY",
-                "size": 0.0,
-                "kelly_alloc": kelly_alloc,
-                "vwap": target_price,
-                "theoretical_edge_bps": theoretical_edge_bps
-            }
-
-        # 2. Pin Risk (Oracle Jitter) Quantitative Protection
-        pin_risk_window = self.config.risk.PIN_RISK_SECONDS
-        if context.tau_seconds <= pin_risk_window and context.tau_seconds > 0.0:
-            # Noise margin: either standard BPS or empirical standard deviation of spot
-            noise_bps_usd = context.spot_price * (self.config.risk.ORACLE_NOISE_BPS / 10000.0)
-            import bisect
-            cutoff_10 = t_now - 10.0
-            idx_10 = bisect.bisect_left(self.spot_history, (cutoff_10,))
-            recent_spots = [x[1] for x in self.spot_history[idx_10:]]
-            empirical_std = np.std(recent_spots) if len(recent_spots) > 1 else 0.0
-            
-            oracle_noise = max(noise_bps_usd, empirical_std)
-            distance_to_strike = abs(context.spot_price - context.strike_price)
-            
-            if distance_to_strike < oracle_noise:
-                logger.warning(
-                    f"[PIN RISK] Trade blocked: |S - K| = {distance_to_strike:.4f} < "
-                    f"noise = {oracle_noise:.4f} (tau: {context.tau_seconds:.1f}s)"
-                )
-                return {
-                    "side": "HOLD",
-                    "reason": "REJECT_PIN_RISK",
-                    "size": 0.0,
-                    "kelly_alloc": kelly_alloc,
-                    "vwap": target_price,
-                    "theoretical_edge_bps": theoretical_edge_bps
-                }
-
-        # 3. Market Desync / Staleness Check
-        if self.last_ask_updated_at > 0.0 and self.last_bid_updated_at > 0.0:
-            # Let quote age be the age of the side we are interacting with
-            quote_age = t_now - min(self.last_ask_updated_at, self.last_bid_updated_at)
-            
-            # If quote is stale (older than 100ms) and spot has walked too far
-            if quote_age > 0.100 and self.spot_history:
-                t_lookup = t_now - quote_age
-                import bisect
-                idx = bisect.bisect_left(self.spot_history, (t_lookup,))
-                if idx == 0:
-                    closest_spot = self.spot_history[0][1]
-                elif idx == len(self.spot_history):
-                    closest_spot = self.spot_history[-1][1]
-                else:
-                    before = self.spot_history[idx - 1]
-                    after = self.spot_history[idx]
-                    if abs(before[0] - t_lookup) < abs(after[0] - t_lookup):
-                        closest_spot = before[1]
-                    else:
-                        closest_spot = after[1]
-                delta_S = abs(context.spot_price - closest_spot)
-                
-                # Check normal diffusion expected moves
-                dt_years = quote_age / (365.25 * 24 * 3600.0)
-                z_score = self.config.risk.DESYNC_Z_SCORE
-                threshold_desync = max(z_score * context.spot_price * context.volatility * np.sqrt(dt_years), context.spot_price * 0.00005)
-                
-                if delta_S > threshold_desync:
-                    if t_now - self._last_stale_log_time >= 2.0:
-                        logger.warning(f"[STALENESS] Quote Stale (Age: {quote_age:.2f}s, dS: {delta_S:.2f} > th: {threshold_desync:.2f})")
-                        self._last_stale_log_time = t_now
-                    return {
-                        "side": "HOLD",
-                        "reason": "REJECT_DESYNC_STALENESS",
-                        "size": 0.0,
-                        "kelly_alloc": kelly_alloc,
-                        "vwap": target_price,
-                        "theoretical_edge_bps": theoretical_edge_bps
-                    }
-
-
-        # Calculate age of each side of the book for Probability of Fill (PoF) scaling
-        age_ask = t_now - self.last_ask_updated_at if self.last_ask_updated_at > 0.0 else 0.0
-        age_bid = t_now - self.last_bid_updated_at if self.last_bid_updated_at > 0.0 else 0.0
-
-        # Convert Kelly weights to contract target holdings
-        target_qty_yes = (target_w_yes * wealth) / p_ask_yes if p_ask_yes > 0.0 else 0.0
-        target_qty_no = (target_w_no * wealth) / p_ask_no if p_ask_no > 0.0 else 0.0
-        
-        # Calculate dynamic transaction costs in bps
-        costi_rete_bps = (gas / min_order_usd) * 10000.0
-        min_margin = self.config.arbitrage.MIN_ACCEPTABLE_MARGIN_BPS
-        abs_max_slippage = self.config.arbitrage.ABSOLUTE_MAX_SLIPPAGE_BPS
-        
-        # Check decisions:
-        # A. SELL YES (Exiting excess YES positions)
-        if qty_yes > target_qty_yes and qty_yes > 0.0:
-            excess_yes = qty_yes - target_qty_yes
-            
-            # Selling YES means walking YES bids
-            edge_bps = (p_bid_yes - p_yes) * 10000.0
-            max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)
-            
-            qty_exec, vwap, slippage_bps = self.walk_order_book(
-                levels=context.bids_l2,
-                fair_price=p_yes,
-                max_kelly_qty=excess_yes,
-                max_slippage_bps=max_slippage_bps,
-                is_buy=False
-            )
-            
-            if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
-                ev = vwap - p_yes
-                per_unit_fee = self.config.arbitrage.TAKER_FEE_MULTIPLIER * vwap * (1.0 - vwap)
-                ev_net = ev - per_unit_fee
-                pof = self._calculate_pof(context.tau_seconds, age_bid)
-                ev_adjusted = ev_net * pof
-                
-                if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
-                    limit_price = max(0.0, p_bid_yes * (1.0 - max_slippage_bps / 10000.0))
-                    return {
-                        "side": "SELL_YES",
-                        "size": qty_exec,
-                        "limit_price": limit_price,
-                        "vwap": vwap,
-                        "ev": ev,
-                        "expected_slippage_bps": slippage_bps,
-                        "kelly_alloc": kelly_alloc,
-                        "theoretical_edge_bps": theoretical_edge_bps
-                    }
-
-        # B. SELL NO (Exiting excess NO positions)
-        if qty_no > target_qty_no and qty_no > 0.0:
-            excess_no = qty_no - target_qty_no
-            
-            # Selling NO corresponds to matching asks YES in reverse pricing: (1.0 - p, q) sorted descending
-            derived_bids_no = sorted([(1.0 - ask_p, ask_q) for ask_p, ask_q in context.asks_l2], key=lambda x: x[0], reverse=True)
-            
-            edge_bps = ((1.0 - p_ask_yes) - p_no) * 10000.0
-            max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)
-            
-            qty_exec, vwap, slippage_bps = self.walk_order_book(
-                levels=derived_bids_no,
-                fair_price=p_no,
-                max_kelly_qty=excess_no,
-                max_slippage_bps=max_slippage_bps,
-                is_buy=False
-            )
-            
-            if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
-                ev = vwap - p_no
-                per_unit_fee = self.config.arbitrage.TAKER_FEE_MULTIPLIER * vwap * (1.0 - vwap)
-                ev_net = ev - per_unit_fee
-                pof = self._calculate_pof(context.tau_seconds, age_ask)
-                ev_adjusted = ev_net * pof
-                
-                if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
-                    best_bid_no = 1.0 - p_ask_yes
-                    limit_price_no = max(0.0, best_bid_no * (1.0 - max_slippage_bps / 10000.0))
-                    limit_price = 1.0 - limit_price_no # In YES terms
-                    return {
-                        "side": "SELL_NO",
-                        "size": qty_exec,
-                        "limit_price": limit_price,
-                        "vwap": vwap,
-                        "ev": ev,
-                        "expected_slippage_bps": slippage_bps,
-                        "kelly_alloc": kelly_alloc,
-                        "theoretical_edge_bps": theoretical_edge_bps
-                    }
-
-        # C. BUY YES INCREMENTAL
-        if target_qty_yes > qty_yes and qty_no <= 0.001:
-            dq_yes = target_qty_yes - qty_yes
-            
-            # Sizing limit caps
-            q_max_by_cap = max(0.0, (W - gas) / p_ask_yes) if p_ask_yes > 0.0 else 0.0
-            q_max_by_risk = self.config.arbitrage.MAX_POSITION_SIZE_USD / p_ask_yes if p_ask_yes > 0.0 else 0.0
-            max_add_by_risk = max(0.0, q_max_by_risk - qty_yes)
-            dq_yes = min(dq_yes, q_max_by_cap, max_add_by_risk)
-            
-            # Sweeping order book to calculate fill price & actual slippage
-            edge_bps = (p_yes - p_ask_yes) * 10000.0
-            max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)
-            
-            qty_exec, vwap, slippage_bps = self.walk_order_book(
-                levels=context.asks_l2,
-                fair_price=p_yes,
-                max_kelly_qty=dq_yes,
-                max_slippage_bps=max_slippage_bps,
-                is_buy=True
-            )
-            
-            if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
-                ev = p_yes - vwap
-                # Subtract the dynamic taker fee per unit from the EV gate.
-                per_unit_fee = self.config.arbitrage.TAKER_FEE_MULTIPLIER * vwap * (1.0 - vwap)
-                ev_net = ev - per_unit_fee
-                # Apply fill probability EV scaling (PoF)
-                pof = self._calculate_pof(context.tau_seconds, age_ask)
-                ev_adjusted = ev_net * pof
-                
-                if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
-                    limit_price = min(1.0, p_ask_yes * (1.0 + max_slippage_bps / 10000.0))
-                    return {
-                        "side": "BUY_YES",
-                        "size": qty_exec,
-                        "limit_price": limit_price,
-                        "vwap": vwap,
-                        "ev": ev,
-                        "expected_slippage_bps": slippage_bps,
-                        "kelly_alloc": kelly_alloc,
-                        "theoretical_edge_bps": theoretical_edge_bps
-                    }
-
-        # D. BUY NO INCREMENTAL
-        if target_qty_no > qty_no and qty_yes <= 0.001:
-            dq_no = target_qty_no - qty_no
-            
-            q_max_by_cap = max(0.0, (W - gas) / p_ask_no) if p_ask_no > 0.0 else 0.0
-            q_max_by_risk = self.config.arbitrage.MAX_POSITION_SIZE_USD / p_ask_no if p_ask_no > 0.0 else 0.0
-            max_add_by_risk = max(0.0, q_max_by_risk - qty_no)
-            dq_no = min(dq_no, q_max_by_cap, max_add_by_risk)
-            
-            edge_bps = (p_no - p_ask_no) * 10000.0
-            max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)
-            
-            # Buying NO corresponds to walking YES bids in reverse pricing: (1.0 - p, q)
-            derived_asks_no = sorted([(1.0 - bid_p, bid_q) for bid_p, bid_q in context.bids_l2], key=lambda x: x[0])
-            
-            qty_exec, vwap, slippage_bps = self.walk_order_book(
-                levels=derived_asks_no,
-                fair_price=p_no,
-                max_kelly_qty=dq_no,
-                max_slippage_bps=max_slippage_bps,
-                is_buy=True
-            )
-            
-            if qty_exec > 0.0 and (qty_exec * vwap) >= min_order_usd:
-                ev = p_no - vwap
-                per_unit_fee = self.config.arbitrage.TAKER_FEE_MULTIPLIER * vwap * (1.0 - vwap)
-                ev_net = ev - per_unit_fee
-                pof = self._calculate_pof(context.tau_seconds, age_bid)
-                ev_adjusted = ev_net * pof
-                
-                if ev_adjusted >= self.config.arbitrage.MIN_EXPECTED_VALUE:
-                    limit_price_no = min(1.0, p_ask_no * (1.0 + max_slippage_bps / 10000.0))
-                    limit_price = 1.0 - limit_price_no # In YES terms
-                    return {
-                        "side": "BUY_NO",
-                        "size": qty_exec,
-                        "limit_price": limit_price,
-                        "vwap": vwap,
-                        "ev": ev,
-                        "expected_slippage_bps": slippage_bps,
-                        "kelly_alloc": kelly_alloc,
-                        "theoretical_edge_bps": theoretical_edge_bps
-                    }
-
-        return {
-            "side": "HOLD",
-            "reason": "NO_EV_OR_SIZE_OPPORTUNITY",
-            "size": 0.0,
-            "kelly_alloc": kelly_alloc,
-            "vwap": target_price,
-            "theoretical_edge_bps": theoretical_edge_bps
-        }
-
-    def _calculate_pof(self, tau_seconds: float, quote_age: float = 0.0) -> float:
-        """Calculates fill probability based on remaining lifetime and quote age."""
-        tau_lim = self.config.risk.POF_LATENCY_TAU
-        k_decay = self.config.risk.POF_DECAY_K
-        pof_tau = 1.0 / (1.0 + np.exp(-k_decay * (tau_seconds - tau_lim)))
-        
-        # Penalize staleness: if a quote is old, it's less likely to be filled.
-        # Uses an exponential decay (e.g. e^(-1.0 * age))
-        pof_age = np.exp(-quote_age * 1.0)
-        
-        return float(pof_tau * pof_age)

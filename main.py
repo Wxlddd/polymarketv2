@@ -641,421 +641,102 @@ class LiveOrchestrator:
             self.divergence_filter.get_scale(p_yes, p_mkt, t_now)
 
         # Evaluate Trade Sizing and Execution
-        if self.config.maker.ENABLED:
-            decision = {"side": "HOLD", "reason": "MAKER_QUOTING", "size": 0.0, "vwap": 0.0}
-            self.latest_decision_ref[0] = decision
-            
-            # A. Simulate limit order fills first (using the Pro-Rata Queue Priority Model)
-            top_b, top_a = self.shadow_book.get_market_top_of_book()
-            best_bid_p = top_b[0] if top_b else None
-            best_ask_p = top_a[0] if top_a else None
-            
-            active_bid_p = self.engine.execution_router.active_bid_price
-            active_bid_q = self.engine.execution_router.active_bid_qty
-            active_ask_p = self.engine.execution_router.active_ask_price
-            active_ask_q = self.engine.execution_router.active_ask_qty
-            
-            # 1. Update Bid Order Queue Priority State
-            if active_bid_p > 0.0:
-                cur_depth = self.shadow_book.q_real_bids.get(active_bid_p, 0.0)
-                if self._current_active_orders["bid"] is None or self._current_active_orders["bid"]["price"] != active_bid_p:
-                    self._current_active_orders["bid"] = {
-                        "price": active_bid_p,
-                        "qty": active_bid_q,
-                        "queue_ahead": cur_depth,
-                        "prev_depth": cur_depth,
-                        "touched": False
-                    }
-                else:
-                    self._current_active_orders["bid"]["qty"] = active_bid_q
-                    
-                order = self._current_active_orders["bid"]
-                if best_ask_p is not None:
-                    if best_ask_p < active_bid_p:
-                        order["queue_ahead"] = 0.0
-                        order["touched"] = True
-                    elif best_ask_p == active_bid_p:
-                        order["touched"] = True
-                        delta_depth = order["prev_depth"] - cur_depth
-                        if delta_depth > 0:
-                            alpha = 0.40 # 40% trades, 60% cancels
-                            v_traded = alpha * delta_depth
-                            c_cancels = (1.0 - alpha) * delta_depth
-                            ratio = order["queue_ahead"] / order["prev_depth"] if order["prev_depth"] > 0 else 0.0
-                            v_cancelled_ahead = c_cancels * ratio
-                            order["queue_ahead"] = max(0.0, order["queue_ahead"] - v_traded - v_cancelled_ahead)
-                        
-                        # Polygon sequencer gas priority-jump stochastical decay (2% per tick)
-                        stoch_decay = 0.02 * order["queue_ahead"]
-                        order["queue_ahead"] = max(0.0, order["queue_ahead"] - stoch_decay)
-                        order["prev_depth"] = cur_depth
-            else:
-                self._current_active_orders["bid"] = None
-                
-            # 2. Update Ask Order Queue Priority State
-            if active_ask_p > 0.0:
-                cur_depth = self.shadow_book.q_real_asks.get(active_ask_p, 0.0)
-                if self._current_active_orders["ask"] is None or self._current_active_orders["ask"]["price"] != active_ask_p:
-                    self._current_active_orders["ask"] = {
-                        "price": active_ask_p,
-                        "qty": active_ask_q,
-                        "queue_ahead": cur_depth,
-                        "prev_depth": cur_depth,
-                        "touched": False
-                    }
-                else:
-                    self._current_active_orders["ask"]["qty"] = active_ask_q
-                    
-                order = self._current_active_orders["ask"]
-                if best_bid_p is not None:
-                    if best_bid_p > active_ask_p:
-                        order["queue_ahead"] = 0.0
-                        order["touched"] = True
-                    elif best_bid_p == active_ask_p:
-                        order["touched"] = True
-                        delta_depth = order["prev_depth"] - cur_depth
-                        if delta_depth > 0:
-                            alpha = 0.40
-                            v_traded = alpha * delta_depth
-                            c_cancels = (1.0 - alpha) * delta_depth
-                            ratio = order["queue_ahead"] / order["prev_depth"] if order["prev_depth"] > 0 else 0.0
-                            v_cancelled_ahead = c_cancels * ratio
-                            order["queue_ahead"] = max(0.0, order["queue_ahead"] - v_traded - v_cancelled_ahead)
-                        
-                        stoch_decay = 0.02 * order["queue_ahead"]
-                        order["queue_ahead"] = max(0.0, order["queue_ahead"] - stoch_decay)
-                        order["prev_depth"] = cur_depth
-            else:
-                self._current_active_orders["ask"] = None
-
-            # Track total Limit Volume Sent when Touched/Crossed
-            for side in ["bid", "ask"]:
-                ord_info = self._current_active_orders[side]
-                if ord_info is not None and ord_info["touched"] and not ord_info.get("recorded_touch", False):
-                    self.hft_metrics["volume_sent_touched"] += ord_info["qty"]
-                    ord_info["recorded_touch"] = True
-
-            # 3. Simulate fills (only when crossed or touched and Q_ahead <= 0)
-            order_bid = self._current_active_orders["bid"]
-            is_buy_fill = False
-            if active_bid_p > 0.0 and best_ask_p is not None and order_bid is not None:
-                is_crossed = best_ask_p < active_bid_p
-                is_touched_and_front = best_ask_p == active_bid_p and order_bid["queue_ahead"] <= 0.0
-                if is_crossed or is_touched_and_front:
-                    is_buy_fill = True
-                    
-            if is_buy_fill:
-                fee = active_bid_q * self.engine.execution_router.taker_fee_multiplier * active_bid_p * (1.0 - active_bid_p)
-                cost = active_bid_q * active_bid_p + self.config.arbitrage.GAS_FEE_USD + fee
-                if cost > self.client.cash_balance:
-                    cost_per_share = active_bid_p * (1.0 + self.engine.execution_router.taker_fee_multiplier * (1.0 - active_bid_p))
-                    max_q = max(0.0, (self.client.cash_balance - self.config.arbitrage.GAS_FEE_USD) / cost_per_share)
-                    if max_q > 0.0 and (max_q * active_bid_p) >= 5.0:
-                        active_bid_q = max_q
-                    else:
-                        self.engine.execution_router.active_bid_id = ""
-                        self.engine.execution_router.active_bid_price = 0.0
-                        self.engine.execution_router.active_bid_qty = 0.0
-                        active_bid_p = 0.0
-                        self._current_active_orders["bid"] = None
-                        is_buy_fill = False
-                        
-                if is_buy_fill and active_bid_p > 0.0:
-                    # Buy Fill!
+        
+        # 1. Process market data through client to detect limit order fills
+        context_state = {"timestamp": t_now, "strike_price": active_strike}
+        fills = await self.client.process_market_data(context.bids_l2, context.asks_l2, context_state)
+        
+        for result in fills:
+            if result.get("success"):
+                instr = result.get("instruction")
+                if instr:
                     self.total_trades += 1
-                    self.hft_metrics["volume_executed"] += active_bid_q
+                    self.hft_metrics["volume_executed"] += result["qty"]
                     
-                    # Record post-fill trade for MTM toxicity tracking
                     self.hft_metrics["pending_mtm_trades"].append({
                         "timestamp": t_now,
-                        "side": "BUY_YES",
-                        "exec_price": active_bid_p,
+                        "side": result["side"],
+                        "exec_price": result["price"],
                         "mtm_1s": None,
                         "mtm_5s": None,
                         "mtm_15s": None
                     })
                     
-                    p_mkt = best_ask_p
+                    p_mkt_fill = self._get_market_implied_price(p_yes)
+                    status_str = "MAKER_FILL_BUY" if "BUY" in result["side"] else "MAKER_FILL_SELL"
                     self.recorder.record_signal(
                         timestamp=t_now,
                         spot_price=spot,
                         strike=active_strike,
                         model_prob=p_yes,
-                        implied_prob=p_mkt,
-                        kelly_size=active_bid_q,
-                        status="MAKER_FILL_BUY"
+                        implied_prob=p_mkt_fill if p_mkt_fill is not None else p_yes,
+                        kelly_size=result["qty"],
+                        status=status_str
                     )
                     
-                    self.log_message("info", f"[MAKER FILL] BUY_YES filled at limit price: {active_bid_p:.4f} | Size: {active_bid_q:.2f} (Queue cleared)")
+                    self.log_message("info", f"[MAKER FILL] {result['side']} filled at {result['price']:.4f} | Size: {result['qty']:.2f}")
                     if self.web_server:
                         self.web_server.broadcast_message({
                             "type": "trade_signal",
-                            "signal": {"side": "BUY_YES", "size": active_bid_q, "vwap": active_bid_p, "ev": p_yes - active_bid_p if p_yes is not None else 0.0}
+                            "signal": {"side": result["side"], "size": result["qty"], "vwap": result["price"], "ev": 0.0}
                         })
-                        
-                    # Store execution parameters and clear state BEFORE await
-                    exec_qty = active_bid_q
-                    exec_price = active_bid_p
-                    exec_ev = p_yes - active_bid_p if p_yes is not None else 0.0
-                    
-                    self.engine.execution_router.active_bid_id = ""
-                    self.engine.execution_router.active_bid_price = 0.0
-                    self.engine.execution_router.active_bid_qty = 0.0
-                    self._current_active_orders["bid"] = None
-                    
-                    await self.client.execute_trade(
-                        side="BUY_YES",
-                        qty=exec_qty,
-                        price=exec_price,
-                        ev=exec_ev,
-                        expected_slippage_bps=0.0,
-                        context_state={"timestamp": t_now, "strike_price": active_strike},
-                        is_maker=True
-                    )
-
-            # Check Sell Fill
-            order_ask = self._current_active_orders["ask"]
-            is_sell_fill = False
-            if active_ask_p > 0.0 and best_bid_p is not None and order_ask is not None:
-                is_crossed = best_bid_p > active_ask_p
-                is_touched_and_front = best_bid_p == active_ask_p and order_ask["queue_ahead"] <= 0.0
-                if is_crossed or is_touched_and_front:
-                    is_sell_fill = True
-                    
-            if is_sell_fill:
-                yes_shares = self.client.get_position_size("YES")
-                if yes_shares < active_ask_q:
-                    rem_qty = active_ask_q - yes_shares
-                    no_price = 1.0 - active_ask_p
-                    # Maker execution: no taker fee is charged
-                    cost = rem_qty * no_price + self.config.arbitrage.GAS_FEE_USD
-                    if cost > self.client.cash_balance:
-                        cost_per_share_no = no_price
-                        max_rem = max(0.0, (self.client.cash_balance - self.config.arbitrage.GAS_FEE_USD) / cost_per_share_no)
-                        active_ask_q = yes_shares + max_rem
-                        if active_ask_q < 1e-5 or (yes_shares == 0.0 and max_rem * no_price < 5.0):
-                            self.engine.execution_router.active_ask_id = ""
-                            self.engine.execution_router.active_ask_price = 0.0
-                            self.engine.execution_router.active_ask_qty = 0.0
-                            active_ask_p = 0.0
-                            self._current_active_orders["ask"] = None
-                            is_sell_fill = False
-                            
-                if is_sell_fill and active_ask_p > 0.0:
-                    # Sell Fill!
-                    self.total_trades += 1
-                    self.hft_metrics["volume_executed"] += active_ask_q
-                    
-                    # Record post-fill trade for MTM toxicity tracking
-                    self.hft_metrics["pending_mtm_trades"].append({
-                        "timestamp": t_now,
-                        "side": "SELL_YES",
-                        "exec_price": active_ask_p,
-                        "mtm_1s": None,
-                        "mtm_5s": None,
-                        "mtm_15s": None
-                    })
-                    
-                    p_mkt = best_bid_p
-                    self.recorder.record_signal(
-                        timestamp=t_now,
-                        spot_price=spot,
-                        strike=active_strike,
-                        model_prob=p_yes,
-                        implied_prob=p_mkt,
-                        kelly_size=active_ask_q,
-                        status="MAKER_FILL_SELL"
-                    )
-                    
-                    self.log_message("info", f"[MAKER FILL] SELL_YES filled at limit price: {active_ask_p:.4f} | Size: {active_ask_q:.2f} (Queue cleared)")
-                    if self.web_server:
-                        self.web_server.broadcast_message({
-                            "type": "trade_signal",
-                            "signal": {"side": "SELL_YES", "size": active_ask_q, "vwap": active_ask_p, "ev": active_ask_p - p_yes if p_yes is not None else 0.0}
-                        })
-                        
-                    # Store execution parameters and clear state BEFORE await
-                    exec_qty = active_ask_q
-                    exec_price = active_ask_p
-                    exec_ev = active_ask_p - p_yes if p_yes is not None else 0.0
-                    yes_shares = self.client.get_position_size("YES")
-                    
-                    self.engine.execution_router.active_ask_id = ""
-                    self.engine.execution_router.active_ask_price = 0.0
-                    self.engine.execution_router.active_ask_qty = 0.0
-                    self._current_active_orders["ask"] = None
-                    
-                    if yes_shares >= exec_qty:
-                        await self.client.execute_trade(
-                            side="SELL_YES",
-                            qty=exec_qty,
-                            price=exec_price,
-                            ev=exec_ev,
-                            expected_slippage_bps=0.0,
-                            context_state={"timestamp": t_now, "strike_price": active_strike},
-                            is_maker=True
-                        )
-                    else:
-                        if yes_shares > 0.0:
-                            await self.client.execute_trade(
-                                side="SELL_YES",
-                                qty=yes_shares,
-                                price=exec_price,
-                                ev=exec_ev,
-                                expected_slippage_bps=0.0,
-                                context_state={"timestamp": t_now, "strike_price": active_strike},
-                                is_maker=True
-                            )
-                        rem_q = exec_qty - yes_shares
-                        no_price = 1.0 - exec_price
-                        await self.client.execute_trade(
-                            side="BUY_NO",
-                            qty=rem_q,
-                            price=no_price,
-                            ev=(1.0 - p_yes) - no_price if p_yes is not None else 0.0,
-                            expected_slippage_bps=0.0,
-                            context_state={"timestamp": t_now, "strike_price": active_strike},
-                            is_maker=True
-                        )
-
-            # B. Generate and process new quoting instructions
-            instructions = self.engine.evaluate_and_route(context)
-            
-            # Count instructions for OTR tracking
-            for instr in instructions:
-                if instr.action == "NEW":
-                    self.hft_metrics["total_orders_sent"] += 1
-                elif instr.action == "CANCEL":
-                    self.hft_metrics["total_orders_cancelled"] += 1
-                elif instr.action == "REPLACE":
-                    self.hft_metrics["total_orders_sent"] += 1
-                    self.hft_metrics["total_orders_cancelled"] += 1
-            
-            # Format diagnostic decision for the dashboard & web state
-            bid_p = self.engine.execution_router.active_bid_price
-            ask_p = self.engine.execution_router.active_ask_price
-            decision = {
-                "side": "QUOTING",
-                "size": self.engine.execution_router.active_bid_qty,
-                "vwap": bid_p if bid_p > 0.0 else ask_p,
-                "reason": f"Bid: {bid_p:.2f} Ask: {ask_p:.2f}",
-                "expected_slippage_bps": 0.0,
-                "ev": 0.0
-            }
-            self.latest_decision_ref[0] = decision
-            
-            for instr in instructions:
-                if instr.action == "NEW" and instr.regime in ("B", "PANIC"):
-                    # Check if taker executions are enabled (PANIC is always allowed to prevent holding to settlement)
-                    if instr.regime == "B" and not self.config.arbitrage.TAKER_ENABLED:
-                        continue
-
-                    # Gate taker execution if a trade task is already in flight
-                    if self._pending_trade_task is not None and not self._pending_trade_task.done():
-                        continue
-
-                    # Check HFT safety cooldown to prevent infinite loop spamming
-                    if t_now - self._last_rejection_time.get(instr.side, 0.0) < 1.5:
-                        if t_now - getattr(self, "_last_cooldown_log_time", 0.0) >= 2.0:
-                            self._last_cooldown_log_time = t_now
-                            self.log_message("warning", f"[COOLDOWN] Skipping {instr.side} taker trade execution due to recent rejection safety hold.")
-                        continue
-
-                    # Taker execution in Regime B / PANIC!
-                    self.total_trades += 1
-                    p_mkt_exec = p_mkt if p_mkt is not None else p_yes
-                    self.recorder.record_signal(
-                        timestamp=t_now,
-                        spot_price=spot,
-                        strike=active_strike,
-                        model_prob=p_yes,
-                        implied_prob=p_mkt_exec,
-                        kelly_size=instr.qty,
-                        status=f"TAKER_{instr.side}" if instr.regime == "B" else f"PANIC_{instr.side}"
-                    )
-                    
-                    self.log_message("info", f"[{'TAKER' if instr.regime == 'B' else 'PANIC'} ORDER] Executing {instr.side} | Size: {instr.qty:.2f} | Price: {instr.price:.4f}")
-                    decision_taker = {
-                        "side": instr.side,
-                        "size": instr.qty,
-                        "vwap": instr.price,
-                        "ev": p_yes - instr.price if instr.side == "BUY_YES" else (1.0 - p_yes) - instr.price if p_yes is not None else 0.0,
-                        "expected_slippage_bps": 0.0,
-                        "limit_price": instr.price
-                    }
-                    self._pending_trade_task = asyncio.create_task(
-                        self._execute_trade_async(
-                            decision_taker, spot, active_strike, ofi, vol, tau_sec, p_yes, t_now
-                        )
-                    )
-        else:
-            # Check if taker executions are enabled
-            if not self.config.arbitrage.TAKER_ENABLED:
-                decision = {
-                    "side": "HOLD",
-                    "reason": "TAKER_DISABLED",
-                    "size": 0.0,
-                    "kelly_alloc": 0.0,
-                    "vwap": p_mkt if p_mkt is not None else 0.5,
-                    "theoretical_edge_bps": 0.0
-                }
-                self.latest_decision_ref[0] = decision
-            # Check if a taker trade task is already in flight
-            elif self._pending_trade_task is not None and not self._pending_trade_task.done():
-                decision = {
-                    "side": "HOLD",
-                    "reason": "TAKER_TASK_IN_FLIGHT",
-                    "size": 0.0,
-                    "kelly_alloc": 0.0,
-                    "vwap": p_mkt if p_mkt is not None else 0.5,
-                    "theoretical_edge_bps": 0.0
-                }
-                self.latest_decision_ref[0] = decision
-            else:
-                decision = self.engine.evaluate_and_trade(p_yes, context, self.client)
-                self.latest_decision_ref[0] = decision
+        
+        # 2. Generate and process new quoting instructions
+        instructions = self.engine.evaluate_and_route(context)
+        
+        # Format diagnostic decision for the dashboard
+        bid_p = self.engine.execution_router.active_bid_price
+        ask_p = self.engine.execution_router.active_ask_price
+        decision = {
+            "side": "QUOTING",
+            "size": self.engine.execution_router.active_bid_qty,
+            "vwap": bid_p if bid_p > 0.0 else ask_p,
+            "reason": f"Bid: {bid_p:.2f} Ask: {ask_p:.2f}",
+            "expected_slippage_bps": 0.0,
+            "ev": 0.0
+        }
+        self.latest_decision_ref[0] = decision
+        
+        for instr in instructions:
+            if instr.action == "NEW":
+                self.hft_metrics["total_orders_sent"] += 1
+            elif instr.action == "CANCEL":
+                self.hft_metrics["total_orders_cancelled"] += 1
+            elif instr.action == "REPLACE":
+                self.hft_metrics["total_orders_sent"] += 1
+                self.hft_metrics["total_orders_cancelled"] += 1
                 
-                # Check HFT safety cooldown to prevent infinite loop spamming
-                if decision["side"] != "HOLD" and t_now - self._last_rejection_time.get(decision["side"], 0.0) < 1.5:
-                    if t_now - getattr(self, "_last_cooldown_log_time", 0.0) >= 2.0:
-                        self._last_cooldown_log_time = t_now
-                        self.log_message("warning", f"[COOLDOWN] Skipping {decision['side']} taker trade execution due to recent rejection safety hold.")
-                    decision = {
-                        "side": "HOLD",
-                        "reason": "SAFETY_COOLDOWN_ACTIVE",
-                        "size": 0.0,
-                        "kelly_alloc": decision.get("kelly_alloc", 0.0),
-                        "vwap": decision.get("vwap", 0.5),
-                        "theoretical_edge_bps": decision.get("theoretical_edge_bps", 0.0)
-                    }
-                    self.latest_decision_ref[0] = decision
-
-            if decision["side"] != "HOLD":
-                p_mkt_signal = p_mkt if p_mkt is not None else p_yes
+            res = await self.client.process_instruction(instr, context_state)
+            
+            # Taker executions are returned synchronously from process_instruction
+            if instr.action == "NEW" and instr.regime in ("B", "PANIC") and res.get("success"):
+                self.total_trades += 1
+                p_mkt_exec = self._get_market_implied_price(p_yes)
+                status_str = f"TAKER_{instr.side}" if instr.regime == "B" else f"PANIC_{instr.side}"
                 self.recorder.record_signal(
                     timestamp=t_now,
                     spot_price=spot,
                     strike=active_strike,
                     model_prob=p_yes,
-                    implied_prob=p_mkt_signal,
-                    kelly_size=decision["size"],
-                    status=decision["side"]
+                    implied_prob=p_mkt_exec if p_mkt_exec is not None else p_yes,
+                    kelly_size=res["qty"],
+                    status=status_str
                 )
+                type_str = 'TAKER' if instr.regime == 'B' else 'PANIC'
+                self.log_message("info", f"[{type_str} ORDER] Executed {instr.side} | Size: {res['qty']:.2f} | Price: {res['price']:.4f}")
+                
+                self.hft_metrics["total_taker_edge"] += abs(p_yes - res["price"] if p_yes is not None else 0.0)
+                self.hft_metrics["total_taker_trades"] += 1
+                
+                self.hft_metrics["pending_mtm_trades"].append({
+                    "timestamp": t_now,
+                    "side": res["side"],
+                    "exec_price": res["price"],
+                    "mtm_1s": None,
+                    "mtm_5s": None,
+                    "mtm_15s": None
+                })
 
-                # Log SIGNAL — single source of truth
-                self.log_message(
-                    "info",
-                    f"SIGNAL: {decision['side']} | Size: {decision['size']:.2f}"
-                    f" | VWAP: {decision['vwap']:.4f} | EV: {decision['ev']:.4f}"
-                )
-
-                # Dispatch the execution to background queue
-                self._pending_trade_task = asyncio.create_task(
-                    self._execute_trade_async(
-                        decision, spot, active_strike, ofi, vol, tau_sec, p_yes, t_now
-                    )
-                )
-        
         # Get Implied Market price and Edge — use REAL market book (q_real), never depleted
         p_mkt = self._get_market_implied_price(p_yes)
         edge = p_yes - p_mkt if p_yes is not None and p_mkt is not None else None
@@ -1077,64 +758,6 @@ class LiveOrchestrator:
             self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
             
 
-
-    async def _execute_trade_async(self, decision, spot, active_strike, ofi, vol, tau_sec, p_yes, t_signal):
-        """Background task that executes the trade and updates the UI afterward."""
-        try:
-            result = await self.client.execute_trade(
-                side=decision["side"],
-                qty=decision["size"],
-                price=decision["vwap"],
-                ev=decision["ev"],
-                expected_slippage_bps=decision["expected_slippage_bps"],
-                context_state={
-                    "timestamp": t_signal,
-                    "strike_price": active_strike,
-                    "volatility": vol,
-                    "limit_price": decision.get("limit_price", decision["vwap"])
-                }
-            )
-            
-            if result.get("success"):
-                self.log_message(
-                    "info",
-                    f"EXECUTED {result['side']} | Qty: {result['qty']:.2f} | Price: ${result['price']:.4f} "
-                    f"| PnL: ${result['pnl']:+.2f}"
-                )
-                
-                # Increment total trades in non-maker mode
-                if not self.config.maker.ENABLED:
-                    self.total_trades += 1
-                    
-                # Track Edge-to-Slippage metric for Taker Trades
-                actual_price = result["price"]
-                target_price = decision["vwap"]
-                slippage = abs(actual_price - target_price)
-                
-                self.hft_metrics["total_taker_edge"] += abs(decision["ev"])
-                self.hft_metrics["total_taker_slippage"] += slippage
-                self.hft_metrics["total_taker_trades"] += 1
-                
-                # Append fill to MTM lag tracking queue
-                self.hft_metrics["pending_mtm_trades"].append({
-                    "timestamp": time.time(),
-                    "side": result["side"],
-                    "exec_price": actual_price,
-                    "mtm_1s": None,
-                    "mtm_5s": None,
-                    "mtm_15s": None
-                })
-            else:
-                self.log_message(
-                    "warning", 
-                    f"TRADE REJECTED: {result.get('reason')}"
-                )
-                self._last_rejection_time[decision["side"]] = time.time()
-
-            if self.web_server:
-                self._update_web_state(decision, spot, active_strike, ofi, vol, tau_sec, p_yes)
-        except Exception as e:
-            self.log_message("error", f"Error during trade execution: {e}")
 
     async def _market_discovery_loop(self) -> None:
         """Periodically evaluates clock to trigger dynamic market Discovery and Rollovers."""

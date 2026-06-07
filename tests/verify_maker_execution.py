@@ -4,7 +4,8 @@ from src.core.market_context import MarketContext
 from src.core.base_strategy import BaseStrategy
 from src.core.interfaces import IExecutionClient
 from config.settings import SystemConfig
-from src.execution.maker_execution import InventoryManager, ExecutionRouter, OrderInstruction, MakerExecutionEngine
+from src.execution.engine import InventoryManager, ExecutionRouter, ExecutionEngine
+from src.core.interfaces import OrderInstruction
 
 class MockStrategy(BaseStrategy):
     def __init__(self, p_hat: Optional[float] = 0.55):
@@ -32,8 +33,15 @@ class MockClientForTest(IExecutionClient):
             return self._no
         return 0.0
         
-    async def execute_trade(self, *args, **kwargs):
+    async def _execute_trade_internal(self, *args, **kwargs):
         return {}
+
+    async def process_instruction(self, instruction, context_state):
+        return {'success': True, 'action': instruction.action, 'qty': instruction.qty, 'price': instruction.price, 'side': instruction.side}
+
+    def process_market_data(self, bids_l2, asks_l2, context_state):
+        return []
+
 
 
 class TestMakerExecution(unittest.TestCase):
@@ -210,12 +218,12 @@ class TestMakerExecution(unittest.TestCase):
         self.assertEqual(ask_quote.regime, "C")
 
     def test_maker_execution_engine_orchestration(self):
-        # Verify MakerExecutionEngine orchestrates strategy, client and router correctly
+        # Verify ExecutionEngine orchestrates strategy, client and router correctly
         config = SystemConfig()
         strategy = MockStrategy(p_hat=0.58)
         client = MockClientForTest(cash=2000.0, yes=50.0, no=0.0)
         
-        engine = MakerExecutionEngine(strategy, client, config)
+        engine = ExecutionEngine(strategy, client, config)
         
         context = MarketContext(
             timestamp=1000.0,
@@ -237,7 +245,7 @@ class TestMakerExecution(unittest.TestCase):
 
         # Now test with strategy returning None (Safe cancel mode)
         strategy_none = MockStrategy(p_hat=None)
-        engine_none = MakerExecutionEngine(strategy_none, client, config)
+        engine_none = ExecutionEngine(strategy_none, client, config)
         
         # Set active orders so they are cancelled
         engine_none.execution_router.active_bid_id = "bid_1"
@@ -281,7 +289,7 @@ class TestMakerExecution(unittest.TestCase):
         }
         
         async def run_maker_trade():
-            return await client.execute_trade(
+            return await client._execute_trade_internal(
                 side="BUY_YES",
                 qty=100.0,
                 price=0.46,
