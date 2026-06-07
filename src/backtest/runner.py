@@ -77,6 +77,7 @@ class BacktestRunner:
         )
         
         shadow_book = ShadowOrderBook()
+        shadow_book.is_backtest = True
         strategy = StrategyFactory.get_strategy(self.config.STRATEGY_NAME, self.config)
         client = MockExecutionClient(self.config, recorder, shadow_book)
         client.is_backtest = True
@@ -153,7 +154,7 @@ class BacktestRunner:
         
         # Simulation Loop (Chronological ticks stream)
         for i in range(total_ticks):
-            if progress_callback and i % max(1, total_ticks // 10) == 0:
+            if progress_callback and i % max(1, total_ticks // 100) == 0:
                 progress_callback(int((i / total_ticks) * 100))
             t = float(timestamps[i])
             spot = float(spot_prices[i])
@@ -277,13 +278,11 @@ class BacktestRunner:
                 active_bid_q = maker_engine.execution_router.active_bid_qty
                 fill_occurred = False
                 if active_bid_p > 0.0 and best_ask_p is not None and best_ask_p <= active_bid_p:
-                    # Fee-aware cash balance check
-                    fee = active_bid_q * maker_engine.execution_router.taker_fee_multiplier * active_bid_p * (1.0 - active_bid_p)
-                    cost = active_bid_q * active_bid_p + 0.03 + fee
+                    # Cash balance check (limit orders pay 0% fees)
+                    cost = active_bid_q * active_bid_p + 0.03
                     if cost > client.cash_balance:
                         # Scale down the fill to what we can afford
-                        cost_per_share = active_bid_p * (1.0 + maker_engine.execution_router.taker_fee_multiplier * (1.0 - active_bid_p))
-                        max_q = max(0.0, (client.cash_balance - 0.03) / cost_per_share)
+                        max_q = max(0.0, (client.cash_balance - 0.03) / active_bid_p)
                         if max_q > 0.0 and (max_q * active_bid_p) >= 5.0:
                             active_bid_q = max_q
                         else:
@@ -306,17 +305,23 @@ class BacktestRunner:
                             kelly_size=active_bid_q,
                             status="MAKER_FILL_BUY"
                         )
-                        await client.execute_trade(
-                            side="BUY_YES",
-                            qty=active_bid_q,
-                            price=active_bid_p,
-                            ev=p_yes - active_bid_p if p_yes is not None else 0.0,
-                            expected_slippage_bps=0.0,
-                            context_state={"timestamp": t, "strike_price": active_strike}
-                        )
+                        exec_qty = active_bid_q
+                        exec_price = active_bid_p
+                        exec_ev = p_yes - active_bid_p if p_yes is not None else 0.0
+                        
                         maker_engine.execution_router.active_bid_id = ""
                         maker_engine.execution_router.active_bid_price = 0.0
                         maker_engine.execution_router.active_bid_qty = 0.0
+                        
+                        await client.execute_trade(
+                            side="BUY_YES",
+                            qty=exec_qty,
+                            price=exec_price,
+                            ev=exec_ev,
+                            expected_slippage_bps=0.0,
+                            context_state={"timestamp": t, "strike_price": active_strike},
+                            is_maker=True
+                        )
 
                 # Check active sell limit order (ask) fill
                 active_ask_p = maker_engine.execution_router.active_ask_price
@@ -327,12 +332,11 @@ class BacktestRunner:
                         # We need cash to buy NO for the remainder
                         rem_qty = active_ask_q - yes_shares
                         no_price = 1.0 - active_ask_p
-                        fee = rem_qty * maker_engine.execution_router.taker_fee_multiplier * no_price * (1.0 - no_price)
-                        cost = rem_qty * no_price + 0.03 + fee
+                        # Maker execution: no taker fee is charged
+                        cost = rem_qty * no_price + 0.03
                         if cost > client.cash_balance:
                             # Scale down remainder to what we can afford
-                            cost_per_share_no = no_price * (1.0 + maker_engine.execution_router.taker_fee_multiplier * active_ask_p)
-                            max_rem = max(0.0, (client.cash_balance - 0.03) / cost_per_share_no)
+                            max_rem = max(0.0, (client.cash_balance - 0.03) / no_price)
                             active_ask_q = yes_shares + max_rem
                             if active_ask_q < 1e-5 or (yes_shares == 0.0 and max_rem * no_price < 5.0):
                                 # Cannot afford
@@ -354,39 +358,47 @@ class BacktestRunner:
                             kelly_size=active_ask_q,
                             status="MAKER_FILL_SELL"
                         )
+                        exec_qty = active_ask_q
+                        exec_price = active_ask_p
+                        exec_ev = active_ask_p - p_yes if p_yes is not None else 0.0
                         yes_shares = client.get_position_size("YES")
-                        if yes_shares >= active_ask_q:
+                        
+                        maker_engine.execution_router.active_ask_id = ""
+                        maker_engine.execution_router.active_ask_price = 0.0
+                        maker_engine.execution_router.active_ask_qty = 0.0
+                        
+                        if yes_shares >= exec_qty:
                             await client.execute_trade(
                                 side="SELL_YES",
-                                qty=active_ask_q,
-                                price=active_ask_p,
-                                ev=active_ask_p - p_yes if p_yes is not None else 0.0,
+                                qty=exec_qty,
+                                price=exec_price,
+                                ev=exec_ev,
                                 expected_slippage_bps=0.0,
-                                context_state={"timestamp": t, "strike_price": active_strike}
+                                context_state={"timestamp": t, "strike_price": active_strike},
+                                is_maker=True
                             )
                         else:
                             if yes_shares > 0.0:
                                 await client.execute_trade(
                                     side="SELL_YES",
                                     qty=yes_shares,
-                                    price=active_ask_p,
-                                    ev=active_ask_p - p_yes if p_yes is not None else 0.0,
+                                    price=exec_price,
+                                    ev=exec_ev,
                                     expected_slippage_bps=0.0,
-                                    context_state={"timestamp": t, "strike_price": active_strike}
+                                    context_state={"timestamp": t, "strike_price": active_strike},
+                                    is_maker=True
                                 )
-                            rem_q = active_ask_q - yes_shares
-                            no_price = 1.0 - active_ask_p
+                            rem_q = exec_qty - yes_shares
+                            no_price = 1.0 - exec_price
                             await client.execute_trade(
                                 side="BUY_NO",
                                 qty=rem_q,
                                 price=no_price,
                                 ev=(1.0 - p_yes) - no_price if p_yes is not None else 0.0,
                                 expected_slippage_bps=0.0,
-                                context_state={"timestamp": t, "strike_price": active_strike}
+                                context_state={"timestamp": t, "strike_price": active_strike},
+                                is_maker=True
                             )
-                        maker_engine.execution_router.active_ask_id = ""
-                        maker_engine.execution_router.active_ask_price = 0.0
-                        maker_engine.execution_router.active_ask_qty = 0.0
 
                 # B. Quoting evaluation bypass check
                 cur_best_bid = top_b_sh[0] if top_b_sh else None
@@ -422,8 +434,8 @@ class BacktestRunner:
                     last_evaluated_best_ask = cur_best_ask
                     
                     for instr in instructions:
-                        if instr.action == "NEW" and instr.regime == "B":
-                            # Taker execution in Regime B!
+                        if instr.action == "NEW" and instr.regime in ("B", "PANIC"):
+                            # Taker execution in Regime B / PANIC!
                             trade_count += 1
                             top_b_real, top_a_real = shadow_book.get_market_top_of_book()
                             p_mkt = 0.5 * (top_b_real[0] + top_a_real[0]) if top_b_real and top_a_real else p_yes
@@ -434,7 +446,7 @@ class BacktestRunner:
                                 model_prob=p_yes,
                                 implied_prob=p_mkt,
                                 kelly_size=instr.qty,
-                                status=f"TAKER_{instr.side}"
+                                status=f"TAKER_{instr.side}" if instr.regime == "B" else f"PANIC_{instr.side}"
                             )
                             
                             decision_taker = {

@@ -68,6 +68,7 @@ class ArbitrageConfig:
     MAX_POSITION_SIZE_USD: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_USD", "250.0")))
     MIN_ORDER_USD: float = field(default_factory=lambda: float(os.getenv("MIN_ORDER_USD", "1.0")))
     TAKER_ENABLED: bool = field(default_factory=lambda: os.getenv("TAKER_ENABLED", "True").lower() == "true")
+    PANIC_CONCESSION: float = field(default_factory=lambda: float(os.getenv("PANIC_CONCESSION", "0.15")))
 
 @dataclass(frozen=True)
 class RiskConfig:
@@ -78,6 +79,11 @@ class RiskConfig:
     ORACLE_NOISE_BPS: float = field(default_factory=lambda: float(os.getenv("ORACLE_NOISE_BPS", "1.5")))
     PIN_RISK_SECONDS: float = field(default_factory=lambda: float(os.getenv("PIN_RISK_SECONDS", "3.0")))
     COOLDOWN_PERIOD_SEC: int = field(default_factory=lambda: int(os.getenv("COOLDOWN_PERIOD_SEC", "10")))
+    DIVERGENCE_WINDOW_SECONDS: float = field(default_factory=lambda: float(os.getenv("DIVERGENCE_WINDOW_SECONDS", "60.0")))
+    VELOCITY_LOOKBACK_SECONDS: float = field(default_factory=lambda: float(os.getenv("VELOCITY_LOOKBACK_SECONDS", "10.0")))
+    V_MAX: float = field(default_factory=lambda: float(os.getenv("V_MAX", "0.005")))
+    GAMMA: float = field(default_factory=lambda: float(os.getenv("GAMMA", "2.0")))
+    MIN_KELLY_THRESHOLD: float = field(default_factory=lambda: float(os.getenv("MIN_KELLY_THRESHOLD", "0.01")))
 
 @dataclass(frozen=True)
 class MarketMakerConfig:

@@ -8,6 +8,7 @@ from src.core.interfaces import ISpotFeed, IExecutionClient
 from src.execution.shadow_book import ShadowOrderBook
 from src.core.base_strategy import BaseStrategy
 from src.execution.engine import ExecutionEngine
+from src.core.market_context import MarketContext
 
 try:
     from rich.console import Console
@@ -56,7 +57,8 @@ def build_dashboard(
     client: IExecutionClient,
     engine: ExecutionEngine,
     latest_decision: Dict[str, Any],
-    hft_metrics: Optional[Dict[str, Any]] = None
+    hft_metrics: Optional[Dict[str, Any]] = None,
+    orchestrator: Optional[Any] = None
 ) -> Layout:
     """Builds the Rich terminal layout combining all system modules."""
     layout = Layout()
@@ -78,7 +80,7 @@ def build_dashboard(
     
     layout["right"].split_column(
         Layout(name="orderbook"),
-        Layout(name="execution_engine", size=8),
+        Layout(name="execution_engine", size=9),
         Layout(name="hft_metrics", size=8)
     )
 
@@ -192,11 +194,38 @@ def build_dashboard(
         f"{shadow_book.smoothed_ofi:+.1f}"
     )
     
+    # Extract divergence filter stats
+    div_filter = None
+    if orchestrator and hasattr(orchestrator, "divergence_filter"):
+        div_filter = orchestrator.divergence_filter
+    elif engine and hasattr(engine, "divergence_filter"):
+        div_filter = getattr(engine, "divergence_filter", None)
+        
+    last_div = div_filter.last_divergence if div_filter is not None else 0.0
+    last_vel = div_filter.last_velocity if div_filter is not None else 0.0
+    last_acc = div_filter.last_acceleration if div_filter is not None else 0.0
+    last_scale = div_filter.last_scale if div_filter is not None else 1.0
+    
     # Active contract details description
     status_text = Text()
     status_text.append(f"  Active Slug: {market_manager.current_slug or '—'}\n", style="dim")
     status_text.append(f"  Active Condition: {market_manager.condition_id or '—'}\n", style="dim")
     status_text.append(f"  Calibrated Volatility: {vol:.2%}  |  Smoothed OFI: {shadow_book.smoothed_ofi:+.1f}\n", style="dim")
+    
+    # Divergence stats formatting
+    div_pct = last_div * 100
+    vel_pts = last_vel * 100
+    scale_color = "green" if last_scale >= 0.9 else "yellow" if last_scale > 0.0 else "red"
+    status_text.append("  Divergence Metrics: ", style="bold dim")
+    status_text.append(f"Current: {div_pct:+.2f}%", style="cyan")
+    status_text.append(" | ", style="dim")
+    status_text.append(f"Velocity: {vel_pts:+.3f} pts/s", style="magenta")
+    status_text.append(" | ", style="dim")
+    status_text.append(f"Acceleration: {last_acc:+.5f}", style="dim")
+    status_text.append(" | ", style="dim")
+    status_text.append("Kelly Scale: ", style="dim")
+    status_text.append(f"{last_scale:.1%}", style=f"bold {scale_color}")
+    status_text.append("\n")
     
     body_layout = Layout()
     body_layout.split_column(
@@ -243,6 +272,7 @@ def build_dashboard(
     ex_table.add_row("Execution Msg/Reason:", f"[dim]{dec_reason}[/]")
     ex_table.add_row("YES Position Quantity:", f"[green]{qty_yes:.2f}[/]")
     ex_table.add_row("NO Position Quantity:", f"[red]{qty_no:.2f}[/]")
+    ex_table.add_row("Divergence Scale:", f"[{scale_color}]{last_scale:.1%}[/]")
     
     layout["execution_engine"].update(Panel(ex_table, title="[bold]Risk & Sizing Engine[/]", border_style="bright_black"))
 
@@ -363,7 +393,8 @@ async def run_terminal_dashboard(
                     client=client,
                     engine=engine,
                     latest_decision=latest_decision,
-                    hft_metrics=hft_metrics
+                    hft_metrics=hft_metrics,
+                    orchestrator=orchestrator
                 )
                 live.update(layout)
             except Exception as e:

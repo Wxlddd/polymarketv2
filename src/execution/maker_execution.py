@@ -134,7 +134,7 @@ class ExecutionRouter:
         'active_bid_id', 'active_bid_price', 'active_bid_qty',
         'active_ask_id', 'active_ask_price', 'active_ask_qty',
         # Order counter for mock ID generation
-        '_order_counter', 'min_order_usd', 'locked'
+        '_order_counter', 'min_order_usd', 'locked', 'panic_concession'
     )
 
     def __init__(
@@ -152,7 +152,8 @@ class ExecutionRouter:
         fixed_horizon_sec: float = 300.0,
         gas_fee_usd: float = 0.03,
         taker_fee_multiplier: float = 0.072,
-        min_order_usd: float = 1.0
+        min_order_usd: float = 1.0,
+        panic_concession: float = 0.15
     ):
         self.gamma = gamma
         self.min_fee_buffer = min_fee_buffer
@@ -169,6 +170,7 @@ class ExecutionRouter:
         self.taker_fee_multiplier = taker_fee_multiplier
         self.min_order_usd = min_order_usd
         self.locked = False
+        self.panic_concession = panic_concession
 
         # State memory
         self.active_bid_id: str = ""
@@ -206,7 +208,8 @@ class ExecutionRouter:
         context: MarketContext,
         yes_shares: float,
         no_shares: float,
-        cash_balance: float
+        cash_balance: float,
+        divergence_scale: float = 1.0
     ) -> List[OrderInstruction]:
         """
         Evaluates execution regimes tick-by-tick and yields a list of OrderInstructions.
@@ -218,6 +221,7 @@ class ExecutionRouter:
             yes_shares: Current YES shares held.
             no_shares: Current NO shares held.
             cash_balance: Available USD cash.
+            divergence_scale: Sizing scale factor [0, 1] from the divergence velocity filter.
             
         Returns:
             List of OrderInstruction objects.
@@ -226,6 +230,12 @@ class ExecutionRouter:
         
         # Guard: Ensure we have order book data
         if not context.bids_l2 or not context.asks_l2:
+            return instructions
+
+        # Toxic Flow Guard: if divergence velocity is high, cancel quotes and do not trade
+        if divergence_scale <= 0.01:
+            self._cancel_bid(instructions, "SAFE")
+            self._cancel_ask(instructions, "SAFE")
             return instructions
 
         # Lock check
@@ -252,19 +262,30 @@ class ExecutionRouter:
             
             if q > 0:
                 # Aggressively sell all YES contracts
-                instructions.append(OrderInstruction("NEW", "SELL_YES", best_bid, yes_shares, "panic_sell_yes", regime="PANIC"))
+                limit_p = max(0.01, p_hat - self.panic_concession)
+                instructions.append(OrderInstruction("NEW", "SELL_YES", limit_p, yes_shares, "panic_sell_yes", regime="PANIC"))
             elif q < 0:
                 # Aggressively buy YES contracts to cover NO position
-                instructions.append(OrderInstruction("NEW", "BUY_YES", best_ask, no_shares, "panic_buy_yes", regime="PANIC"))
+                limit_p = min(0.99, p_hat + self.panic_concession)
+                instructions.append(OrderInstruction("NEW", "BUY_YES", limit_p, no_shares, "panic_buy_yes", regime="PANIC"))
             return instructions
 
         # Phase 1: Soft Unwind (Reduce-Only Regime)
         is_reduce_only = (tau_sec <= 45.0)
         if is_reduce_only:
-            # 1. Skew reservation price skewed by inventory
-            q_norm = q / self.max_inventory if self.max_inventory > 0.0 else q
+            # 1. reservation price calculation
+            # Skew target reservation price by inventory
+            # Normalize q
+            q_norm = 0.0
+            if self.max_inventory > 0.0:
+                q_norm = max(-1.0, min(1.0, q / self.max_inventory))
+                
+            # P_res calculation using the pure HFT instant risk formula recommended by the user
             p_res = p_hat - self.gamma * q_norm * sigma_sq
-            p_res = max(0.01, min(0.99, p_res))
+            if p_res < 0.01:
+                p_res = 0.01
+            elif p_res > 0.99:
+                p_res = 0.99
             
             # 2. Calculate optimal spread and target quotes
             delta = self.calculate_spread(sigma_sq, tau_sec)
@@ -284,13 +305,13 @@ class ExecutionRouter:
                 self._cancel_bid(instructions, "REDUCE")
                 p_ask_post = max(p_ask_target, best_bid + self.tick_size)
                 p_ask_post = max(0.01, min(0.99, p_ask_post))
-                self._route_maker_ask(p_ask_post, instructions, "REDUCE", yes_shares, cash_balance)
+                self._route_maker_ask(p_ask_post, instructions, "REDUCE", yes_shares, cash_balance, 1.0)
             elif q < 0:
                 # NO position -> Reduce-only means we only BUY YES to cover. Cancel Ask.
                 self._cancel_ask(instructions, "REDUCE")
                 p_bid_post = min(p_bid_target, best_ask - self.tick_size)
                 p_bid_post = max(0.01, min(0.99, p_bid_post))
-                self._route_maker_bid(p_bid_post, instructions, "REDUCE", cash_balance)
+                self._route_maker_bid(p_bid_post, instructions, "REDUCE", yes_shares, no_shares, cash_balance, 1.0)
             else:
                 # q == 0 -> We are perfectly flat! Cancel quotes on both sides to prevent any inventory.
                 self._cancel_bid(instructions, "REDUCE")
@@ -341,13 +362,13 @@ class ExecutionRouter:
                 self._cancel_bid(instructions, regime)
                 p_ask_post = max(p_ask_target, best_bid + self.tick_size)
                 p_ask_post = max(0.01, min(0.99, p_ask_post))
-                self._route_maker_ask(p_ask_post, instructions, regime, yes_shares, cash_balance)
+                self._route_maker_ask(p_ask_post, instructions, regime, yes_shares, cash_balance, 1.0)
             elif q < 0:
                 # We have NO inventory. Reducing side is Bid (buying YES). Cancel Ask.
                 self._cancel_ask(instructions, regime)
                 p_bid_post = min(p_bid_target, best_ask - self.tick_size)
                 p_bid_post = max(0.01, min(0.99, p_bid_post))
-                self._route_maker_bid(p_bid_post, instructions, regime, cash_balance)
+                self._route_maker_bid(p_bid_post, instructions, regime, yes_shares, no_shares, cash_balance, 1.0)
                 
         else:
             # Check for REGIME B: Taker crossing conditions
@@ -369,10 +390,12 @@ class ExecutionRouter:
                     cost_per_share = best_ask * (1.0 + self.taker_fee_multiplier * (1.0 - best_ask))
                     max_qty_by_cash = max(0.0, (cash_balance - self.gas_fee_usd) / cost_per_share)
                     
+                    max_add_by_inventory = max(0.0, self.max_inventory - q)
                     if max_qty_by_cash < self.maker_size:
                         target_qty = 0.0
                     else:
                         target_qty = max(self.maker_size, min(target_qty, max_qty_by_cash))
+                        target_qty = min(target_qty, max_add_by_inventory)
                     
                     # Cancel all maker quotes to prevent fills during taker executions
                     self._cancel_bid(instructions, regime)
@@ -396,6 +419,9 @@ class ExecutionRouter:
                     # Clip target quantity by available cash balance (if buying NO)
                     if yes_shares < target_qty:
                         rem_qty = target_qty - yes_shares
+                        max_rem_by_inventory = max(0.0, self.max_inventory)
+                        rem_qty = min(rem_qty, max_rem_by_inventory)
+                        
                         no_price = 1.0 - best_bid
                         cost_per_share_no = no_price * (1.0 + self.taker_fee_multiplier * best_bid)
                         max_rem_by_cash = max(0.0, (cash_balance - self.gas_fee_usd) / cost_per_share_no)
@@ -405,6 +431,10 @@ class ExecutionRouter:
                         else:
                             target_qty = yes_shares + min(rem_qty, max_rem_by_cash)
                             
+                    if yes_shares == 0.0:
+                        max_add_by_inventory = max(0.0, self.max_inventory + q)
+                        target_qty = min(target_qty, max_add_by_inventory)
+                        
                     if target_qty < self.maker_size and yes_shares == 0.0:
                         target_qty = 0.0
                     else:
@@ -437,8 +467,8 @@ class ExecutionRouter:
                 if p_bid_post >= p_ask_post:
                     p_ask_post = p_bid_post + self.tick_size
                     
-                self._route_maker_bid(p_bid_post, instructions, regime, cash_balance)
-                self._route_maker_ask(p_ask_post, instructions, regime, yes_shares, cash_balance)
+                self._route_maker_bid(p_bid_post, instructions, regime, yes_shares, no_shares, cash_balance, divergence_scale)
+                self._route_maker_ask(p_ask_post, instructions, regime, yes_shares, cash_balance, divergence_scale)
                 
         return instructions
 
@@ -458,16 +488,35 @@ class ExecutionRouter:
             self.active_ask_price = 0.0
             self.active_ask_qty = 0.0
 
-    def _route_maker_bid(self, p_bid_target: float, instructions: List[OrderInstruction], regime: str, cash_balance: float) -> None:
+    def _route_maker_bid(
+        self,
+        p_bid_target: float,
+        instructions: List[OrderInstruction],
+        regime: str,
+        yes_shares: float,
+        no_shares: float,
+        cash_balance: float,
+        divergence_scale: float = 1.0
+    ) -> None:
+        # Enforce maximum total inventory capacity constraint (max_inventory)
+        q = yes_shares - no_shares
+        target_qty = max(0.0, self.max_inventory - q)
+        
+        # Scale target quantity by divergence scale for toxic flow protection
+        scaled_target = target_qty * divergence_scale
+        
         # Enforce minimum trade size of min_order_usd (qty * price >= min_order_usd)
         min_qty = self.min_order_usd / p_bid_target if p_bid_target > 0.0 else 0.0
-        qty = max(self.maker_size, min_qty)
+        if scaled_target < min_qty:
+            self._cancel_bid(instructions, regime)
+            return
+            
+        qty = scaled_target
         
         # Check cash constraints
         cost = qty * p_bid_target
         if cost + self.gas_fee_usd > cash_balance:
             max_qty = max(0.0, (cash_balance - self.gas_fee_usd) / p_bid_target)
-            # If the maximum possible size under cash constraint is below min_order_usd, cancel bid and skip order
             if max_qty * p_bid_target < self.min_order_usd:
                 self._cancel_bid(instructions, regime)
                 return
@@ -489,38 +538,31 @@ class ExecutionRouter:
                 self.active_bid_price = p_bid_target
                 self.active_bid_qty = qty
 
-    def _route_maker_ask(self, p_ask_target: float, instructions: List[OrderInstruction], regime: str, yes_shares: float, cash_balance: float) -> None:
-        # Enforce minimum trade size of min_order_usd
-        # If we hold enough YES shares, we can quote up to yes_shares
-        min_qty = self.min_order_usd / p_ask_target if p_ask_target > 0.0 else 0.0
-        target_qty = max(self.maker_size, min_qty)
+    def _route_maker_ask(
+        self,
+        p_ask_target: float,
+        instructions: List[OrderInstruction],
+        regime: str,
+        yes_shares: float,
+        cash_balance: float,
+        divergence_scale: float = 1.0
+    ) -> None:
+        # We can ONLY sell YES tokens we actually hold
+        if yes_shares <= 0.0:
+            self._cancel_ask(instructions, regime)
+            return
+            
+        # Scale quoting ask size by the divergence scale
+        target_qty = yes_shares * divergence_scale
         
-        if yes_shares >= target_qty:
-            qty = target_qty
-        else:
-            # We need to buy NO for the remainder (rem_qty = target_qty - yes_shares)
-            # Buying NO requires rem_qty * no_price >= min_order_usd
-            no_price = 1.0 - p_ask_target
-            min_rem_qty = self.min_order_usd / no_price if no_price > 0.0 else 0.0
+        # Enforce minimum trade size
+        min_qty = self.min_order_usd / p_ask_target if p_ask_target > 0.0 else 0.0
+        if target_qty < min_qty:
+            self._cancel_ask(instructions, regime)
+            return
             
-            # The remaining quantity of NO to buy must be at least min_rem_qty
-            rem_qty = max(target_qty - yes_shares, min_rem_qty)
-            cost = rem_qty * no_price
-            
-            if cost + self.gas_fee_usd > cash_balance:
-                max_rem = max(0.0, (cash_balance - self.gas_fee_usd) / no_price)
-                if max_rem * no_price < self.min_order_usd and yes_shares * p_ask_target < self.min_order_usd:
-                    # If both the remaining NO buy and our YES holdings are too small, cancel ask and abort
-                    self._cancel_ask(instructions, regime)
-                    return
-                elif max_rem * no_price < self.min_order_usd:
-                    # If only YES holdings are above min_order_usd, quote only yes_shares
-                    qty = yes_shares
-                else:
-                    qty = yes_shares + max_rem
-            else:
-                qty = yes_shares + rem_qty
-                
+        qty = target_qty
+        
         if not self.active_ask_id:
             self._order_counter += 1
             mock_id = f"mock_ask_{self._order_counter}"
@@ -575,7 +617,8 @@ class MakerExecutionEngine:
             fixed_horizon_sec=config.maker.FIXED_HORIZON_SEC,
             gas_fee_usd=config.arbitrage.GAS_FEE_USD,
             taker_fee_multiplier=config.arbitrage.TAKER_FEE_MULTIPLIER,
-            min_order_usd=config.arbitrage.MIN_ORDER_USD
+            min_order_usd=config.arbitrage.MIN_ORDER_USD,
+            panic_concession=config.arbitrage.PANIC_CONCESSION
         )
         # Time-sampled EWMA mid-price variance calibrator (10s sampling, alpha=0.05)
         self.mid_price_calibrator = MidPriceVolCalibrator(sampling_interval=10.0, alpha=0.05)
@@ -614,13 +657,19 @@ class MakerExecutionEngine:
         no_shares = self.client.get_position_size("NO")
         cash = self.client.cash_balance
 
-        # 4. Delegate to state-machine router
+        # 4. Get divergence scale from the shared/assigned divergence filter
+        divergence_scale = 1.0
+        if hasattr(self, "divergence_filter") and self.divergence_filter is not None:
+            divergence_scale = self.divergence_filter.last_scale
+
+        # 5. Delegate to state-machine router
         return self.execution_router.evaluate_regimes(
             p_hat=p_hat,
             sigma_sq=sigma_sq,
             context=context,
             yes_shares=yes_shares,
             no_shares=no_shares,
-            cash_balance=cash
+            cash_balance=cash,
+            divergence_scale=divergence_scale
         )
 

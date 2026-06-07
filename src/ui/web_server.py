@@ -96,12 +96,15 @@ class WebServer:
         if not self._is_running or not self.active_monitors:
             return
         try:
-            loop = asyncio.get_running_loop()
             msg = json.dumps(msg_dict)
             for ws in list(self.active_monitors):
-                loop.create_task(ws.send_str(msg))
-        except RuntimeError:
-            pass  # No running event loop
+                queue = getattr(ws, "_send_queue", None)
+                if queue is not None:
+                    try:
+                        queue.put_nowait(msg)
+                    except asyncio.QueueFull:
+                        # Drop message to prevent memory growth
+                        pass
         except Exception as e:
             logger.error(f"Error broadcasting message: {e}")
 
@@ -112,10 +115,14 @@ class WebServer:
             try:
                 if self.state_dirty and self.active_monitors:
                     msg = json.dumps(self.latest_state)
-                    # Broadcast to all active browsers concurrently
-                    tasks = [ws.send_str(msg) for ws in list(self.active_monitors)]
-                    if tasks:
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                    for ws in list(self.active_monitors):
+                        queue = getattr(ws, "_send_queue", None)
+                        if queue is not None:
+                            try:
+                                queue.put_nowait(msg)
+                            except asyncio.QueueFull:
+                                # Drop state update to prevent memory growth
+                                pass
                     self.state_dirty = False
             except Exception as e:
                 logger.error(f"Error in throttled broadcast loop: {e}")
@@ -141,12 +148,38 @@ class WebServer:
         """Manages WebSocket connection lifecycles."""
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        
+        # Create a bounded queue for this connection
+        queue = asyncio.Queue(maxsize=1000)
+        ws._send_queue = queue
         self.active_monitors.add(ws)
+        
+        # Writer task for this specific WebSocket
+        async def ws_writer():
+            try:
+                while not ws.closed:
+                    msg = await queue.get()
+                    try:
+                        # Write with timeout to prune dead/stuck clients
+                        await asyncio.wait_for(ws.send_str(msg), timeout=2.0)
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.warning(f"WebSocket send timeout or failure: {e}. Closing connection.")
+                        break
+                    finally:
+                        queue.task_done()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self.active_monitors.discard(ws)
+                if not ws.closed:
+                    await ws.close()
+
+        writer_task = asyncio.create_task(ws_writer())
         
         # Send initial state immediately if available
         if self.latest_state:
             try:
-                await ws.send_str(json.dumps(self.latest_state))
+                queue.put_nowait(json.dumps(self.latest_state))
             except Exception:
                 pass
                 
@@ -155,7 +188,13 @@ class WebServer:
                 # Do nothing, only server-to-client updates are needed
                 pass
         finally:
+            writer_task.cancel()
+            try:
+                await writer_task
+            except Exception:
+                pass
             self.active_monitors.discard(ws)
+            
         return ws
 
     def _extract_timestamp_from_path(self, file_path: str) -> Optional[float]:
@@ -318,7 +357,12 @@ class WebServer:
                 payload = {"type": "backtest_progress", "progress": pct}
                 msg = json.dumps(payload)
                 for ws in list(self.active_monitors):
-                    asyncio.run_coroutine_threadsafe(ws.send_str(msg), loop)
+                    queue = getattr(ws, "_send_queue", None)
+                    if queue is not None:
+                        try:
+                            loop.call_soon_threadsafe(queue.put_nowait, msg)
+                        except Exception:
+                            pass
                     
             def run_backtest_thread():
                 config = SystemConfig()

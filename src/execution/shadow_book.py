@@ -225,21 +225,8 @@ class ShadowOrderBook(IOrderBook):
         timestamp: float = 0.0,
     ) -> float:
         """
-        WebSocket Reconciliation — processes L2 deltas from the historical feed.
-
-        Separates concerns:
-          1. Updates V_hist (q_real) with the authoritative feed data.
-          2. Calls tracker.reconcile() for event-driven correction of V_cons.
-          3. Computes and returns smoothed OFI based on effective (V_eff) state.
-
-        Args:
-            bid_updates: List of (price, qty) from feed. qty=0 means level gone.
-            ask_updates: List of (price, qty) from feed. qty=0 means level gone.
-            is_snapshot: If True, clears all state first (cycle rollover).
-            timestamp:   Current simulation time in epoch seconds.
-
-        Returns:
-            Exponentially smoothed Order Flow Imbalance (OFI).
+        WebSocket Reconciliation — processes L2 updates.
+        Supports both live incremental deltas and backtest full snapshots.
         """
         if timestamp > 0.0:
             self._t_now = timestamp
@@ -254,30 +241,45 @@ class ShadowOrderBook(IOrderBook):
             self._tracker_bids.reset()
             self._tracker_asks.reset()
 
-        # ── Process Bid Updates ─────────────────────────────────────────────
-        for price, qty in bid_updates:
-            p = round(price, 6)
-            v_old = self.q_real_bids.get(p, 0.0)
+        is_backtest = getattr(self, "is_backtest", False)
 
-            if qty == 0.0:
-                # Level removed from feed — auto-zero V_cons via reconcile
+        # ── Process Bid Updates ─────────────────────────────────────────────
+        new_bids = {round(price, 6): float(qty) for price, qty in bid_updates}
+        
+        # If running in backtest (which streams full snapshots) or explicit is_snapshot is True,
+        # identify and delete any levels that are missing from the update.
+        if (is_backtest or is_snapshot) and self.q_real_bids:
+            removed_bids = set(self.q_real_bids.keys()) - set(new_bids.keys())
+            for p in removed_bids:
+                v_old = self.q_real_bids[p]
+                self._tracker_bids.reconcile(p, v_old, 0.0, t)
+                self.q_real_bids.pop(p, None)
+
+        for p, v_new in new_bids.items():
+            v_old = self.q_real_bids.get(p, 0.0)
+            if v_new == 0.0:
                 self._tracker_bids.reconcile(p, v_old, 0.0, t)
                 self.q_real_bids.pop(p, None)
             else:
-                v_new = float(qty)
                 self._tracker_bids.reconcile(p, v_old, v_new, t)
                 self.q_real_bids[p] = v_new
 
         # ── Process Ask Updates ─────────────────────────────────────────────
-        for price, qty in ask_updates:
-            p = round(price, 6)
-            v_old = self.q_real_asks.get(p, 0.0)
+        new_asks = {round(price, 6): float(qty) for price, qty in ask_updates}
+        
+        if (is_backtest or is_snapshot) and self.q_real_asks:
+            removed_asks = set(self.q_real_asks.keys()) - set(new_asks.keys())
+            for p in removed_asks:
+                v_old = self.q_real_asks[p]
+                self._tracker_asks.reconcile(p, v_old, 0.0, t)
+                self.q_real_asks.pop(p, None)
 
-            if qty == 0.0:
+        for p, v_new in new_asks.items():
+            v_old = self.q_real_asks.get(p, 0.0)
+            if v_new == 0.0:
                 self._tracker_asks.reconcile(p, v_old, 0.0, t)
                 self.q_real_asks.pop(p, None)
             else:
-                v_new = float(qty)
                 self._tracker_asks.reconcile(p, v_old, v_new, t)
                 self.q_real_asks[p] = v_new
  

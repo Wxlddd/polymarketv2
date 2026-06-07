@@ -86,6 +86,7 @@ class TestMakerExecution(unittest.TestCase):
             asks_l2=[(0.57, 500.0)]
         )
         
+        # Test case 1: yes_shares = 0.0 (only bid is quoted, ask is cancelled/skipped)
         instructions = self.router.evaluate_regimes(
             p_hat=0.55,
             sigma_sq=0.25,
@@ -95,11 +96,25 @@ class TestMakerExecution(unittest.TestCase):
             cash_balance=1000.0
         )
         
-        self.assertEqual(len(instructions), 2)
+        self.assertEqual(len(instructions), 1)
         bid_instr = next(x for x in instructions if x.side == "BUY_YES")
-        ask_instr = next(x for x in instructions if x.side == "SELL_YES")
         self.assertEqual(bid_instr.action, "NEW")
-        self.assertEqual(ask_instr.action, "NEW")
+        
+        # Test case 2: yes_shares = 100.0 (both bid and ask are quoted)
+        self.router.reset_active_orders()
+        instructions_with_shares = self.router.evaluate_regimes(
+            p_hat=0.60,
+            sigma_sq=0.25,
+            context=context,
+            yes_shares=100.0,
+            no_shares=0.0,
+            cash_balance=1000.0
+        )
+        self.assertEqual(len(instructions_with_shares), 2)
+        bid_instr2 = next(x for x in instructions_with_shares if x.side == "BUY_YES")
+        ask_instr2 = next(x for x in instructions_with_shares if x.side == "SELL_YES")
+        self.assertEqual(bid_instr2.action, "NEW")
+        self.assertEqual(ask_instr2.action, "NEW")
 
     def test_regime_b_taker_mode_buy(self):
         context = MarketContext(
@@ -233,6 +248,64 @@ class TestMakerExecution(unittest.TestCase):
         for instr in instructions_none:
             self.assertEqual(instr.action, "CANCEL")
             self.assertEqual(instr.regime, "SAFE")
+
+    def test_mock_client_maker_execution(self):
+        from src.execution.clients import MockExecutionClient
+        from src.execution.shadow_book import ShadowOrderBook
+        from src.logging.recorder import DataRecorder
+        import asyncio
+
+        config = SystemConfig()
+        
+        recorder = DataRecorder(
+            base_log_dir=config.LOG_DIR,
+            strategy_name="test_maker",
+            run_id="test_run_maker",
+            buffer_size=1
+        )
+        
+        shadow_book = ShadowOrderBook()
+        shadow_book.update_book(
+            bid_updates=[(0.45, 1000.0)],
+            ask_updates=[(0.47, 1000.0)],
+            is_snapshot=True
+        )
+        
+        client = MockExecutionClient(config, recorder, shadow_book)
+        initial_cash = client.cash_balance
+        
+        context_state = {
+            "timestamp": 1000.0,
+            "strike_price": 60000.0,
+            "volatility": 0.25
+        }
+        
+        async def run_maker_trade():
+            return await client.execute_trade(
+                side="BUY_YES",
+                qty=100.0,
+                price=0.46,
+                ev=0.1,
+                expected_slippage_bps=0.0,
+                context_state=context_state,
+                is_maker=True
+            )
+            
+        loop = asyncio.get_event_loop()
+        res = loop.run_until_complete(run_maker_trade())
+        
+        self.assertTrue(res["success"])
+        self.assertEqual(res["qty"], 100.0)
+        self.assertEqual(res["price"], 0.46)
+        self.assertEqual(res["realized_slippage_bps"], 0.0)
+        
+        expected_cash = initial_cash - (100.0 * 0.46 + 0.03)
+        self.assertAlmostEqual(client.cash_balance, expected_cash)
+        self.assertEqual(client.get_position_size("YES"), 100.0)
+        self.assertEqual(client.entry_prices["YES"], 0.46)
+        
+        asks = shadow_book.get_sorted_asks()
+        self.assertEqual(asks[0][1], 1000.0)
 
 if __name__ == '__main__':
     unittest.main()

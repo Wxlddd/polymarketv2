@@ -5,6 +5,7 @@ from typing import Dict, Any, Tuple, Optional, List
 from config.settings import SystemConfig
 from src.core.market_context import MarketContext
 from src.core.interfaces import IExecutionClient
+from src.execution.divergence_filter import DivergenceVelocityFilter
 
 logger = logging.getLogger("ExecutionEngine")
 
@@ -17,6 +18,7 @@ class ExecutionEngine:
     
     def __init__(self, config: SystemConfig):
         self.config = config
+        self.divergence_filter = DivergenceVelocityFilter(config)
         self.spot_history: List[Tuple[float, float]] = []  # (timestamp, price)
 
         # Staleness track memory
@@ -179,13 +181,15 @@ class ExecutionEngine:
         # Phase 2: Hard Liquidation Sweep (Panic Sweep)
         is_panic_unwind = (tau_seconds <= 15.0) or (tau_seconds <= 45.0 and spread > 0.10)
         if is_panic_unwind:
+            concession = self.config.arbitrage.PANIC_CONCESSION
             if abs(q) > 0.0:
                 if q > 0:
                     # We hold YES, must sell YES immediately
+                    limit_price = max(0.01, p_yes - concession)
                     return {
                         "side": "SELL_YES",
                         "size": float(qty_yes),
-                        "limit_price": float(best_bid_val),
+                        "limit_price": float(limit_price),
                         "vwap": float(best_bid_val),
                         "ev": 999.0,
                         "expected_slippage_bps": 0.0,
@@ -195,10 +199,11 @@ class ExecutionEngine:
                     }
                 else:
                     # We hold NO, must buy YES to flatten inventory
+                    limit_price = min(0.99, p_yes + concession)
                     return {
                         "side": "BUY_YES",
                         "size": float(qty_no),
-                        "limit_price": float(best_ask_val),
+                        "limit_price": float(limit_price),
                         "vwap": float(best_ask_val),
                         "ev": 999.0,
                         "expected_slippage_bps": 0.0,
@@ -261,10 +266,26 @@ class ExecutionEngine:
         w_current_no = (qty_no * p_ask_no) / wealth if wealth > 0.0 else 0.0
         
         # Raw unconstrained Kelly targets (can be negative if overvalued)
-        f_star_yes = gamma * (p_yes - p_ask_yes) / (1.0 - p_ask_yes) if p_ask_yes < 1.0 else 0.0
+        f_star_yes_raw = gamma * (p_yes - p_ask_yes) / (1.0 - p_ask_yes) if p_ask_yes < 1.0 else 0.0
         
         p_no = 1.0 - p_yes
-        f_star_no = gamma * (p_no - p_ask_no) / (1.0 - p_ask_no) if p_ask_no < 1.0 else 0.0
+        f_star_no_raw = gamma * (p_no - p_ask_no) / (1.0 - p_ask_no) if p_ask_no < 1.0 else 0.0
+
+        # Compute market implied price to feed to the divergence filter
+        if best_bid[0] is not None and best_ask[0] is not None:
+            p_mkt = 0.5 * (best_bid[0] + best_ask[0])
+        elif best_bid[0] is not None:
+            p_mkt = best_bid[0]
+        elif best_ask[0] is not None:
+            p_mkt = best_ask[0]
+        else:
+            p_mkt = p_yes
+
+        divergence_scale, v_t, a_t = self.divergence_filter.get_scale(p_yes, p_mkt, t_now)
+
+        # Scale Kelly fraction
+        f_star_yes = f_star_yes_raw * divergence_scale
+        f_star_no = f_star_no_raw * divergence_scale
         
         # Apply 2026 Polymarket taker fee regularization buffer delta = taker_fee_multiplier * gamma
         taker_fee_multiplier = self.config.arbitrage.TAKER_FEE_MULTIPLIER
@@ -298,19 +319,50 @@ class ExecutionEngine:
             theoretical_edge_bps = edge_yes * 10000.0
             kelly_alloc = target_w_yes
             target_price = p_yes
+            active_raw_kelly = f_star_yes_raw
+            active_side = "YES"
         elif edge_no > edge_yes and edge_no > 0.0:
             theoretical_edge_bps = edge_no * 10000.0
             kelly_alloc = target_w_no
             target_price = p_no
+            active_raw_kelly = f_star_no_raw
+            active_side = "NO"
         else:
             if edge_yes > edge_no:
                 theoretical_edge_bps = max(0.0, edge_yes) * 10000.0
                 kelly_alloc = target_w_yes
                 target_price = p_yes
+                active_raw_kelly = f_star_yes_raw
+                active_side = "YES"
             else:
                 theoretical_edge_bps = max(0.0, edge_no) * 10000.0
                 kelly_alloc = target_w_no
                 target_price = p_no
+                active_raw_kelly = f_star_no_raw
+                active_side = "NO"
+
+        adjusted_kelly_fraction = active_raw_kelly * divergence_scale
+
+        logger.info(
+            f"[DivergenceFilter] Tick: v_t={v_t:.6f}, a_t={a_t:.6f}, scale={divergence_scale:.4f}, "
+            f"adj_kelly={adjusted_kelly_fraction:.4f}"
+        )
+
+        min_kelly = self.config.risk.MIN_KELLY_THRESHOLD
+        if adjusted_kelly_fraction < min_kelly and active_raw_kelly > 0.0:
+            logger.warning(
+                f"[DivergenceFilter] Execution BLOCKED: side={active_side}, "
+                f"adj_kelly={adjusted_kelly_fraction:.4f} < min_threshold={min_kelly:.4f} "
+                f"(raw_kelly={active_raw_kelly:.4f}, v_t={v_t:.6f}, a_t={a_t:.6f}, scale={divergence_scale:.4f})"
+            )
+            return {
+                "side": "HOLD",
+                "reason": "REJECT_DIVERGENCE_VELOCITY",
+                "size": 0.0,
+                "kelly_alloc": kelly_alloc,
+                "vwap": target_price,
+                "theoretical_edge_bps": theoretical_edge_bps
+            }
 
         # 2. Pin Risk (Oracle Jitter) Quantitative Protection
         pin_risk_window = self.config.risk.PIN_RISK_SECONDS
@@ -479,7 +531,8 @@ class ExecutionEngine:
             # Sizing limit caps
             q_max_by_cap = max(0.0, (W - gas) / p_ask_yes) if p_ask_yes > 0.0 else 0.0
             q_max_by_risk = self.config.arbitrage.MAX_POSITION_SIZE_USD / p_ask_yes if p_ask_yes > 0.0 else 0.0
-            dq_yes = min(dq_yes, q_max_by_cap, q_max_by_risk)
+            max_add_by_risk = max(0.0, q_max_by_risk - qty_yes)
+            dq_yes = min(dq_yes, q_max_by_cap, max_add_by_risk)
             
             # Sweeping order book to calculate fill price & actual slippage
             edge_bps = (p_yes - p_ask_yes) * 10000.0
@@ -521,7 +574,8 @@ class ExecutionEngine:
             
             q_max_by_cap = max(0.0, (W - gas) / p_ask_no) if p_ask_no > 0.0 else 0.0
             q_max_by_risk = self.config.arbitrage.MAX_POSITION_SIZE_USD / p_ask_no if p_ask_no > 0.0 else 0.0
-            dq_no = min(dq_no, q_max_by_cap, q_max_by_risk)
+            max_add_by_risk = max(0.0, q_max_by_risk - qty_no)
+            dq_no = min(dq_no, q_max_by_cap, max_add_by_risk)
             
             edge_bps = (p_no - p_ask_no) * 10000.0
             max_slippage_bps = min(edge_bps - costi_rete_bps - min_margin, abs_max_slippage)

@@ -98,6 +98,11 @@ def parse_args():
     return parser.parse_args()
 
 async def main():
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+    )
     args = parse_args()
     print("=== Polymarket V2 Backtest Replay ===")
     
@@ -215,7 +220,21 @@ async def main():
             
     # 3. Run event-driven simulation
     print(f"Starting execution simulation on {len(aligned_df)} ticks...")
-    results = await runner.run(aligned_df)
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task("[cyan]Simulating ticks...", total=100)
+        
+        def update_progress(pct: int):
+            progress.update(task, completed=pct)
+            
+        results = await runner.run(aligned_df, progress_callback=update_progress)
     
     # 4. Output statistics
     print("\n==============================================")

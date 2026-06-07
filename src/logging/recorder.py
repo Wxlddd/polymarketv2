@@ -44,6 +44,21 @@ class DataRecorder(IDataRecorder):
         # In-memory buffer for ticks
         self.tick_buffer: List[Dict[str, Any]] = []
         
+        import pyarrow as pa
+        self._arrow_schema = pa.schema([
+            ('timestamp', pa.float64()),
+            ('spot_price', pa.float64()),
+            ('best_bid', pa.float64()),
+            ('best_bid_qty', pa.float64()),
+            ('best_ask', pa.float64()),
+            ('best_ask_qty', pa.float64()),
+            ('ofi', pa.float64()),
+            ('volatility', pa.float64()),
+            ('bids_l2', pa.string()),
+            ('asks_l2', pa.string())
+        ])
+        self.writer = None
+        
         # Initialize CSV files with headers
         self._init_csv_files()
         
@@ -53,6 +68,9 @@ class DataRecorder(IDataRecorder):
         if today_str != self.current_date:
             # 1. Flush any buffered ticks first
             self._flush_ticks_to_parquet()
+            if self.writer is not None:
+                self.writer.close()
+                self.writer = None
             
             # 2. Update current date and logging directory
             print(f"[DataRecorder] Midnight rollover detected. Moving from {self.current_date} to {today_str}")
@@ -201,56 +219,46 @@ class DataRecorder(IDataRecorder):
             print(f"[DataRecorder Error] Failed to write trade to CSV: {e}")
 
     def _flush_ticks_to_parquet(self) -> None:
-        """Writes buffered ticks into a compressed Parquet database file using Polars."""
+        """Writes buffered ticks into a compressed Parquet database file using PyArrow ParquetWriter."""
         if not self.tick_buffer:
             return
             
         try:
-            schema = {
-                "timestamp": pl.Float64,
-                "spot_price": pl.Float64,
-                "best_bid": pl.Float64,
-                "best_bid_qty": pl.Float64,
-                "best_ask": pl.Float64,
-                "best_ask_qty": pl.Float64,
-                "ofi": pl.Float64,
-                "volatility": pl.Float64,
-                "bids_l2": pl.String,
-                "asks_l2": pl.String
-            }
-            new_df = pl.DataFrame(self.tick_buffer, schema=schema)
+            import pyarrow as pa
+            import pyarrow.parquet as pq
             
-            if os.path.exists(self.ticks_path):
-                try:
-                    existing_df = pl.read_parquet(self.ticks_path)
-                    combined_df = pl.concat([existing_df, new_df])
-                    
-                    # Write to a temporary file first to avoid self-locking/read-locks on Windows
-                    temp_path = self.ticks_path + ".tmp"
-                    combined_df.write_parquet(temp_path, compression="zstd")
-                    
-                    # Atomic swap (guaranteed safe on Windows via os.replace)
-                    os.replace(temp_path, self.ticks_path)
-                except Exception as e:
-                    # If reading or writing the main file fails (e.g. file lock on Windows),
-                    # write to a new 'recovery' chunk to avoid losing data and prevent 
-                    # the buffer from growing indefinitely.
-                    ts_suffix = int(time.time() * 1000)
-                    recovery_path = self.ticks_path.replace(".parquet", f"_rec_{ts_suffix}.parquet")
-                    print(f"[DataRecorder Warning] Main Parquet lock/error, using recovery: {recovery_path} ({e})")
-                    new_df.write_parquet(recovery_path, compression="zstd")
-            else:
-                new_df.write_parquet(self.ticks_path, compression="zstd")
-                
+            # Map tick dictionary buffer to Arrow format
+            data_dict = {col: [] for col in self._arrow_schema.names}
+            for tick in self.tick_buffer:
+                for col in self._arrow_schema.names:
+                    data_dict[col].append(tick.get(col, None))
+            
+            table = pa.Table.from_pydict(data_dict, schema=self._arrow_schema)
+            
+            if self.writer is None:
+                # If file exists at startup, load existing data to initialize writer cleanly
+                if os.path.exists(self.ticks_path) and os.path.getsize(self.ticks_path) > 0:
+                    try:
+                        existing_table = pq.read_table(self.ticks_path)
+                        self.writer = pq.ParquetWriter(self.ticks_path, self._arrow_schema, compression="zstd")
+                        self.writer.write_table(existing_table)
+                    except Exception as e:
+                        # Fail-safe fallback if the file is corrupted
+                        self.writer = pq.ParquetWriter(self.ticks_path, self._arrow_schema, compression="zstd")
+                else:
+                    self.writer = pq.ParquetWriter(self.ticks_path, self._arrow_schema, compression="zstd")
+            
+            self.writer.write_table(table)
             self.tick_buffer.clear()
         except Exception as e:
-            # Critical failure (e.g. OOM or Schema error in DataFrame creation)
             print(f"[DataRecorder Error] CRITICAL failure to write Parquet log: {e}")
-            # Clear buffer if it gets too large to prevent memory leak
             if len(self.tick_buffer) > self.buffer_size * 5:
                 print(f"[DataRecorder Error] Tick buffer cleared due to persistent failures to save memory.")
                 self.tick_buffer.clear()
 
     def flush(self) -> None:
-        """Forces all buffered records to disk."""
+        """Forces all buffered records to disk and closes the active file writer."""
         self._flush_ticks_to_parquet()
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None

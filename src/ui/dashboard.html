@@ -541,7 +541,15 @@
               </tr>
               <tr>
                 <td class="dim">Engine Status:</td>
-                <td id="eng-reason" class="dim" colspan="3">—</td>
+                <td id="eng-reason" class="dim">—</td>
+                <td class="dim">Kelly Scale:</td>
+                <td id="eng-div-scale" class="bold white">—</td>
+              </tr>
+              <tr>
+                <td class="dim">Divergence:</td>
+                <td id="eng-div" class="white">—</td>
+                <td class="dim">Div Velocity:</td>
+                <td id="eng-div-velocity" class="white">—</td>
               </tr>
             </table>
           </div>
@@ -768,6 +776,9 @@
     engQtyNo: document.getElementById('eng-qty-no'),
     engMargin: document.getElementById('eng-margin'),
     engReason: document.getElementById('eng-reason'),
+    engDivScale: document.getElementById('eng-div-scale'),
+    engDiv: document.getElementById('eng-div'),
+    engDivVelocity: document.getElementById('eng-div-velocity'),
     logsBox: document.getElementById('logs-box'),
     progressWrap: document.getElementById('bt-progress-wrap'),
     progressBar: document.getElementById('bt-progress-bar')
@@ -889,6 +900,16 @@
     els.engReason.textContent = dec.reason || 'NO_SIGNAL';
     els.engQtyYes.textContent = state.pos_qty_yes ? state.pos_qty_yes.toFixed(1) : '0.0';
     els.engQtyNo.textContent = state.pos_qty_no ? state.pos_qty_no.toFixed(1) : '0.0';
+
+    const divScale = state.divergence_scale !== undefined ? state.divergence_scale : 1.0;
+    els.engDivScale.textContent = (divScale * 100).toFixed(1) + '%';
+    els.engDivScale.className = 'bold ' + (divScale >= 0.9 ? 'green' : divScale > 0.0 ? 'amber' : 'red');
+
+    const divVal = state.divergence !== undefined ? state.divergence : 0.0;
+    els.engDiv.textContent = (divVal >= 0 ? '+' : '') + (divVal * 100).toFixed(2) + '%';
+
+    const divVel = state.divergence_velocity !== undefined ? state.divergence_velocity : 0.0;
+    els.engDivVelocity.textContent = (divVel >= 0 ? '+' : '') + (divVel * 100).toFixed(3) + ' pts/s';
 
     // 5.5 HFT quality and toxicity metrics update
     if (state.hft_metrics) {

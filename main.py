@@ -13,6 +13,7 @@ from src.strategies.factory import StrategyFactory
 from src.execution.shadow_book import ShadowOrderBook
 from src.execution.clients import MockExecutionClient
 from src.execution.engine import ExecutionEngine
+from src.execution.divergence_filter import DivergenceVelocityFilter
 from src.logging.recorder import DataRecorder
 from src.ui.dashboard import run_terminal_dashboard
 from src.ui.web_server import WebServer
@@ -57,11 +58,14 @@ class LiveOrchestrator:
         self.shadow_book = ShadowOrderBook()
         self.strategy = StrategyFactory.get_strategy(config.STRATEGY_NAME, config)
         self.client = MockExecutionClient(config, self.recorder, self.shadow_book)
+        self.divergence_filter = DivergenceVelocityFilter(config)
         if config.maker.ENABLED:
             from src.execution.maker_execution import MakerExecutionEngine
             self.engine = MakerExecutionEngine(self.strategy, self.client, config)
+            self.engine.divergence_filter = self.divergence_filter
         else:
             self.engine = ExecutionEngine(config)
+            self.engine.divergence_filter = self.divergence_filter
         self.strike_manager: Optional[StrikeManager] = None
         self.waiting_for_first_rollover = False
         self.total_trades = 0
@@ -89,6 +93,7 @@ class LiveOrchestrator:
         # Time-based EMA state for p_yes smoothing.
         # Timestamp of the previous p_yes update, needed to compute dt for alpha.
         self._smoothed_p_yes_ts: float = 0.0
+        self._last_processed_expiry: Optional[int] = None
 
         # Safety cooldown tracking to prevent infinite rapid-fire taker order spamming on rejections
         self._last_rejection_time: Dict[str, float] = {}
@@ -420,6 +425,10 @@ class LiveOrchestrator:
             "latest_decision": decision,
             "pos_qty_yes": pos_qty_yes,
             "pos_qty_no": pos_qty_no,
+            "divergence": self.divergence_filter.last_divergence,
+            "divergence_velocity": self.divergence_filter.last_velocity,
+            "divergence_acceleration": self.divergence_filter.last_acceleration,
+            "divergence_scale": self.divergence_filter.last_scale,
             "hft_metrics": hft_payload
         }
         self.web_server.update_state(state)
@@ -463,6 +472,16 @@ class LiveOrchestrator:
             return
 
         t_now = time.time()
+
+        # Check if the active expiry has changed. If so, immediately reset the smoothed probability and strategy state.
+        current_expiry = self.strike_manager.expiration_timestamp if self.strike_manager else None
+        if current_expiry is not None:
+            if not hasattr(self, "_last_processed_expiry") or self._last_processed_expiry != current_expiry:
+                self._last_processed_expiry = current_expiry
+                self._smoothed_p_yes = None
+                self._smoothed_p_yes_ts = 0.0
+                self.strategy.reset()
+                self.log_message("info", f"[Reset] New expiry cycle detected in CLOB callback: {current_expiry}. Resetting smoothed probability and strategy state.")
 
         if self.waiting_for_first_rollover:
             if t_now - getattr(self, "_last_wait_log_time", 0.0) >= 15.0:
@@ -616,6 +635,10 @@ class LiveOrchestrator:
         self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks)
         
         p_mkt = self._get_market_implied_price(p_yes)
+        
+        # Update divergence filter on every tick
+        if p_yes is not None and p_mkt is not None:
+            self.divergence_filter.get_scale(p_yes, p_mkt, t_now)
 
         # Evaluate Trade Sizing and Execution
         if self.config.maker.ENABLED:
@@ -770,18 +793,25 @@ class LiveOrchestrator:
                             "signal": {"side": "BUY_YES", "size": active_bid_q, "vwap": active_bid_p, "ev": p_yes - active_bid_p if p_yes is not None else 0.0}
                         })
                         
-                    await self.client.execute_trade(
-                        side="BUY_YES",
-                        qty=active_bid_q,
-                        price=active_bid_p,
-                        ev=p_yes - active_bid_p if p_yes is not None else 0.0,
-                        expected_slippage_bps=0.0,
-                        context_state={"timestamp": t_now, "strike_price": active_strike}
-                    )
+                    # Store execution parameters and clear state BEFORE await
+                    exec_qty = active_bid_q
+                    exec_price = active_bid_p
+                    exec_ev = p_yes - active_bid_p if p_yes is not None else 0.0
+                    
                     self.engine.execution_router.active_bid_id = ""
                     self.engine.execution_router.active_bid_price = 0.0
                     self.engine.execution_router.active_bid_qty = 0.0
                     self._current_active_orders["bid"] = None
+                    
+                    await self.client.execute_trade(
+                        side="BUY_YES",
+                        qty=exec_qty,
+                        price=exec_price,
+                        ev=exec_ev,
+                        expected_slippage_bps=0.0,
+                        context_state={"timestamp": t_now, "strike_price": active_strike},
+                        is_maker=True
+                    )
 
             # Check Sell Fill
             order_ask = self._current_active_orders["ask"]
@@ -797,10 +827,10 @@ class LiveOrchestrator:
                 if yes_shares < active_ask_q:
                     rem_qty = active_ask_q - yes_shares
                     no_price = 1.0 - active_ask_p
-                    fee = rem_qty * self.engine.execution_router.taker_fee_multiplier * no_price * (1.0 - no_price)
-                    cost = rem_qty * no_price + self.config.arbitrage.GAS_FEE_USD + fee
+                    # Maker execution: no taker fee is charged
+                    cost = rem_qty * no_price + self.config.arbitrage.GAS_FEE_USD
                     if cost > self.client.cash_balance:
-                        cost_per_share_no = no_price * (1.0 + self.engine.execution_router.taker_fee_multiplier * active_ask_p)
+                        cost_per_share_no = no_price
                         max_rem = max(0.0, (self.client.cash_balance - self.config.arbitrage.GAS_FEE_USD) / cost_per_share_no)
                         active_ask_q = yes_shares + max_rem
                         if active_ask_q < 1e-5 or (yes_shares == 0.0 and max_rem * no_price < 5.0):
@@ -844,40 +874,49 @@ class LiveOrchestrator:
                             "signal": {"side": "SELL_YES", "size": active_ask_q, "vwap": active_ask_p, "ev": active_ask_p - p_yes if p_yes is not None else 0.0}
                         })
                         
+                    # Store execution parameters and clear state BEFORE await
+                    exec_qty = active_ask_q
+                    exec_price = active_ask_p
+                    exec_ev = active_ask_p - p_yes if p_yes is not None else 0.0
                     yes_shares = self.client.get_position_size("YES")
-                    if yes_shares >= active_ask_q:
+                    
+                    self.engine.execution_router.active_ask_id = ""
+                    self.engine.execution_router.active_ask_price = 0.0
+                    self.engine.execution_router.active_ask_qty = 0.0
+                    self._current_active_orders["ask"] = None
+                    
+                    if yes_shares >= exec_qty:
                         await self.client.execute_trade(
                             side="SELL_YES",
-                            qty=active_ask_q,
-                            price=active_ask_p,
-                            ev=active_ask_p - p_yes if p_yes is not None else 0.0,
+                            qty=exec_qty,
+                            price=exec_price,
+                            ev=exec_ev,
                             expected_slippage_bps=0.0,
-                            context_state={"timestamp": t_now, "strike_price": active_strike}
+                            context_state={"timestamp": t_now, "strike_price": active_strike},
+                            is_maker=True
                         )
                     else:
                         if yes_shares > 0.0:
                             await self.client.execute_trade(
                                 side="SELL_YES",
                                 qty=yes_shares,
-                                price=active_ask_p,
-                                ev=active_ask_p - p_yes if p_yes is not None else 0.0,
+                                price=exec_price,
+                                ev=exec_ev,
                                 expected_slippage_bps=0.0,
-                                context_state={"timestamp": t_now, "strike_price": active_strike}
+                                context_state={"timestamp": t_now, "strike_price": active_strike},
+                                is_maker=True
                             )
-                        rem_q = active_ask_q - yes_shares
-                        no_price = 1.0 - active_ask_p
+                        rem_q = exec_qty - yes_shares
+                        no_price = 1.0 - exec_price
                         await self.client.execute_trade(
                             side="BUY_NO",
                             qty=rem_q,
                             price=no_price,
                             ev=(1.0 - p_yes) - no_price if p_yes is not None else 0.0,
                             expected_slippage_bps=0.0,
-                            context_state={"timestamp": t_now, "strike_price": active_strike}
+                            context_state={"timestamp": t_now, "strike_price": active_strike},
+                            is_maker=True
                         )
-                    self.engine.execution_router.active_ask_id = ""
-                    self.engine.execution_router.active_ask_price = 0.0
-                    self.engine.execution_router.active_ask_qty = 0.0
-                    self._current_active_orders["ask"] = None
 
             # B. Generate and process new quoting instructions
             instructions = self.engine.evaluate_and_route(context)

@@ -72,7 +72,7 @@ class IExecutionClient(ABC):
         pass
 
     @abstractmethod
-    async def execute_trade(self, side: str, qty: float, price: float, ev: float, expected_slippage_bps: float, context_state: Dict[str, Any]) -> Dict[str, Any]:
+    async def execute_trade(self, side: str, qty: float, price: float, ev: float, expected_slippage_bps: float, context_state: Dict[str, Any], is_maker: bool = False) -> Dict[str, Any]:
         """
         Executes a paper or live trade.
         Returns a dictionary summarizing execution details (fill price, real slippage, pnl).
