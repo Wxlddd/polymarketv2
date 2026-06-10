@@ -235,18 +235,15 @@ class HawkesMertonCharacteristicFunction:
         kappa_plus = np.exp(mu_j_plus + 0.5 * sigma_j_plus**2) - 1.0
         kappa_minus = np.exp(mu_j_minus + 0.5 * sigma_j_minus**2) - 1.0
         
-        # Drift component in log-price: b = mu - lambda_plus * kappa_plus - lambda_minus * kappa_minus - 0.5 * sigma^2
-        #
-        # MATHEMATICAL NOTE ON MARTINGALE COMPENSATOR:
-        # Under standard Gil-Pelaez option pricing, the drift component 'mu' is assumed to be either
-        # constant or a deterministic function of time over the integration horizon tau.
-        # By setting use_local_drift = True, we introduce an instantaneous OFI-modulated stochastic drift
-        # mu_t = r + ofi_multiplier * ofi. Freezing this instantaneous mu_t over the entire remaining
-        # maturity tau is a local approximation. This approximation holds very well in high-frequency trading
-        # contexts (e.g. Polymarket V2) where tau is small and we continuously re-evaluate the expectation
-        # tick-by-tick.
-        b = mu - lambda_plus * kappa_plus - lambda_minus * kappa_minus - 0.5 * sigma**2
-        
+        # MATHEMATICAL NOTE ON MARTINGALE COMPENSATOR (P-MEASURE FIX):
+        # Under standard Gil-Pelaez option pricing, we use a Q-measure Risk-Neutral world 
+        # where the compensator (lambda * kappa) offsets jumps to maintain a martingale.
+        # However, for prediction markets we predict real-world probabilities (P-measure).
+        # We WANT the asymmetric jumps to shift the asset drift directionally. 
+        # Using a Q-measure compensator caused an "Inversion Bug" where positive jumps 
+        # dragged continuous drift negatively, making p_hat drop instead of rise.
+        # We remove the jump compensators to properly model the real-world drift.
+        b = mu - 0.5 * sigma**2        
         # Continuous diffusion part
         diffusion = 1j * u * x0 + 1j * u * b * tau - 0.5 * (sigma**2) * (u**2) * tau
         

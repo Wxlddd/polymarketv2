@@ -59,13 +59,8 @@ class LiveOrchestrator:
         self.strategy = StrategyFactory.get_strategy(config.STRATEGY_NAME, config)
         self.client = MockExecutionClient(config, self.recorder, self.shadow_book)
         self.divergence_filter = DivergenceVelocityFilter(config)
-        if config.maker.ENABLED:
-            from src.execution.maker_execution import MakerExecutionEngine
-            self.engine = MakerExecutionEngine(self.strategy, self.client, config)
-            self.engine.divergence_filter = self.divergence_filter
-        else:
-            self.engine = ExecutionEngine(config)
-            self.engine.divergence_filter = self.divergence_filter
+        self.engine = ExecutionEngine(self.strategy, self.client, config)
+        self.engine.divergence_filter = self.divergence_filter
         self.strike_manager: Optional[StrikeManager] = None
         self.waiting_for_first_rollover = False
         self.total_trades = 0
@@ -81,8 +76,11 @@ class LiveOrchestrator:
             "total_taker_slippage": 0.0,
             "total_taker_trades": 0,
             "total_orders_sent": 0,
-            "total_orders_cancelled": 0
+            "total_orders_cancelled": 0,
+            "tps": 0.0
         }
+        self._tick_count_tps = 0
+        self._last_tps_time = time.time()
         self._current_active_orders = {
             "bid": None, # dict or None: {"price": P, "qty": Q, "queue_ahead": qa, "prev_depth": pd}
             "ask": None  # dict or None: {"price": P, "qty": Q, "queue_ahead": qa, "prev_depth": pd}
@@ -334,7 +332,7 @@ class LiveOrchestrator:
         # 1. Limit Order Fill Rate
         vol_touched = self.hft_metrics["volume_sent_touched"]
         vol_executed = self.hft_metrics["volume_executed"]
-        fill_rate = vol_executed / vol_touched if vol_touched > 0.0 else (1.0 if self.config.maker.ENABLED else 0.0)
+        fill_rate = vol_executed / vol_touched if vol_touched > 0.0 else 1.0
         
         # 2. MTM Post-Fill (1s, 5s, 15s)
         all_mtm_trades = self.hft_metrics["completed_mtm_trades"] + self.hft_metrics["pending_mtm_trades"]
@@ -398,7 +396,8 @@ class LiveOrchestrator:
             "pnl_divergence": pnl_divergence,
             "otr": otr,
             "total_orders_sent": self.hft_metrics["total_orders_sent"],
-            "total_orders_cancelled": self.hft_metrics["total_orders_cancelled"]
+            "total_orders_cancelled": self.hft_metrics["total_orders_cancelled"],
+            "tps": self.hft_metrics.get("tps", 0.0)
         }
             
         state = {
@@ -472,6 +471,7 @@ class LiveOrchestrator:
             return
 
         t_now = time.time()
+        self._tick_count_tps += 1
 
         # Check if the active expiry has changed. If so, immediately reset the smoothed probability and strategy state.
         current_expiry = self.strike_manager.expiration_timestamp if self.strike_manager else None
@@ -587,6 +587,14 @@ class LiveOrchestrator:
         # Calculate time remaining
         tau_sec = max(0.0, self.market_manager.current_expiry - t_now)
         
+        # Log position in the final 60 seconds before settlement
+        if tau_sec <= 60.0 and not getattr(self, "logged_60s_position", False):
+            q_yes = self.client.positions.get("YES", 0.0)
+            q_no = self.client.positions.get("NO", 0.0)
+            net_q = q_yes - q_no
+            self.log_message("warning", f"POSITION_60S_BEFORE_SETTLE: Net Position: {net_q} (YES: {q_yes}, NO: {q_no})")
+            self.logged_60s_position = True
+        
         # Calibrate volatility
         self.strategy.vol_calibrator.add_tick(spot, t_now)
         vol = self.strategy.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
@@ -670,6 +678,8 @@ class LiveOrchestrator:
                         strike=active_strike,
                         model_prob=p_yes,
                         implied_prob=p_mkt_fill if p_mkt_fill is not None else p_yes,
+                        micro_price=getattr(self.engine.execution_router, "latest_micro_price", None) or 0.0,
+                        p_val=getattr(self.engine.execution_router, "latest_p_val", None) or 0.0,
                         kelly_size=result["qty"],
                         status=status_str
                     )
@@ -719,6 +729,8 @@ class LiveOrchestrator:
                     strike=active_strike,
                     model_prob=p_yes,
                     implied_prob=p_mkt_exec if p_mkt_exec is not None else p_yes,
+                    micro_price=getattr(self.engine.execution_router, "latest_micro_price", None) or 0.0,
+                    p_val=getattr(self.engine.execution_router, "latest_p_val", None) or 0.0,
                     kelly_size=res["qty"],
                     status=status_str
                 )
@@ -768,6 +780,7 @@ class LiveOrchestrator:
                 rollover = await self.market_manager.update_market_cycle(t_now)
                 if rollover:
                     self.waiting_for_first_rollover = False
+                    self.logged_60s_position = False
                     self.log_message(
                         "info",
                         f"Market Rollover detected. New active cycle expiry: {self.market_manager.current_expiry} | "
@@ -890,9 +903,11 @@ class LiveOrchestrator:
                     self._smoothed_p_yes = None
                     self._smoothed_p_yes_ts = 0.0
                     self.strategy.reset()
-                    if self.config.maker.ENABLED and hasattr(self.engine, "reset"):
+                    if hasattr(self.engine, "reset"):
                         self.engine.reset()
                     self._current_active_orders = {"bid": None, "ask": None}
+                    if hasattr(self.client, "cancel_all_orders"):
+                        self.client.cancel_all_orders()
 
 
                     # 3. Restart CLOB feed to subscribe to new tokens
@@ -963,6 +978,13 @@ class LiveOrchestrator:
         """Periodically pushes state to the Web UI even if no market ticks arrive, preventing UI freeze."""
         while self.is_running:
             try:
+                t_now = time.time()
+                dt = t_now - self._last_tps_time
+                if dt >= 1.0:
+                    self.hft_metrics["tps"] = self._tick_count_tps / dt
+                    self._tick_count_tps = 0
+                    self._last_tps_time = t_now
+                
                 if self.web_server:
                     self._update_web_state()
             except asyncio.CancelledError:
