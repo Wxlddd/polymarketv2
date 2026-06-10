@@ -73,6 +73,9 @@ $$\mu_t = r + \text{OFI}_{\text{smoothed}} \cdot \gamma \cdot (365.25 \times 24 
 
 The resulting Merton probability is stabilized with a time-based EMA filter with an adaptive half-life (compressed near expiry).
 
+### 5. P-Measure vs Q-Measure Pricing
+Unlike traditional derivatives pricing which relies on Risk-Neutral (Q-measure) valuation using a martingale compensator, Polymarket binary options require predicting the real-world (P-measure) probability. If a standard martingale compensator is used, an increase in positive jumps (due to bullish OFI) mathematically forces the continuous drift downwards to keep the expected value constant, paradoxically resulting in a bearish probability drop. Polymarket V2 explicitly strips out the martingale jump compensator from the characteristic function to allow the microstructural jump intensities to correctly alter the real-world directional drift.
+
 ### 2. Fractional Kelly Sizing
 The optimal allocation percentage of portfolio capital on the YES/NO book is calibrated using the fractional Kelly formula with a regularization buffer for taker fees:
 
