@@ -89,7 +89,8 @@ def build_dashboard(
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     # Calculate cycle countdown remaining time (tau)
-    expiry = market_manager.current_expiry or int(t_now - (t_now % 300) + 300)
+    cycle = market_manager.cycle_duration_sec
+    expiry = market_manager.current_expiry or int(t_now - (t_now % cycle) + cycle)
     tau_sec = max(0.0, expiry - t_now)
     mins, secs = int(tau_sec // 60), int(tau_sec % 60)
     countdown_color = "red" if tau_sec < 45.0 else "yellow" if tau_sec < 120.0 else "cyan"

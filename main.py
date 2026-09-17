@@ -566,7 +566,7 @@ class LiveOrchestrator:
         # Resolve active Strike Price only after the cycle has actually started
         if self.strike_manager and (self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0):
             if self.market_manager.current_expiry is not None:
-                cycle_start_time = self.market_manager.current_expiry - 300
+                cycle_start_time = self.market_manager.current_expiry - self.market_manager.cycle_duration_sec
                 if t_now >= cycle_start_time:
                     strike_tick = self.spot_feed.get_first_tick_after(cycle_start_time)
                     if strike_tick is not None:
@@ -952,7 +952,7 @@ class LiveOrchestrator:
                     # Try to resolve presumed strike during active cycle if not already resolved
                     if self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0:
                         if self.market_manager.current_expiry is not None:
-                            cycle_start_time = self.market_manager.current_expiry - 300
+                            cycle_start_time = self.market_manager.current_expiry - self.market_manager.cycle_duration_sec
                             strike_tick = self.spot_feed.get_first_tick_after(cycle_start_time)
                             if strike_tick is not None:
                                 _, strike_price_val = strike_tick

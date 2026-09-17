@@ -27,7 +27,7 @@ async def main():
     shadow_book = ShadowOrderBook()
     strategy = MertonStrategy(config)
     client = MockExecutionClient(config, recorder, shadow_book)
-    engine = ExecutionEngine(config)
+    engine = ExecutionEngine(strategy, client, config)
     
     # Pre-populate dummy states
     market_manager.current_expiry = int(time.time() + 150)

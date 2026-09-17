@@ -14,6 +14,7 @@ from src.strategies.factory import StrategyFactory
 from src.execution.shadow_book import ShadowOrderBook
 from src.execution.clients import MockExecutionClient
 from src.execution.engine import ExecutionEngine
+from src.execution.divergence_filter import DivergenceVelocityFilter
 from src.logging.recorder import DataRecorder
 
 logger = logging.getLogger("BacktestRunner")
@@ -81,14 +82,12 @@ class BacktestRunner:
         strategy = StrategyFactory.get_strategy(self.config.STRATEGY_NAME, self.config)
         client = MockExecutionClient(self.config, recorder, shadow_book)
         client.is_backtest = True
-        engine = ExecutionEngine(self.config)
-        
-        if self.config.maker.ENABLED:
-            from src.execution.maker_execution import MakerExecutionEngine
-            maker_engine = MakerExecutionEngine(strategy, client, self.config)
-        else:
-            maker_engine = None
-        
+        # Same unified maker/taker engine and divergence filter as the live orchestrator,
+        # so a backtest exercises exactly the code path that trades live.
+        engine = ExecutionEngine(strategy, client, self.config)
+        divergence_filter = DivergenceVelocityFilter(self.config)
+        engine.divergence_filter = divergence_filter
+
         # Expiry tracker variables
         current_expiry: Optional[int] = None
         strike_manager: Optional[StrikeManager] = None
@@ -171,8 +170,9 @@ class BacktestRunner:
                     settlement_strike = strike_manager.get_strike(t, spot)
                     client.settle_positions(settlement_price=spot, strike_price=settlement_strike, timestamp=t)
 
-                # Roll to next 5-minute cycle expiration
-                current_expiry = int(t) - (int(t) % 300) + 300
+                # Roll to next cycle expiration (CYCLE_DURATION_SEC-aligned, e.g. 300s for 5m or 14400s for 4h)
+                cycle = self.config.polymarket.CYCLE_DURATION_SEC
+                current_expiry = int(t) - (int(t) % cycle) + cycle
                 # First tick price serves as the new cycle's strike K (ATM)
                 strike_manager = StrikeManager(presumed_strike=spot, expiration_timestamp=current_expiry)
                 strike_manager.get_strike(t, spot)
@@ -183,8 +183,8 @@ class BacktestRunner:
                 p_yes_ema = None
                 p_yes_ema_ts = 0.0
                 strategy.reset()
-                if maker_engine is not None:
-                    maker_engine.reset()
+                engine.reset()
+                client.cancel_all_orders()
             
             # 3. Update shadow order book proxy.
             # First tick of each cycle: full snapshot (clears stale residuals from old cycle).
@@ -193,21 +193,16 @@ class BacktestRunner:
             shadow_book.update_book(bids_l2, asks_l2, is_snapshot=is_snap, timestamp=t)
             cycle_snapshot_sent = True
             
-            # 3.5 Execute pending orders that have reached their execution time
+            # 3.5 Execute queued taker orders whose simulated network latency has elapsed.
+            # Taker instructions are delayed in *event time* (not wall-clock) so the
+            # replay stays instantaneous while still modelling the 150-300ms round trip.
             ready_orders = [o for o in pending_orders if o["exec_time"] <= t]
             pending_orders = [o for o in pending_orders if o["exec_time"] > t]
-            
-            # Sort by execution time to ensure chronological processing
+
             for order in sorted(ready_orders, key=lambda x: x["exec_time"]):
-                decision = order["decision"]
-                await client.execute_trade(
-                    side=decision["side"],
-                    qty=decision["size"],
-                    price=decision.get("limit_price", decision["vwap"]),
-                    ev=decision["ev"],
-                    expected_slippage_bps=decision["expected_slippage_bps"],
-                    context_state=order["context_state"]
-                )
+                res = await client.process_instruction(order["instruction"], order["context_state"])
+                if res.get("success"):
+                    trade_count += 1
             
             # 4. Construct lightweight Context (without costly book sorting)
             active_strike = strike_manager.get_strike(t, spot)
@@ -265,280 +260,97 @@ class BacktestRunner:
             # 5. Record Tick update in Parquet buffer (bypassed in backtest to eliminate I/O bottleneck)
             # recorder.record_tick(t, spot, ofi, vol, bids_l2, asks_l2)
 
-            # 6. Engine Decisions & routing execution
-            # Check if we can bypass evaluation for trade decisions
-            if self.config.maker.ENABLED and maker_engine is not None:
-                # A. Simulate limit order fills first! (Continuous check on every tick)
-                top_b_sh, top_a_sh = shadow_book.get_market_top_of_book()
-                best_bid_p = top_b_sh[0] if top_b_sh else None
-                best_ask_p = top_a_sh[0] if top_a_sh else None
-                
-                # Check active buy limit order (bid) fill
-                active_bid_p = maker_engine.execution_router.active_bid_price
-                active_bid_q = maker_engine.execution_router.active_bid_qty
-                fill_occurred = False
-                if active_bid_p > 0.0 and best_ask_p is not None and best_ask_p <= active_bid_p:
-                    # Cash balance check (limit orders pay 0% fees)
-                    cost = active_bid_q * active_bid_p + 0.03
-                    if cost > client.cash_balance:
-                        # Scale down the fill to what we can afford
-                        max_q = max(0.0, (client.cash_balance - 0.03) / active_bid_p)
-                        if max_q > 0.0 and (max_q * active_bid_p) >= 5.0:
-                            active_bid_q = max_q
-                        else:
-                            # Cannot afford minimum fill, clear and skip
-                            maker_engine.execution_router.active_bid_id = ""
-                            maker_engine.execution_router.active_bid_price = 0.0
-                            maker_engine.execution_router.active_bid_qty = 0.0
-                            active_bid_p = 0.0
-                            
-                    if active_bid_p > 0.0:
-                        # Buy Fill!
-                        trade_count += 1
-                        fill_occurred = True
-                        recorder.record_signal(
-                            timestamp=t,
-                            spot_price=spot,
-                            strike=active_strike,
-                            model_prob=p_yes,
-                            implied_prob=best_ask_p,
-                            kelly_size=active_bid_q,
-                            status="MAKER_FILL_BUY"
-                        )
-                        exec_qty = active_bid_q
-                        exec_price = active_bid_p
-                        exec_ev = p_yes - active_bid_p if p_yes is not None else 0.0
-                        
-                        maker_engine.execution_router.active_bid_id = ""
-                        maker_engine.execution_router.active_bid_price = 0.0
-                        maker_engine.execution_router.active_bid_qty = 0.0
-                        
-                        await client.execute_trade(
-                            side="BUY_YES",
-                            qty=exec_qty,
-                            price=exec_price,
-                            ev=exec_ev,
-                            expected_slippage_bps=0.0,
-                            context_state={"timestamp": t, "strike_price": active_strike},
-                            is_maker=True
-                        )
+            # 6. Engine decisions & routing — mirrors LiveOrchestrator._clob_callback exactly.
+            context_state = {"timestamp": t, "strike_price": active_strike, "volatility": vol}
 
-                # Check active sell limit order (ask) fill
-                active_ask_p = maker_engine.execution_router.active_ask_price
-                active_ask_q = maker_engine.execution_router.active_ask_qty
-                if active_ask_p > 0.0 and best_bid_p is not None and best_bid_p >= active_ask_p:
-                    yes_shares = client.get_position_size("YES")
-                    if yes_shares < active_ask_q:
-                        # We need cash to buy NO for the remainder
-                        rem_qty = active_ask_q - yes_shares
-                        no_price = 1.0 - active_ask_p
-                        # Maker execution: no taker fee is charged
-                        cost = rem_qty * no_price + 0.03
-                        if cost > client.cash_balance:
-                            # Scale down remainder to what we can afford
-                            max_rem = max(0.0, (client.cash_balance - 0.03) / no_price)
-                            active_ask_q = yes_shares + max_rem
-                            if active_ask_q < 1e-5 or (yes_shares == 0.0 and max_rem * no_price < 5.0):
-                                # Cannot afford
-                                maker_engine.execution_router.active_ask_id = ""
-                                maker_engine.execution_router.active_ask_price = 0.0
-                                maker_engine.execution_router.active_ask_qty = 0.0
-                                active_ask_p = 0.0
-                                
-                    if active_ask_p > 0.0:
-                        # Sell Fill!
-                        trade_count += 1
-                        fill_occurred = True
-                        recorder.record_signal(
-                            timestamp=t,
-                            spot_price=spot,
-                            strike=active_strike,
-                            model_prob=p_yes,
-                            implied_prob=best_bid_p,
-                            kelly_size=active_ask_q,
-                            status="MAKER_FILL_SELL"
-                        )
-                        exec_qty = active_ask_q
-                        exec_price = active_ask_p
-                        exec_ev = active_ask_p - p_yes if p_yes is not None else 0.0
-                        yes_shares = client.get_position_size("YES")
-                        
-                        maker_engine.execution_router.active_ask_id = ""
-                        maker_engine.execution_router.active_ask_price = 0.0
-                        maker_engine.execution_router.active_ask_qty = 0.0
-                        
-                        if yes_shares >= exec_qty:
-                            await client.execute_trade(
-                                side="SELL_YES",
-                                qty=exec_qty,
-                                price=exec_price,
-                                ev=exec_ev,
-                                expected_slippage_bps=0.0,
-                                context_state={"timestamp": t, "strike_price": active_strike},
-                                is_maker=True
-                            )
-                        else:
-                            if yes_shares > 0.0:
-                                await client.execute_trade(
-                                    side="SELL_YES",
-                                    qty=yes_shares,
-                                    price=exec_price,
-                                    ev=exec_ev,
-                                    expected_slippage_bps=0.0,
-                                    context_state={"timestamp": t, "strike_price": active_strike},
-                                    is_maker=True
-                                )
-                            rem_q = exec_qty - yes_shares
-                            no_price = 1.0 - exec_price
-                            await client.execute_trade(
-                                side="BUY_NO",
-                                qty=rem_q,
-                                price=no_price,
-                                ev=(1.0 - p_yes) - no_price if p_yes is not None else 0.0,
-                                expected_slippage_bps=0.0,
-                                context_state={"timestamp": t, "strike_price": active_strike},
-                                is_maker=True
-                            )
-
-                # B. Quoting evaluation bypass check
-                cur_best_bid = top_b_sh[0] if top_b_sh else None
-                cur_best_ask = top_a_sh[0] if top_a_sh else None
-                
-                should_eval_quote = (
-                    last_evaluated_p_yes is None
-                    or p_yes is None
-                    or should_eval
-                    or abs(p_yes - last_evaluated_p_yes) > 1e-5
-                    or cur_best_bid != last_evaluated_best_bid
-                    or cur_best_ask != last_evaluated_best_ask
-                    or fill_occurred
-                    or is_snap
-                )
-                
-                if should_eval_quote and not pending_orders:
-                    # Upgrade context with sorted L2 book!
-                    context = MarketContext(
-                        timestamp=t,
-                        spot_price=spot,
-                        strike_price=active_strike,
-                        tau_seconds=tau_sec,
-                        volatility=vol,
-                        ofi=ofi,
-                        bids_l2=shadow_book.get_sorted_bids(),
-                        asks_l2=shadow_book.get_sorted_asks()
-                    )
-                    instructions = maker_engine.evaluate_and_route(context)
-                    
-                    last_evaluated_p_yes = p_yes
-                    last_evaluated_best_bid = cur_best_bid
-                    last_evaluated_best_ask = cur_best_ask
-                    
-                    for instr in instructions:
-                        if instr.action == "NEW" and instr.regime in ("B", "PANIC"):
-                            # Taker execution in Regime B / PANIC!
-                            trade_count += 1
-                            top_b_real, top_a_real = shadow_book.get_market_top_of_book()
-                            p_mkt = 0.5 * (top_b_real[0] + top_a_real[0]) if top_b_real and top_a_real else p_yes
-                            recorder.record_signal(
-                                timestamp=t,
-                                spot_price=spot,
-                                strike=active_strike,
-                                model_prob=p_yes,
-                                implied_prob=p_mkt,
-                                kelly_size=instr.qty,
-                                status=f"TAKER_{instr.side}" if instr.regime == "B" else f"PANIC_{instr.side}"
-                            )
-                            
-                            decision_taker = {
-                                "side": instr.side,
-                                "size": instr.qty,
-                                "vwap": instr.price,
-                                "ev": p_yes - instr.price if instr.side == "BUY_YES" else (1.0 - p_yes) - instr.price,
-                                "expected_slippage_bps": 0.0,
-                                "limit_price": instr.price
-                            }
-                            # Queue simulated taker order with stochastic latency
-                            delay = np.random.uniform(0.150, 0.300)
-                            pending_orders.append({
-                                "exec_time": t + delay,
-                                "decision": decision_taker,
-                                "context_state": {
-                                    "timestamp": t,
-                                    "strike_price": active_strike,
-                                    "volatility": vol,
-                                    "limit_price": instr.price
-                                }
-                            })
-            else:
-                # Taker-only logic evaluation bypass check
-                top_b_sh, top_a_sh = shadow_book.get_top_of_book()
-                cur_best_bid = top_b_sh[0] if top_b_sh else None
-                cur_best_ask = top_a_sh[0] if top_a_sh else None
-                
-                has_positions = (client.get_position_size("YES") > 1e-9 or client.get_position_size("NO") > 1e-9)
-                
-                should_eval_trade = (
-                    last_evaluated_p_yes is None
-                    or p_yes is None
-                    or should_eval
-                    or abs(p_yes - last_evaluated_p_yes) > 1e-5
-                    or cur_best_bid != last_evaluated_best_bid
-                    or cur_best_ask != last_evaluated_best_ask
-                    or ready_orders
-                    or has_positions
-                    or is_snap
-                )
-                
-                decision = {"side": "HOLD"}
-                if should_eval_trade and not pending_orders:
-                    # Upgrade context with sorted L2 book ONLY when evaluating trade!
-                    context = MarketContext(
-                        timestamp=t,
-                        spot_price=spot,
-                        strike_price=active_strike,
-                        tau_seconds=tau_sec,
-                        volatility=vol,
-                        ofi=ofi,
-                        bids_l2=shadow_book.get_sorted_bids(),
-                        asks_l2=shadow_book.get_sorted_asks()
-                    )
-                    
-                    decision = engine.evaluate_and_trade(p_yes, context, client)
-                
-                last_evaluated_p_yes = p_yes
-                last_evaluated_best_bid = cur_best_bid
-                last_evaluated_best_ask = cur_best_ask
-                
-                if decision["side"] != "HOLD":
+            # A. Evaluate resting maker orders against the updated book (queue depth + fills).
+            #    This is the same fill simulator the live paper client uses.
+            fills = await client.process_market_data(
+                shadow_book.get_sorted_bids(), shadow_book.get_sorted_asks(), context_state
+            )
+            fill_occurred = False
+            for result in fills:
+                if result.get("success"):
                     trade_count += 1
-                    # Compute implied market price from the REAL book (not shadow)
-                    top_b_real, top_a_real = shadow_book.get_market_top_of_book()
-                    p_mkt = 0.5 * (top_b_real[0] + top_a_real[0]) if top_b_real and top_a_real else p_yes
-                    
-                    # Log Signal event
+                    fill_occurred = True
                     recorder.record_signal(
                         timestamp=t,
                         spot_price=spot,
                         strike=active_strike,
                         model_prob=p_yes,
-                        implied_prob=p_mkt,
-                        kelly_size=decision["size"],
-                        status=decision["side"]
+                        implied_prob=result["price"],
+                        kelly_size=result["qty"],
+                        status="MAKER_FILL_BUY" if "BUY" in result["side"] else "MAKER_FILL_SELL"
                     )
-                    
-                    # Queue simulated trade with stochastic latency
-                    delay = np.random.uniform(0.150, 0.300)
-                    pending_orders.append({
-                        "exec_time": t + delay,
-                        "decision": decision,
-                        "context_state": {
-                            "timestamp": t,
-                            "strike_price": active_strike,
-                            "volatility": vol,
-                            "limit_price": decision.get("limit_price", decision["vwap"])
-                        }
-                    })
-                
+
+            # B. Divergence velocity filter (toxic-flow guard) on every tick, as in live.
+            top_b_sh, top_a_sh = shadow_book.get_market_top_of_book()
+            cur_best_bid = top_b_sh[0] if top_b_sh else None
+            cur_best_ask = top_a_sh[0] if top_a_sh else None
+            if p_yes is not None and (cur_best_bid is not None or cur_best_ask is not None):
+                if cur_best_bid is not None and cur_best_ask is not None:
+                    p_mkt_div = 0.5 * (cur_best_bid + cur_best_ask)
+                else:
+                    p_mkt_div = cur_best_bid if cur_best_bid is not None else cur_best_ask
+                divergence_filter.get_scale(p_yes, p_mkt_div, t)
+
+            # C. Quoting evaluation bypass: skip the router when nothing it depends on changed.
+            should_eval_quote = (
+                last_evaluated_p_yes is None
+                or p_yes is None
+                or should_eval
+                or abs(p_yes - last_evaluated_p_yes) > 1e-5
+                or cur_best_bid != last_evaluated_best_bid
+                or cur_best_ask != last_evaluated_best_ask
+                or fill_occurred
+                or is_snap
+            )
+
+            if should_eval_quote and not pending_orders:
+                context = MarketContext(
+                    timestamp=t,
+                    spot_price=spot,
+                    strike_price=active_strike,
+                    tau_seconds=tau_sec,
+                    volatility=vol,
+                    ofi=ofi,
+                    bids_l2=shadow_book.get_sorted_bids(),
+                    asks_l2=shadow_book.get_sorted_asks()
+                )
+                instructions = engine.evaluate_and_route(context)
+
+                last_evaluated_p_yes = p_yes
+                last_evaluated_best_bid = cur_best_bid
+                last_evaluated_best_ask = cur_best_ask
+
+                for instr in instructions:
+                    if instr.action == "NEW" and instr.regime in ("B", "PANIC"):
+                        # Taker / panic sweep: log the signal now, execute after simulated latency.
+                        p_mkt = 0.5 * (cur_best_bid + cur_best_ask) if (cur_best_bid is not None and cur_best_ask is not None) else p_yes
+                        recorder.record_signal(
+                            timestamp=t,
+                            spot_price=spot,
+                            strike=active_strike,
+                            model_prob=p_yes,
+                            implied_prob=p_mkt,
+                            kelly_size=instr.qty,
+                            status=f"TAKER_{instr.side}" if instr.regime == "B" else f"PANIC_{instr.side}"
+                        )
+                        delay = np.random.uniform(0.150, 0.300)
+                        pending_orders.append({
+                            "exec_time": t + delay,
+                            "instruction": instr,
+                            "context_state": {
+                                "timestamp": t,
+                                "strike_price": active_strike,
+                                "volatility": vol,
+                                "limit_price": instr.price
+                            }
+                        })
+                    else:
+                        # Maker NEW/REPLACE rest in the client book; CANCEL removes them.
+                        await client.process_instruction(instr, context_state)
+
             # Track current equity using mid-price from REAL book for consistent MTM
             top_b, top_a = shadow_book.get_market_top_of_book()
             if top_b and top_a:

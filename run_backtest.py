@@ -72,10 +72,10 @@ def get_overlapping_files(data_dir: str, start_time: float, end_time: float):
 def parse_args():
     parser = argparse.ArgumentParser(description="Polymarket V2 Backtest Simulator")
     parser.add_argument(
-        "--file", 
-        type=str, 
-        default="c:/Users/loren/Documents/AntiGravity Projects/polymarket/data/raw/tick_data_1779562304.parquet",
-        help="Path to a single historical tick file (ignored if --start and --end are used)"
+        "--file",
+        type=str,
+        default=None,
+        help="Path to a single historical tick file or directory of parquet files (ignored if --start and --end are used)"
     )
     parser.add_argument(
         "--start",
@@ -129,9 +129,8 @@ async def main():
             return
             
         data_dirs = [
-            "logs",
+            config.LOG_DIR,
             os.path.join("data", "raw"),
-            "c:/Users/loren/Documents/AntiGravity Projects/polymarket/data/raw"
         ]
         
         selected_files = []

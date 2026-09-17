@@ -11,39 +11,44 @@ logger = logging.getLogger("MarketManager")
 
 class MarketManager:
     """
-    Orchestrates the dynamic discovery of Polymarket 5-minute cycle markets.
-    Generates deterministic slugs, fetches metadata via the Gamma API, 
+    Orchestrates the dynamic discovery of Polymarket fixed-length Up/Down cycle markets
+    (e.g. 5-minute or 4-hour cycles, configured via CYCLE_DURATION_SEC / MARKET_SLUG_TYPE).
+    Generates deterministic slugs, fetches metadata via the Gamma API,
     and handles rollovers when expiration milestones are crossed.
     """
-    
+
     def __init__(self, config: SystemConfig):
         self.config = config
         self.ticker = config.TICKER.lower()
-        
+        self.cycle_duration_sec = config.polymarket.CYCLE_DURATION_SEC
+        self.slug_type = config.polymarket.MARKET_SLUG_TYPE
+
         self.current_expiry: Optional[int] = None
         self.current_slug: Optional[str] = None
-        
+
         # Extracted active market details
         self.condition_id: Optional[str] = None
         self.yes_token_id: Optional[str] = None
         self.no_token_id: Optional[str] = None
         self.strike_price: Optional[float] = None
-        
+
         self._lock = asyncio.Lock()
 
     def get_next_expiry(self, current_time: float) -> int:
         """
-        Calculates the UNIX expiration timestamp of the next 5-minute window 
-        using modular arithmetic. Expirations are multiples of 300 seconds.
+        Calculates the UNIX expiration timestamp of the next cycle window using
+        modular arithmetic. Expirations are multiples of CYCLE_DURATION_SEC
+        (aligned to the Unix epoch, matching Polymarket's own rollover clock).
         Preempts the rollover by 15 seconds so the bot subscribes to the next cycle early.
         """
+        cycle = self.cycle_duration_sec
         t_int = int(current_time + 15.0)
-        return t_int - (t_int % 300) + 300
+        return t_int - (t_int % cycle) + cycle
 
     def get_slug_for_expiry(self, expiry: int) -> str:
         """Generates the deterministic Polymarket event slug for the target expiration."""
-        # Polymarket 5-minute event slugs use the start time of the cycle (expiry - 300)
-        return f"{self.ticker}-updown-5m-{expiry - 300}"
+        # Polymarket event slugs use the start time of the cycle (expiry - cycle_duration)
+        return f"{self.ticker}-updown-{self.slug_type}-{expiry - self.cycle_duration_sec}"
 
     async def update_market_cycle(self, current_time: float) -> bool:
         """

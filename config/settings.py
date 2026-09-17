@@ -25,6 +25,14 @@ class PolymarketConfig:
     PRESUMED_STRIKE_PRICE: float = field(default_factory=lambda: float(os.getenv("PRESUMED_STRIKE_PRICE", "67500.0")))
     EXPIRATION_TIMESTAMP: float = field(default_factory=lambda: float(os.getenv("EXPIRATION_TIMESTAMP", "0.0")))
 
+    # Market cycle settings — Polymarket runs several parallel Up/Down cycle
+    # lengths per ticker (e.g. "5m" every 300s, "4h" every 14400s). Both the
+    # rollover clock and the deterministic event slug depend on these two
+    # values, so they must be changed together when switching timeframes.
+    # CYCLE_DURATION_SEC must be a divisor of 86400 (aligned to Unix epoch).
+    CYCLE_DURATION_SEC: int = field(default_factory=lambda: int(os.getenv("CYCLE_DURATION_SEC", "300")))
+    MARKET_SLUG_TYPE: str = field(default_factory=lambda: os.getenv("MARKET_SLUG_TYPE", "5m"))
+
 @dataclass(frozen=True)
 class MertonJumpDiffusionConfig:
     """Merton Jump-Diffusion hyper-parameters for pricing calibration."""
