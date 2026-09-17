@@ -217,42 +217,87 @@ class MicrostructuralState:
         self.last_timestamp = timestamp
 
 
+SECONDS_PER_YEAR = 365.25 * 24 * 3600.0
+
+
+def integrated_expected_intensity(
+    lambda_current: float, lambda_0: float, beta: float, tau_seconds: float
+) -> float:
+    r"""
+    Time-integrates the expected future path of a mean-reverting Hawkes intensity
+    over the remaining horizon, instead of naively multiplying the instantaneous
+    (possibly transient) intensity by the entire remaining time.
+
+    Absent further shocks, the intensity relaxes exponentially back to baseline:
+    $E[\lambda(t+s)] = \lambda_0 + (\lambda(t) - \lambda_0)e^{-\beta s}$. Integrating
+    over the remaining horizon $\tau$ gives the expected jump count:
+    $\int_0^\tau E[\lambda(t+s)]\,ds = \lambda_0 \tau + (\lambda(t)-\lambda_0)\frac{1-e^{-\beta\tau}}{\beta}$
+
+    This bounds the contribution of a fleeting OFI-driven excitation (which decays
+    with half-life ~ln(2)/beta, typically well under a second) to at most
+    (lambda_current - lambda_0) / beta "extra" expected jumps, regardless of how
+    far away expiry is — a single microstructure tick can no longer be amplified
+    by the full remaining time-to-expiry as it was in the naive lambda*tau form.
+
+    Returns the expected jump count already converted to "years" so it can be used
+    as a drop-in replacement for lambda*tau in the characteristic function
+    (lambda is expressed in jumps/year, beta and tau_seconds in real seconds).
+    """
+    if beta <= 1e-12:
+        # No mean reversion: degenerates to the naive instantaneous*tau form.
+        return lambda_current * (tau_seconds / SECONDS_PER_YEAR)
+    excess = lambda_current - lambda_0
+    integral_seconds_domain = lambda_0 * tau_seconds + excess * (1.0 - np.exp(-beta * tau_seconds)) / beta
+    return integral_seconds_domain / SECONDS_PER_YEAR
+
+
 class HawkesMertonCharacteristicFunction:
     """
     Computes the characteristic function for the Hawkes-Driven Merton Jump-Diffusion model
     with split positive and negative jump processes.
     """
-    
+
     def phi(
         self, u: np.ndarray, S_t: float, K: float, tau: float, mu: float, sigma: float,
         lambda_plus: float, lambda_minus: float,
         mu_j_plus: float, sigma_j_plus: float,
-        mu_j_minus: float, sigma_j_minus: float
+        mu_j_minus: float, sigma_j_minus: float,
+        tau_seconds: float = 0.0, beta: float = 0.0, lambda_0: float = 0.0
     ) -> np.ndarray:
         x0 = np.log(S_t)
-        
-        # Jump drift correctors: kappa = E[e^Y] - 1 for each jump process
-        kappa_plus = np.exp(mu_j_plus + 0.5 * sigma_j_plus**2) - 1.0
-        kappa_minus = np.exp(mu_j_minus + 0.5 * sigma_j_minus**2) - 1.0
-        
+
         # MATHEMATICAL NOTE ON MARTINGALE COMPENSATOR (P-MEASURE FIX):
-        # Under standard Gil-Pelaez option pricing, we use a Q-measure Risk-Neutral world 
+        # Under standard Gil-Pelaez option pricing, we use a Q-measure Risk-Neutral world
         # where the compensator (lambda * kappa) offsets jumps to maintain a martingale.
         # However, for prediction markets we predict real-world probabilities (P-measure).
-        # We WANT the asymmetric jumps to shift the asset drift directionally. 
-        # Using a Q-measure compensator caused an "Inversion Bug" where positive jumps 
+        # We WANT the asymmetric jumps to shift the asset drift directionally.
+        # Using a Q-measure compensator caused an "Inversion Bug" where positive jumps
         # dragged continuous drift negatively, making p_hat drop instead of rise.
         # We remove the jump compensators to properly model the real-world drift.
-        b = mu - 0.5 * sigma**2        
+        b = mu - 0.5 * sigma**2
         # Continuous diffusion part
         diffusion = 1j * u * x0 + 1j * u * b * tau - 0.5 * (sigma**2) * (u**2) * tau
-        
+
+        # TIME-INTEGRATED JUMP INTENSITY (see integrated_expected_intensity docstring):
+        # lambda_plus/lambda_minus are the INSTANTANEOUS Hawkes intensities, which can
+        # spike sharply on a single OFI tick and decay back to lambda_0 within ~1/beta
+        # seconds. Multiplying that spike directly by the full remaining tau (as in the
+        # naive Merton formula) would let a fleeting microstructure signal dominate the
+        # probability of a settlement that may be minutes or hours away. We instead use
+        # the expected integral of the mean-reverting intensity path over [0, tau].
+        if beta > 0.0:
+            jump_plus_tau = integrated_expected_intensity(lambda_plus, lambda_0, beta, tau_seconds)
+            jump_minus_tau = integrated_expected_intensity(lambda_minus, lambda_0, beta, tau_seconds)
+        else:
+            jump_plus_tau = lambda_plus * tau
+            jump_minus_tau = lambda_minus * tau
+
         # Positive jump process characteristic part
-        jump_plus = lambda_plus * tau * (np.exp(1j * u * mu_j_plus - 0.5 * (sigma_j_plus**2) * (u**2)) - 1.0)
-        
+        jump_plus = jump_plus_tau * (np.exp(1j * u * mu_j_plus - 0.5 * (sigma_j_plus**2) * (u**2)) - 1.0)
+
         # Negative jump process characteristic part
-        jump_minus = lambda_minus * tau * (np.exp(1j * u * mu_j_minus - 0.5 * (sigma_j_minus**2) * (u**2)) - 1.0)
-        
+        jump_minus = jump_minus_tau * (np.exp(1j * u * mu_j_minus - 0.5 * (sigma_j_minus**2) * (u**2)) - 1.0)
+
         return np.exp(diffusion + jump_plus + jump_minus)
 
 
@@ -274,6 +319,7 @@ class HawkesMertonPricer:
         lambda_plus: float, lambda_minus: float,
         mu_j_plus: float, sigma_j_plus: float,
         mu_j_minus: float, sigma_j_minus: float,
+        beta: float = 0.0, lambda_0: float = 0.0,
         limit: int = 150
     ) -> float:
         # Convert tau to annualized terms (seconds to years)
@@ -317,7 +363,8 @@ class HawkesMertonPricer:
                 u=nodes, S_t=S_t, K=K, tau=tau, mu=mu, sigma=sigma,
                 lambda_plus=lambda_plus, lambda_minus=lambda_minus,
                 mu_j_plus=mu_j_plus, sigma_j_plus=sigma_j_plus,
-                mu_j_minus=mu_j_minus, sigma_j_minus=sigma_j_minus
+                mu_j_minus=mu_j_minus, sigma_j_minus=sigma_j_minus,
+                tau_seconds=tau_seconds, beta=beta, lambda_0=lambda_0
             )
             
             # Black-Scholes CF (same continuous drift and volatility)
@@ -425,7 +472,9 @@ class MertonStrategy(BaseStrategy):
             mu_j_plus=mu_j_plus,
             sigma_j_plus=sigma_j_plus,
             mu_j_minus=mu_j_minus,
-            sigma_j_minus=sigma_j_minus
+            sigma_j_minus=sigma_j_minus,
+            beta=beta,
+            lambda_0=self.lambda_0
         )
         
         # Bound probability to avoid tail instabilities in Kelly sizing

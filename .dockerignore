@@ -1,0 +1,8 @@
+.git
+.venv
+logs
+data
+*.log
+__pycache__
+scratch
+.env

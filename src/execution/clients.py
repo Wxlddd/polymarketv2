@@ -55,6 +55,10 @@ class MockExecutionClient(IExecutionClient):
     def cash_balance(self) -> float:
         return self._cash_balance
 
+    def cancel_all_orders(self) -> None:
+        """Drops all resting maker orders (e.g. at cycle rollover, so stale quotes cannot fill against the next cycle's book)."""
+        self.active_maker_orders = {"bid": None, "ask": None}
+
     def get_position_size(self, side: str) -> float:
         """Returns the holding quantity of YES or NO contracts."""
         clean_side = side.upper().replace("BUY_", "").replace("SELL_", "")

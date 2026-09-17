@@ -219,36 +219,42 @@ class ExecutionRouter:
             self._cancel_ask(instructions, "SAFE")
             return instructions
 
-        # Lock check
-        if self.locked:
-            self._cancel_bid(instructions, "LOCKED")
-            self._cancel_ask(instructions, "LOCKED")
-            return instructions
-            
         best_bid = context.bids_l2[0][0]
         best_ask = context.asks_l2[0][0]
         p_mid = 0.5 * (best_bid + best_ask)
         current_spread = best_ask - best_bid
-        
+
         # Get net position q
         q = yes_shares - no_shares
         tau_sec = context.tau_seconds
 
         # Phase 2: Hard Liquidation Sweep (Panic Sweep)
+        # Evaluated BEFORE the lock check and re-issued on every tick while q != 0:
+        # an IOC sweep can be rejected or only partially filled, and a fire-once
+        # sweep would otherwise leave the whole inventory riding into settlement.
         is_panic = (tau_sec <= 15.0) or (tau_sec <= 45.0 and current_spread > 0.10)
         if is_panic:
             self._cancel_bid(instructions, "PANIC")
             self._cancel_ask(instructions, "PANIC")
             self.locked = True
-            
+
+            # Liquidation limits are anchored to the BOOK, not to p_hat: when the model
+            # disagrees with the market (which is precisely when inventory is held), a
+            # p_hat-based limit sits outside the spread and the IOC sweep never fills.
             if q > 0:
-                # Aggressively sell all YES contracts
-                limit_p = max(0.01, p_hat - self.panic_concession)
+                # Aggressively sell all YES contracts, conceding through the bid side
+                limit_p = max(0.01, best_bid - self.panic_concession)
                 instructions.append(OrderInstruction("NEW", "SELL_YES", limit_p, yes_shares, "panic_sell_yes", regime="PANIC"))
             elif q < 0:
-                # Aggressively buy YES contracts to cover NO position
-                limit_p = min(0.99, p_hat + self.panic_concession)
+                # Aggressively buy YES contracts to cover NO position, conceding through the ask side
+                limit_p = min(0.99, best_ask + self.panic_concession)
                 instructions.append(OrderInstruction("NEW", "BUY_YES", limit_p, no_shares, "panic_buy_yes", regime="PANIC"))
+            return instructions
+
+        # Lock check: once a panic sweep has fired, no new positions until rollover.
+        if self.locked:
+            self._cancel_bid(instructions, "LOCKED")
+            self._cancel_ask(instructions, "LOCKED")
             return instructions
 
         # Phase 1: Soft Unwind (Reduce-Only Regime)
@@ -567,7 +573,7 @@ class ExecutionEngine:
     Interfaces with a generic BaseStrategy to extract probability predictions (P_hat)
     and uses the market context to fetch continuous volatility/variance.
     """
-    __slots__ = ('strategy', 'inventory_manager', 'execution_router', 'client', 'mid_price_calibrator')
+    __slots__ = ('strategy', 'inventory_manager', 'execution_router', 'client', 'mid_price_calibrator', 'divergence_filter')
 
     def __init__(
         self,
@@ -577,7 +583,8 @@ class ExecutionEngine:
     ):
         self.strategy = strategy
         self.client = client
-        
+        self.divergence_filter = None
+
         self.inventory_manager = InventoryManager(
             gamma=config.maker.RISK_AVERSION,
             fixed_horizon_sec=config.maker.FIXED_HORIZON_SEC,
@@ -640,7 +647,7 @@ class ExecutionEngine:
 
         # 4. Get divergence scale from the shared/assigned divergence filter
         divergence_scale = 1.0
-        if hasattr(self, "divergence_filter") and self.divergence_filter is not None:
+        if self.divergence_filter is not None:
             divergence_scale = self.divergence_filter.last_scale
 
         # 5. Delegate to state-machine router

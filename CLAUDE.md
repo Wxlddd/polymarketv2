@@ -1,124 +1,86 @@
-# GEMINI.md
+# Agent guidance for polymarketv2
 
-This file provides guidance to Gemini CLI when working with code in this repository.
+This file is read by coding agents (Claude Code, Gemini CLI — `GEMINI.md` is an identical copy). It describes how the repository actually works; the user-facing documentation is `README.md`.
 
 ## Commands
 
-**Package manager**: `uv` (not pip). All commands use `uv run python`.
+Package manager is `uv`. Python 3.13 (`.python-version`).
 
 ```bash
-# Run live orchestrator — Rich terminal dashboard
-uv run python main.py
+uv sync                                          # create .venv from uv.lock
+uv run python main.py                            # live paper trading, web dashboard on :8080
+uv run python main.py --term                     # Rich terminal dashboard
+uv run python main.py --strategy merton          # skip the interactive strategy prompt
 
-# Run live orchestrator — Bloomberg web dashboard at http://localhost:8080
-uv run python main.py --no-term
+uv run python run_backtest.py --file path/to/ticks.parquet
+uv run python run_backtest.py --start "2026-09-17 10:00:00" --end "2026-09-17 12:00:00"
 
-# Run backtest with time window
-uv run python run_backtest.py --start "2026-05-28 19:15:00" --end "2026-05-28 19:20:00"
-
-# Run backtest with single file
-uv run python run_backtest.py --file "path/to/ticks.parquet"
-
-# Run individual validation scripts (no test runner — each is standalone)
-uv run python tests/verify_phase3.py   # Merton pricing + vol calibration
-uv run python tests/verify_phase4.py   # Shadow book + order execution
-uv run python tests/verify_web_server.py
+# Validation scripts are standalone (no test runner) and need the repo root on the path:
+PYTHONPATH=. uv run python tests/verify_phase3.py           # pricer + vol calibrator
+PYTHONPATH=. uv run python tests/verify_phase4.py           # router -> paper client -> settlement
+PYTHONPATH=. uv run python tests/verify_maker_execution.py  # unittest for ExecutionRouter regimes
 ```
 
-Configuration lives in `.env` (copy from `.env.example`). All env vars are loaded by `config/settings.py` into frozen dataclasses at startup.
+`tests/verify_live_data_and_pricing.py` needs the live WebSocket feeds. `tests/verify_dashboard.py` drives the terminal UI and is not meaningful headless.
 
-## Architecture
+Configuration is `.env` (template `.env.example`), loaded once into frozen dataclasses by `config/settings.py`. `main.py` mutates a few fields through `__dict__` at runtime (token IDs, strategy name) — that is the only sanctioned way to change a frozen config.
 
-### Data flow (per CLOB tick)
+## Per-tick data flow
 
 ```
-ChainlinkSpotFeed (WS)     ClobOrderBookFeed (WS, YES-only)
-        │                            │
-        └──────────┬─────────────────┘
-                   ▼
-         LiveOrchestrator._clob_callback()
-                   │
-         ShadowOrderBook.update_book()  → OFI + ConsumptionTracker reconcile
-                   │
-         MertonStrategy.get_probability()  → p_yes (Bivariate Hawkes + Gil-Pelaez GL64)
-                   │
-         EMA smoothing (time-based halflife, adaptive near expiry)
-                   │
-         ExecutionEngine.evaluate_and_trade()  → decision
-                   │
-         MockExecutionClient.execute_trade()  ← await (prevents double signals)
-                   │
-         ShadowOrderBook.paper_execute()  ← registers fills in ConsumptionTracker
-                   │
-         DataRecorder.record_tick/signal/trade()
+ChainlinkSpotFeed (WS)      ClobOrderBookFeed (WS, YES token only)
+        └──────────┬──────────────┘
+     LiveOrchestrator._clob_callback()                         main.py
+     ShadowOrderBook.update_book()          -> OFI, V_hist/V_cons reconcile
+     MertonStrategy.get_probability()       -> raw p_yes
+     time-based EMA (half-life min(EMA_HALFLIFE_SEC, tau/10))
+     DivergenceVelocityFilter.get_scale()   -> sizing scale in [0,1]
+     MockExecutionClient.process_market_data()  -> resting maker fills
+     ExecutionEngine.evaluate_and_route()   -> List[OrderInstruction]
+     MockExecutionClient.process_instruction()  (awaited per instruction)
+     DataRecorder.record_tick / record_signal / record_trade
 ```
 
-### Module map
+`src/backtest/runner.py` runs exactly this pipeline over a recorded `ticks.parquet` (taker instructions delayed 150–300 ms in event time via a pending queue). If you change the orchestration in `main.py`, mirror it in the runner.
+
+## Module map
 
 | Path | Purpose |
 |---|---|
-| `main.py` | `LiveOrchestrator` — async event loop, coordinates all subsystems |
-| `config/settings.py` | Frozen dataclasses: `SystemConfig` → `PolymarketConfig`, `MertonJumpDiffusionConfig`, `ArbitrageConfig`, `RiskConfig`, `WebServerConfig` |
-| `src/core/interfaces.py` | Abstract interfaces: `ISpotFeed`, `IOrderBook`, `IExecutionClient`, `IDataRecorder` |
-| `src/core/market_context.py` | `MarketContext` frozen dataclass — the data contract between all layers |
-| `src/core/strike_manager.py` | Resolves and locks strike price K |
-| `src/ingestion/live_feeds.py` | `ChainlinkSpotFeed` (Chainlink oracle WS), `ClobOrderBookFeed` (CLOB WS) |
-| `src/ingestion/market_manager.py` | Gamma API discovery, deterministic slug generation, 5-min rollover handling |
-| `src/strategies/factory.py` | `StrategyFactory` — dynamic resolution of active pricing strategy |
-| `src/strategies/merton_strategy.py` | `MertonStrategy`: Bivariate Hawkes + `HawkesMertonPricer` (vectorized Gauss-Legendre GL64) |
-| `src/strategies/legacy_merton_strategy.py` | Legacy Merton strategy (homogeneous Poisson, scalar `scipy.integrate.quad`) |
-| `src/execution/shadow_book.py` | `ShadowOrderBook`: V_hist (q_real) + `ConsumptionTracker` (V_cons) with exponential decay |
-| `src/execution/engine.py` | `ExecutionEngine`: fractional Kelly sizing, L2 book walk, Pin/Desync/PoF risk filters |
-| `src/execution/clients.py` | `MockExecutionClient`: paper-trading, position tracking, settlement, realized_trades |
-| `src/backtest/runner.py` | `BacktestRunner`: event-driven historical replay with summary.json output |
-| `src/logging/recorder.py` | `DataRecorder`: Parquet (ticks, buffered) + CSV (signals/trades, immediate) |
-| `src/ui/dashboard.py` | Rich CLI terminal dashboard |
-| `src/ui/web_server.py` | Integrated aiohttp HTTP + WebSocket server |
-| `src/ui/dashboard.html` | Bloomberg-style web terminal UI with Live Monitor + Backtester tabs |
+| `main.py` | `LiveOrchestrator`: feeds, rollover loop, strike resolution loop, settlement task, UI state |
+| `config/settings.py` | `SystemConfig` → `PolymarketConfig`, `MertonJumpDiffusionConfig`, `ArbitrageConfig`, `RiskConfig`, `MarketMakerConfig`, `WebServerConfig` |
+| `src/core/interfaces.py` | `ISpotFeed`, `IOrderBook`, `IExecutionClient`, `IDataRecorder`, `OrderInstruction` |
+| `src/core/market_context.py` | Frozen `MarketContext` (timestamp, spot, strike, tau, vol, ofi, L2 books) |
+| `src/core/strike_manager.py` | Holds the presumed strike and locks it at expiry |
+| `src/ingestion/market_manager.py` | Next-expiry clock, slug `<ticker>-updown-<MARKET_SLUG_TYPE>-<expiry - CYCLE_DURATION_SEC>`, Gamma API lookup |
+| `src/ingestion/live_feeds.py` | `ChainlinkSpotFeed`, `ClobOrderBookFeed` |
+| `src/strategies/merton_strategy.py` | `HighFrequencyVolatilityCalibrator`, `MicrostructuralState` (bivariate Hawkes), `HawkesMertonPricer` (GL64 Gil-Pelaez), `MertonStrategy` |
+| `src/strategies/legacy_merton_strategy.py` | Homogeneous Poisson Merton + posterior OFI logit shift |
+| `src/execution/engine.py` | `ExecutionRouter.evaluate_regimes()` state machine; `ExecutionEngine` wraps strategy + client + router |
+| `src/execution/divergence_filter.py` | `DivergenceVelocityFilter` |
+| `src/execution/shadow_book.py` | `ShadowOrderBook` + `ConsumptionTracker` |
+| `src/execution/clients.py` | `MockExecutionClient`: IOC book walk with fees and stochastic rejection, resting maker queue model, position merge, settlement |
+| `src/backtest/runner.py` | `BacktestRunner`, writes `summary.json` |
+| `src/logging/recorder.py` | Parquet ticks (buffered), CSV signals/trades (immediate), daily directory rollover |
+| `src/ui/web_server.py`, `dashboard.html`, `dashboard.py` | Web dashboard (HTTP + WS) and terminal dashboard |
 
-### Critical invariants
+## Router regimes (`ExecutionRouter.evaluate_regimes`)
 
-**YES-only CLOB subscription**: `ClobOrderBookFeed` subscribes only to the YES token. NO prices are derived as `1.0 - YES_price`. Subscribing to both tokens would mix NO bids (~0.84) into the shadow book top-of-book, making `p_mkt` read ~0.5 regardless of the real market.
+Evaluated in this order every tick: **PANIC** (tau ≤ 15 s, or tau ≤ 45 s with spread > 0.10: cancel all, IOC-sweep the whole net position at `best_bid − PANIC_CONCESSION` / `best_ask + PANIC_CONCESSION`, re-issued every tick until flat, sets `locked`) → **locked** (cancel all, no new positions until rollover) → **REDUCE** (tau ≤ 45 s, reduce-only quoting) → **C** unwind (|q| > MAX_INVENTORY or model realigned with mid) → **B** taker (target quote crosses the book by more than `MM_TAKER_EDGE_EPSILON`; fractional Kelly size) → **A** maker (post-only quotes at `P_res ± delta`).
 
-**ConsumptionTracker separation**: `ShadowOrderBook` maintains V_hist (feed state, never mutated by bot) and a parallel `ConsumptionTracker` V_cons (bot fills only, with exponential decay). `get_market_top_of_book()` reads V_hist; `get_sorted_bids/asks()` returns V_eff = V_hist - V_cons. Both are cached per tick and invalidated on update_book() or paper_execute().
+`p_hat` comes from `strategy.get_probability(context)` inside `ExecutionEngine.evaluate_and_route`; the EMA-smoothed probability in `main.py` is used for logging, the divergence filter and the UI, not for routing.
 
-**Awaited execution**: `_clob_callback` is `async` and `await`s `client.execute_trade()` before returning. This guarantees fills are registered in the consumption tracker before the next CLOB tick arrives, preventing duplicate trade signals on the same opportunity.
+## Invariants — do not break
 
-**Strike resolution guard**: `strike_price` in `MarketContext` is `None` until resolved. Both `MertonStrategy.get_probability()` and `ExecutionEngine.evaluate_and_trade()` return `None`/`HOLD` immediately if strike is `None`. Strike is set either from the Gamma API at rollover or from the first Chainlink tick after `cycle_start = expiry - 300s`.
+- **YES-only CLOB subscription.** NO prices are `1 − p_YES`. Subscribing to both tokens mixes NO bids into the top of book.
+- **V_hist vs V_cons.** `get_market_top_of_book()` reads the untouched feed state; `get_sorted_bids/asks()` return `V_hist − V_cons`. Paper fills go through `paper_execute()` only.
+- **Awaited execution.** `_clob_callback` awaits every `process_instruction` so fills are in V_cons before the next tick.
+- **Strike guard.** `MarketContext.strike_price is None` ⇒ strategy returns `None` and the router cancels everything (`SAFE`).
+- **Cycle timing is config-driven.** Every boundary computation uses `CYCLE_DURATION_SEC` (`MarketManager.cycle_duration_sec` in `main.py`/`dashboard.py`, `config.polymarket.CYCLE_DURATION_SEC` in the runner). Never hard-code 300.
+- **Hawkes intensities are time-integrated in the CF.** `integrated_expected_intensity()` replaces `lambda * tau`; passing raw `lambda * tau` re-introduces the horizon-amplification bug.
+- **`ExecutionEngine` uses `__slots__`.** Add a slot before assigning a new attribute (this is how `divergence_filter` is attached).
+- **Panic sweeps are priced off the book, not off `p_hat`**, and are re-issued until `q == 0`.
 
-**Hawkes stationarity guard**: On first tick, `MicrostructuralState` validates the branching ratio (kappa_self + kappa_cross) / beta < 1.0. If explosive, parameters are automatically scaled to force spectral radius = 0.8.
+## History worth knowing
 
-**Cycle timing**: `MarketManager.get_next_expiry()` preempts the rollover by 15 seconds so the bot subscribes to the new cycle early. Expirations are always multiples of 300 seconds (Unix epoch).
-
-### Pricing pipeline detail
-
-1. **Volatility**: `HighFrequencyVolatilityCalibrator` samples spot every ≥5s, filters >1.5% jumps (resets buffer), caps returns at ±0.5%, computes annualized realized vol over a 300s rolling window.
-2. **Microstructural State**: `MicrostructuralState.update_state()` updates bivariate Hawkes intensities λ+ and λ- tick-by-tick from directional OFI shocks, with optional OFI-modulated drift.
-3. **Probability**: `HawkesMertonPricer.calculate_probability()` computes P(S_T > K) via Gil-Pelaez Fourier inversion of the Hawkes-Merton characteristic function, using Black-Scholes as a control variate, with vectorized Gauss-Legendre quadrature (64 nodes).
-4. **EMA smoothing**: Raw `p_yes` from the pricer is smoothed with a time-based EMA (halflife adaptive, compressed near expiry) in the orchestrator before passing to the engine.
-
-### Risk filters in ExecutionEngine
-
-- **Pin Risk**: blocks trades when `|spot - strike| < oracle_noise` in the final `PIN_RISK_SECONDS` before expiry. Uses bisect for O(log N) spot history lookups.
-- **Desync/Staleness**: blocks if top-of-book quotes are >100ms stale and spot has moved more than the diffusion-implied threshold (z-score × σ × √dt). Uses bisect binary search for closest-spot lookup.
-- **PoF (Fill Probability)**: scales EV by a logistic decay `1 / (1 + exp(-k*(tau - tau_lim)))` to penalize late-cycle trades that risk not being filled before expiry.
-
-### Logging output structure
-
-```
-logs/
-└── YYYY-MM-DD/
-    └── merton/
-        ├── live_<unix_ts>/
-        │   ├── ticks.parquet    # buffered (every 100 ticks), zstd compressed
-        │   ├── signals.csv      # immediate append on every signal
-        │   └── trades.csv       # immediate append on every execution
-        └── backtest_YYYYMMDD_HHMMSS/
-            ├── signals.csv      # backtest signals
-            ├── trades.csv       # backtest executions
-            └── summary.json     # full performance metrics report
-```
-
-### Windows-specific
-
-The orchestrator runs `_keep_awake_loop` (every 30s) to call `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)` via `ctypes`, preventing Windows sleep during live sessions. This is OS-gated (`os.name == 'nt'`).
+Commit `2324e84` consolidated the maker/taker engines into `ExecutionRouter`. That refactor left `main.py`, `run_backtest.py` and several `tests/verify_*.py` pointing at removed APIs (`ExecutionEngine(config)`, `evaluate_and_trade`, `client.execute_trade`, `src/execution/maker_execution`), so neither the live orchestrator nor the backtester could start. Those were repaired in the same change that introduced configurable cycle length, the time-integrated Hawkes intensity and the book-anchored, retried panic sweep. Old `README` text describing a "Kelly + Pin/Desync/PoF" engine referred to code that no longer exists.
