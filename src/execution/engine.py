@@ -115,7 +115,7 @@ class ExecutionRouter:
         'active_bid_id', 'active_bid_price', 'active_bid_qty',
         'active_ask_id', 'active_ask_price', 'active_ask_qty',
         # Order counter for mock ID generation
-        '_order_counter', 'min_order_usd', 'locked', 'panic_concession'
+        '_order_counter', 'min_order_usd', 'locked', 'panic_concession', 'taker_enabled'
     )
 
     def __init__(
@@ -134,7 +134,8 @@ class ExecutionRouter:
         gas_fee_usd: float = 0.03,
         taker_fee_multiplier: float = 0.072,
         min_order_usd: float = 1.0,
-        panic_concession: float = 0.15
+        panic_concession: float = 0.15,
+        taker_enabled: bool = True
     ):
         self.gamma = gamma
         self.min_fee_buffer = min_fee_buffer
@@ -152,6 +153,7 @@ class ExecutionRouter:
         self.min_order_usd = min_order_usd
         self.locked = False
         self.panic_concession = panic_concession
+        self.taker_enabled = taker_enabled
 
         # State memory
         self.active_bid_id: str = ""
@@ -359,8 +361,8 @@ class ExecutionRouter:
                 
         else:
             # Check for REGIME B: Taker crossing conditions
-            taker_buy_yes = p_bid_target > best_ask + self.taker_edge_epsilon
-            taker_buy_no = p_ask_target < best_bid - self.taker_edge_epsilon
+            taker_buy_yes = self.taker_enabled and p_bid_target > best_ask + self.taker_edge_epsilon
+            taker_buy_no = self.taker_enabled and p_ask_target < best_bid - self.taker_edge_epsilon
             
             if taker_buy_yes:
                 # Massive edge buying YES shares
@@ -606,7 +608,8 @@ class ExecutionEngine:
             gas_fee_usd=config.arbitrage.GAS_FEE_USD,
             taker_fee_multiplier=config.arbitrage.TAKER_FEE_MULTIPLIER,
             min_order_usd=config.arbitrage.MIN_ORDER_USD,
-            panic_concession=config.arbitrage.PANIC_CONCESSION
+            panic_concession=config.arbitrage.PANIC_CONCESSION,
+            taker_enabled=config.arbitrage.TAKER_ENABLED
         )
         # Time-sampled EWMA mid-price variance calibrator (10s sampling, alpha=0.05)
         self.mid_price_calibrator = MidPriceVolCalibrator(sampling_interval=10.0, alpha=0.05)
