@@ -105,6 +105,14 @@ async def main():
     )
     args = parse_args()
     print("=== Polymarket V2 Backtest Replay ===")
+
+    # Optional determinism for parameter sweeps (stochastic rejection + taker latency use RNG)
+    seed = os.getenv("BACKTEST_SEED")
+    if seed is not None:
+        import random
+        import numpy as np
+        random.seed(int(seed))
+        np.random.seed(int(seed))
     
     config = SystemConfig()
     if args.strategy:

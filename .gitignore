@@ -11,3 +11,7 @@ wheels/
 .env
 logs/
 *.log
+
+# backtest sweep outputs
+scratch/sweep_runs/
+scratch/sweep_results.csv
