@@ -68,7 +68,7 @@ ChainlinkSpotFeed (WS)      ClobOrderBookFeed (WS, YES token only)
 
 Evaluated in this order every tick: **PANIC** (tau ≤ 15 s, or tau ≤ 45 s with spread > 0.10: cancel all, IOC-sweep the whole net position at `best_bid − PANIC_CONCESSION` / `best_ask + PANIC_CONCESSION`, re-issued every tick until flat, sets `locked`) → **locked** (cancel all, no new positions until rollover) → **REDUCE** (tau ≤ 45 s, reduce-only quoting) → **C** unwind (|q| > MAX_INVENTORY or model realigned with mid) → **B** taker (target quote crosses the book by more than `MM_TAKER_EDGE_EPSILON`; fractional Kelly size) → **A** maker (post-only quotes at `P_res ± delta`).
 
-`p_hat` is the EMA-smoothed probability computed once per tick in `main.py` (and the runner) and passed to `ExecutionEngine.evaluate_and_route(context, p_hat=...)`. The engine only calls `strategy.get_probability` itself when no `p_hat` is supplied (unit tests).
+`p_hat` is the raw probability computed once per tick in `main.py` (and the runner) and passed to `ExecutionEngine.evaluate_and_route(context, p_hat=...)`; the EMA-smoothed value is used for logging, the UI and the divergence filter. The engine only calls `strategy.get_probability` itself when no `p_hat` is supplied (unit tests). Routing on the EMA was tried and rejected: with a 3 s half-life the lagged fair value crosses the book after the market has already moved (more taker signals, worse P&L on a seed-matched replay).
 
 ## Invariants — do not break
 
@@ -76,7 +76,7 @@ Evaluated in this order every tick: **PANIC** (tau ≤ 15 s, or tau ≤ 45 s wit
 - **V_hist vs V_cons.** `get_market_top_of_book()` reads the untouched feed state; `get_sorted_bids/asks()` return `V_hist − V_cons`. Paper fills go through `paper_execute()` only.
 - **Awaited execution.** `_clob_callback` awaits every `process_instruction` so fills are in V_cons before the next tick.
 - **Strike guard.** `MarketContext.strike_price is None` ⇒ strategy returns `None` and the router cancels everything (`SAFE`).
-- **`strategy.get_probability` runs exactly once per tick.** `MicrostructuralState.update_state` adds the tick's OFI shock on every call; a second call at the same timestamp (dt = 0) double-counts the Hawkes excitation. Pass the smoothed `p_hat` into the engine instead of letting it re-price. Recorded sessions before this rule had 1,020 taker round trips closed in a median 0.34 s on model swings of 0.55 with spot unchanged.
+- **`strategy.get_probability` runs exactly once per tick.** `MicrostructuralState.update_state` adds the tick's OFI shock on every call; a second call at the same timestamp (dt = 0) double-counts the Hawkes excitation. Pass the tick's `p_hat` into the engine instead of letting it re-price. Recorded sessions before this rule had 1,020 taker round trips closed in a median 0.34 s on model swings of 0.55 with spot unchanged.
 - **Cycle timing is config-driven.** Every boundary computation uses `CYCLE_DURATION_SEC` (`MarketManager.cycle_duration_sec` in `main.py`/`dashboard.py`, `config.polymarket.CYCLE_DURATION_SEC` in the runner). Never hard-code 300.
 - **Hawkes intensities are time-integrated in the CF.** `integrated_expected_intensity()` replaces `lambda * tau`; passing raw `lambda * tau` re-introduces the horizon-amplification bug.
 - **`ExecutionEngine` uses `__slots__`.** Add a slot before assigning a new attribute (this is how `divergence_filter` is attached).
