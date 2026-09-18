@@ -1,0 +1,132 @@
+{
+  "timestamp": "2026-09-17T23:22:36.240909",
+  "strategy": "merton",
+  "ticks_processed": 128663,
+  "initial_capital": 10000.0,
+  "final_cash": 9636.552147238895,
+  "net_pnl": -363.4478527611045,
+  "total_return_pct": -3.634478527611045,
+  "max_drawdown_pct": 9.706343534816831,
+  "max_drawdown_usd": 1000.8240875852334,
+  "total_trades": 12,
+  "winning_trades": 5,
+  "losing_trades": 7,
+  "flat_trades": 0,
+  "gross_profit": 242.26810279915918,
+  "gross_loss": 478.89090377426527,
+  "profit_factor": 0.5058941418385283,
+  "win_rate_pct": 41.66666666666667,
+  "avg_win": 48.45362055983183,
+  "avg_loss": 68.41298625346647,
+  "win_loss_ratio": 0.7082517985739396,
+  "realized_trades": [
+    {
+      "timestamp": 1779986412.0319169,
+      "side": "SELL_YES",
+      "qty": 178.8002812439466,
+      "entry_price": 0.42,
+      "exit_price": 0.41,
+      "pnl": -4.932131550809032,
+      "won": false
+    },
+    {
+      "timestamp": 1779986429.0606048,
+      "side": "SELL_YES",
+      "qty": 245.18894951029196,
+      "entry_price": 0.42,
+      "exit_price": 0.46,
+      "pnl": 9.777557980411686,
+      "won": true
+    },
+    {
+      "timestamp": 1779986468.0890913,
+      "side": "SELL_YES",
+      "qty": 284.78142476678875,
+      "entry_price": 0.53,
+      "exit_price": 0.69,
+      "pnl": 41.1491661961378,
+      "won": true
+    },
+    {
+      "timestamp": 1779986469.4657435,
+      "side": "SELL_YES",
+      "qty": 130.3739418944063,
+      "entry_price": 0.53,
+      "exit_price": 0.69,
+      "pnl": 18.821967698777627,
+      "won": true
+    },
+    {
+      "timestamp": 1779986698.232385,
+      "side": "SELL_YES",
+      "qty": 303.47,
+      "entry_price": 0.98,
+      "exit_price": 0.47,
+      "pnl": -160.242495144,
+      "won": false
+    },
+    {
+      "timestamp": 1779986699.00692,
+      "side": "SELL_YES",
+      "qty": 152.35,
+      "entry_price": 0.98,
+      "exit_price": 0.4699999999999999,
+      "pnl": -80.46092772000002,
+      "won": false
+    },
+    {
+      "timestamp": 1779986699.3845341,
+      "side": "SELL_YES",
+      "qty": 44.180000000000035,
+      "entry_price": 0.98,
+      "exit_price": 0.38,
+      "pnl": -27.287434176000023,
+      "won": false
+    },
+    {
+      "timestamp": 1779986963.8224037,
+      "side": "SELL_YES",
+      "qty": 250.60870040768046,
+      "entry_price": 0.54,
+      "exit_price": 0.09,
+      "pnl": -112.80391518345621,
+      "won": false
+    },
+    {
+      "timestamp": 1779987008.040838,
+      "side": "SELL_YES",
+      "qty": 486.92734414365015,
+      "entry_price": 0.5,
+      "exit_price": 0.5,
+      "pnl": -0.030000000000001137,
+      "won": false
+    },
+    {
+      "timestamp": 1779987092.4479403,
+      "side": "SELL_YES",
+      "qty": 164.3043900041419,
+      "entry_price": 0.54,
+      "exit_price": 0.74,
+      "pnl": 30.554802146979,
+      "won": true
+    },
+    {
+      "timestamp": 1779988111.795893,
+      "side": "SETTLE_YES",
+      "qty": 308.68393212359365,
+      "entry_price": 0.54,
+      "exit_price": 1.0,
+      "pnl": 141.96460877685305,
+      "won": true
+    },
+    {
+      "timestamp": 1779988126.4412544,
+      "side": "SETTLE_NO",
+      "qty": 211.6,
+      "entry_price": 0.43999999999999995,
+      "exit_price": 0.0,
+      "pnl": -93.13399999999999,
+      "won": false
+    }
+  ]
+}

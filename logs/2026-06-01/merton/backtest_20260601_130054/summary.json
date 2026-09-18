@@ -1,0 +1,42 @@
+{
+  "timestamp": "2026-06-01T13:00:55.892965",
+  "strategy": "merton",
+  "ticks_processed": 1000,
+  "initial_capital": 10000.0,
+  "final_cash": 8200.544199005231,
+  "net_pnl": -1799.4558009947687,
+  "total_return_pct": -17.994558009947685,
+  "max_drawdown_pct": 18.36571440359052,
+  "max_drawdown_usd": 1844.921549966688,
+  "total_trades": 2,
+  "winning_trades": 0,
+  "losing_trades": 2,
+  "flat_trades": 0,
+  "gross_profit": 0,
+  "gross_loss": 1717.0042185182338,
+  "profit_factor": 0.0,
+  "win_rate_pct": 0.0,
+  "avg_win": 0.0,
+  "avg_loss": 858.5021092591169,
+  "win_loss_ratio": 0.0,
+  "realized_trades": [
+    {
+      "timestamp": 1779562500.508487,
+      "side": "SETTLE_NO",
+      "qty": 2429.284183120076,
+      "entry_price": 0.19971942962159026,
+      "exit_price": 0.0,
+      "pnl": -485.20525144149235,
+      "won": false
+    },
+    {
+      "timestamp": 1779562800.096004,
+      "side": "SETTLE_YES",
+      "qty": 3321.3613938939993,
+      "entry_price": 0.37086267376420684,
+      "exit_price": 0.0,
+      "pnl": -1231.7989670767415,
+      "won": false
+    }
+  ]
+}

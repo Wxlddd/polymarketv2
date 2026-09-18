@@ -1,0 +1,2 @@
+timestamp,side,qty,vwap,p_market,expected_slippage_bps,realized_slippage_bps,ev,strike,resolved_won,pnl,capital
+1789683655.7804778,BUY_YES,100.0,0.48,0.48,5.0,4.5,0.02,67500.0,False,-48.0,9952.0

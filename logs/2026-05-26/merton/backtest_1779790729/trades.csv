@@ -1,0 +1,1 @@
+timestamp,side,qty,vwap,p_market,expected_slippage_bps,realized_slippage_bps,ev,strike,resolved_won,pnl,capital

@@ -1,0 +1,2 @@
+timestamp,spot_price,strike,model_prob,implied_prob,kelly_size,status
+1779792300.4465826,77416.18215656183,77415.69949754188,0.99,0.445,306.24,BUY_YES
