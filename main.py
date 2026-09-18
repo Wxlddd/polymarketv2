@@ -691,8 +691,8 @@ class LiveOrchestrator:
                             "signal": {"side": result["side"], "size": result["qty"], "vwap": result["price"], "ev": 0.0}
                         })
         
-        # 2. Generate and process new quoting instructions
-        instructions = self.engine.evaluate_and_route(context)
+        # 2. Generate and process new quoting instructions on the smoothed probability
+        instructions = self.engine.evaluate_and_route(context, p_hat=p_yes)
         
         # Format diagnostic decision for the dashboard
         bid_p = self.engine.execution_router.active_bid_price

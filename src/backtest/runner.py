@@ -317,7 +317,7 @@ class BacktestRunner:
                     bids_l2=shadow_book.get_sorted_bids(),
                     asks_l2=shadow_book.get_sorted_asks()
                 )
-                instructions = engine.evaluate_and_route(context)
+                instructions = engine.evaluate_and_route(context, p_hat=p_yes)
 
                 last_evaluated_p_yes = p_yes
                 last_evaluated_best_bid = cur_best_bid
