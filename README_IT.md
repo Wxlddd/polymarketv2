@@ -66,7 +66,8 @@ Output per sessione:
 
 ```
 logs/YYYY-MM-DD/merton/live_<unix_ts>/
-├── ticks.parquet   # ogni tick CLOB con spot, OFI, vol, L2 completo (zstd, buffer 1000 righe)
+├── ticks.parquet   # ogni update CLOB (snapshot/delta + flag is_snapshot) con spot, OFI, vol, top of book riconciliato
+├── prints.parquet  # ogni trade print YES (last_trade_price): prezzo, size, lato aggressore, timestamp exchange
 ├── signals.csv     # probabilità modello vs mercato a ogni segnale taker / fill maker
 └── trades.csv      # ogni fill paper e settlement con P&L e capitale
 ```

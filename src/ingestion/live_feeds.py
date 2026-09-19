@@ -196,12 +196,14 @@ class ClobOrderBookFeed:
     order book updates for YES/NO tokens.
     """
     
-    def __init__(self, config: SystemConfig, book_callback):
+    def __init__(self, config: SystemConfig, book_callback, trade_callback=None):
         self.config = config
         self.wss_url = config.polymarket.WS_URL
         self.yes_token = config.polymarket.YES_TOKEN_ID
         self.no_token = config.polymarket.NO_TOKEN_ID
         self.book_callback = book_callback
+        # Optional: called as (price, size, side, exchange_ts) for every YES trade print
+        self.trade_callback = trade_callback
         
         self._is_connected = False
         self._is_running = False
@@ -316,6 +318,25 @@ class ClobOrderBookFeed:
                                 
                     if yes_bids or yes_asks:
                         result = self.book_callback(yes_bids, yes_asks, is_snapshot=False)
+                        if inspect.iscoroutine(result):
+                            await result
+
+                # 3. Trade prints — the only ground truth for who actually got filled at a level
+                elif ev.get("event_type") == "last_trade_price":
+                    if self.trade_callback is not None and ev.get("asset_id") == self.yes_token:
+                        try:
+                            price = float(ev.get("price"))
+                            size = float(ev.get("size", 0.0))
+                        except (TypeError, ValueError):
+                            continue
+                        side = str(ev.get("side", "")).upper()
+                        exch_ts = None
+                        try:
+                            raw_ts = float(ev.get("timestamp"))
+                            exch_ts = raw_ts / 1000.0 if raw_ts > 1e11 else raw_ts  # ms vs s
+                        except (TypeError, ValueError):
+                            pass
+                        result = self.trade_callback(price, size, side, exch_ts)
                         if inspect.iscoroutine(result):
                             await result
         except Exception as e:

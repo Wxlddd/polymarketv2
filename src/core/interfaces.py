@@ -111,9 +111,22 @@ class IDataRecorder(ABC):
     """Abstract interface for data logging and backtest tracking."""
 
     @abstractmethod
-    def record_tick(self, timestamp: float, spot_price: float, ofi: float, volatility: float, bids_l2: List[Tuple[float, float]], asks_l2: List[Tuple[float, float]]) -> None:
-        """Logs a single market tick update with L2 book depth."""
+    def record_tick(
+        self, timestamp: float, spot_price: float, ofi: float, volatility: float,
+        bids_l2: List[Tuple[float, float]], asks_l2: List[Tuple[float, float]],
+        top_bid: Optional[Tuple[float, float]] = None, top_ask: Optional[Tuple[float, float]] = None,
+        is_snapshot: bool = False
+    ) -> None:
+        """
+        Logs a single market tick. bids_l2/asks_l2 are the raw feed update (snapshot or delta,
+        as flagged by is_snapshot) so the book can be replayed; top_bid/top_ask are the
+        reconciled top of book after applying it.
+        """
         pass
+
+    def record_print(self, timestamp: float, price: float, size: float, side: str, exchange_ts: Optional[float] = None) -> None:
+        """Logs an exchange trade print (last_trade_price) for the YES token. Optional for recorders that do not persist prints."""
+        return None
 
     @abstractmethod
     def record_signal(self, timestamp: float, spot_price: float, strike: float, model_prob: float, implied_prob: float, kelly_size: float, status: str) -> None:
