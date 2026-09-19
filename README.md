@@ -167,7 +167,11 @@ All in `.env`, read by `config/settings.py`.
 | `STRATEGY_NAME` | `merton` | or `legacy_merton` (Poisson jumps + OFI logit shift). |
 | `V_MAX`, `GAMMA` | `0.005`, `2` | Divergence filter. `scratch/calibrate_divergence.py` prints percentiles from a log. |
 
-Defined but unused by any code: `MIN_EXPECTED_VALUE`, `PIN_RISK_SECONDS`, `DESYNC_Z_SCORE`, `POF_*`, `COOLDOWN_PERIOD_SEC`, `MAX_POSITION_SIZE_USD`.
+Every key above is read by the code. Settings that no longer did anything (`MIN_EXPECTED_VALUE`,
+`PIN_RISK_SECONDS`, `DESYNC_Z_SCORE`, `POF_*`, `COOLDOWN_PERIOD_SEC`, `MAX_POSITION_SIZE_USD`,
+`MIN_ACCEPTABLE_MARGIN_BPS`, `ABSOLUTE_MAX_SLIPPAGE_BPS`, `ORACLE_NOISE_BPS`, `MIN_KELLY_THRESHOLD`,
+`MM_ENABLED`, `HAWKES_KAPPA`, `PRESUMED_STRIKE_PRICE`, `EXPIRATION_TIMESTAMP`) were removed — they
+described the pre-refactor engine. Leaving them in a `.env` is harmless; they are simply ignored.
 
 ## Validation scripts
 

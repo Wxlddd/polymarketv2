@@ -12,21 +12,25 @@ def main():
     # 1. Load configuration
     config = SystemConfig()
     print(f"Loaded config. Ticker: {config.TICKER}")
-    print(f"Presumed Strike: {config.polymarket.PRESUMED_STRIKE_PRICE}")
+
+    # The live orchestrator always starts a cycle with an unresolved strike and locks it
+    # from the first Chainlink tick; this literal stands in for that pre-resolution value.
+    presumed_strike = 67500.0
+    print(f"Presumed Strike: {presumed_strike}")
     
     # 2. Strike Resolution Logic Test
     # Set expiration time to 3 seconds from now
     now = time.time()
     expiration_time = now + 3.0
     strike_manager = StrikeManager(
-        presumed_strike=config.polymarket.PRESUMED_STRIKE_PRICE,
+        presumed_strike=presumed_strike,
         expiration_timestamp=expiration_time
     )
     
     print("\n--- Testing Strike Resolution ---")
     # Spot tick before expiration
     s1 = strike_manager.get_strike(time.time(), 67200.0)
-    print(f"Current strike (before expiration): ${s1} (Expected presumed: {config.polymarket.PRESUMED_STRIKE_PRICE})")
+    print(f"Current strike (before expiration): ${s1} (Expected presumed: {presumed_strike})")
     
     # Wait for expiration
     print("Waiting 3.5 seconds for expiration...")

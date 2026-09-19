@@ -422,19 +422,11 @@ class MertonStrategy(BaseStrategy):
         sigma = self.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
         
         # 2. Update Hawkes/Microstructural state tick-by-tick using Bivariate parameters
-        beta = getattr(self.config.merton, "HAWKES_BETA", 5.0)
-        legacy_kappa = getattr(self.config.merton, "HAWKES_KAPPA", 10.0)
-        kappa_self = getattr(self.config.merton, "HAWKES_KAPPA_SELF", 3.0)
-        kappa_cross = getattr(self.config.merton, "HAWKES_KAPPA_CROSS", 1.0)
-        
-        # Legacy fallback auto-migration:
-        # If legacy HAWKES_KAPPA is customized (not 10.0) in .env, but HAWKES_KAPPA_SELF is default (3.0),
-        # treat legacy HAWKES_KAPPA as HAWKES_KAPPA_SELF.
-        if legacy_kappa != 10.0 and kappa_self == 3.0:
-            kappa_self = legacy_kappa
-            
-        ofi_multiplier = getattr(self.config.merton, "OFI_DRIFT_MULTIPLIER", -1e-6)
-        use_local_drift = getattr(self.config.merton, "USE_LOCAL_INFORMED_DRIFT", False)
+        beta = self.config.merton.HAWKES_BETA
+        kappa_self = self.config.merton.HAWKES_KAPPA_SELF
+        kappa_cross = self.config.merton.HAWKES_KAPPA_CROSS
+        ofi_multiplier = self.config.merton.OFI_DRIFT_MULTIPLIER
+        use_local_drift = self.config.merton.USE_LOCAL_INFORMED_DRIFT
         
         # Risk-free rate (assumed 0 in short-term predictions, but can be customized)
         r = 0.0

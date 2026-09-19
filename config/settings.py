@@ -21,10 +21,6 @@ class PolymarketConfig:
     YES_TOKEN_ID: str = field(default_factory=lambda: os.getenv("YES_TOKEN_ID", "0xYourYesTokenId"))
     NO_TOKEN_ID: str = field(default_factory=lambda: os.getenv("NO_TOKEN_ID", "0xYourNoTokenId"))
 
-    # Strike details
-    PRESUMED_STRIKE_PRICE: float = field(default_factory=lambda: float(os.getenv("PRESUMED_STRIKE_PRICE", "67500.0")))
-    EXPIRATION_TIMESTAMP: float = field(default_factory=lambda: float(os.getenv("EXPIRATION_TIMESTAMP", "0.0")))
-
     # Market cycle settings — Polymarket runs several parallel Up/Down cycle
     # lengths per ticker (e.g. "5m" every 300s, "4h" every 14400s). Both the
     # rollover clock and the deterministic event slug depend on these two
@@ -56,7 +52,6 @@ class MertonJumpDiffusionConfig:
     
     # Hawkes stochastic intensity parameters
     HAWKES_LAMBDA_0: float = field(default_factory=lambda: float(os.getenv("HAWKES_LAMBDA_0", "4000.0")))
-    HAWKES_KAPPA: float = field(default_factory=lambda: float(os.getenv("HAWKES_KAPPA", "10.0")))  # Deprecated fallback
     HAWKES_KAPPA_SELF: float = field(default_factory=lambda: float(os.getenv("HAWKES_KAPPA_SELF", "3.0")))
     HAWKES_KAPPA_CROSS: float = field(default_factory=lambda: float(os.getenv("HAWKES_KAPPA_CROSS", "1.0")))
     HAWKES_BETA: float = field(default_factory=lambda: float(os.getenv("HAWKES_BETA", "5.0")))
@@ -70,10 +65,6 @@ class ArbitrageConfig:
     KELLY_FRACTION: float = field(default_factory=lambda: float(os.getenv("KELLY_FRACTION", "0.05")))
     GAS_FEE_USD: float = field(default_factory=lambda: float(os.getenv("GAS_FEE_USD", "0.03")))
     TAKER_FEE_MULTIPLIER: float = field(default_factory=lambda: float(os.getenv("TAKER_FEE_MULTIPLIER", "0.072")))
-    MIN_EXPECTED_VALUE: float = field(default_factory=lambda: float(os.getenv("MIN_EXPECTED_VALUE", "0.005")))
-    MIN_ACCEPTABLE_MARGIN_BPS: float = field(default_factory=lambda: float(os.getenv("MIN_ACCEPTABLE_MARGIN_BPS", "5.0")))
-    ABSOLUTE_MAX_SLIPPAGE_BPS: float = field(default_factory=lambda: float(os.getenv("ABSOLUTE_MAX_SLIPPAGE_BPS", "150.0")))
-    MAX_POSITION_SIZE_USD: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_USD", "250.0")))
     MIN_ORDER_USD: float = field(default_factory=lambda: float(os.getenv("MIN_ORDER_USD", "1.0")))
     # Maker-only by default: on recorded data the model's information is real but not
     # executable — a signal traded one tick after it appears loses money (see README).
@@ -82,23 +73,15 @@ class ArbitrageConfig:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    """Risk management parameters."""
-    DESYNC_Z_SCORE: float = field(default_factory=lambda: float(os.getenv("DESYNC_Z_SCORE", "2.0")))
-    POF_LATENCY_TAU: float = field(default_factory=lambda: float(os.getenv("POF_LATENCY_TAU", "3.0")))
-    POF_DECAY_K: float = field(default_factory=lambda: float(os.getenv("POF_DECAY_K", "0.25")))
-    ORACLE_NOISE_BPS: float = field(default_factory=lambda: float(os.getenv("ORACLE_NOISE_BPS", "1.5")))
-    PIN_RISK_SECONDS: float = field(default_factory=lambda: float(os.getenv("PIN_RISK_SECONDS", "3.0")))
-    COOLDOWN_PERIOD_SEC: int = field(default_factory=lambda: int(os.getenv("COOLDOWN_PERIOD_SEC", "10")))
+    """Parameters of the divergence velocity filter (the only risk filter in the engine)."""
     DIVERGENCE_WINDOW_SECONDS: float = field(default_factory=lambda: float(os.getenv("DIVERGENCE_WINDOW_SECONDS", "60.0")))
     VELOCITY_LOOKBACK_SECONDS: float = field(default_factory=lambda: float(os.getenv("VELOCITY_LOOKBACK_SECONDS", "10.0")))
     V_MAX: float = field(default_factory=lambda: float(os.getenv("V_MAX", "0.005")))
     GAMMA: float = field(default_factory=lambda: float(os.getenv("GAMMA", "2.0")))
-    MIN_KELLY_THRESHOLD: float = field(default_factory=lambda: float(os.getenv("MIN_KELLY_THRESHOLD", "0.01")))
 
 @dataclass(frozen=True)
 class MarketMakerConfig:
     """Statistical market making and quoting configurations."""
-    ENABLED: bool = field(default_factory=lambda: os.getenv("MM_ENABLED", "True").lower() == "true")
     RISK_AVERSION: float = field(default_factory=lambda: float(os.getenv("MM_RISK_AVERSION", "2.5")))
     MIN_FEE_BUFFER: float = field(default_factory=lambda: float(os.getenv("MM_MIN_FEE_BUFFER", "0.005")))
     TOXICITY_BUFFER: float = field(default_factory=lambda: float(os.getenv("MM_TOXICITY_BUFFER", "0.005")))

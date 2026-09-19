@@ -168,7 +168,12 @@ Tutti in `.env`, letti da `config/settings.py`.
 | `STRATEGY_NAME` | `merton` | oppure `legacy_merton` (salti Poisson + shift logit OFI). |
 | `V_MAX`, `GAMMA` | `0.005`, `2` | Divergence filter. `scratch/calibrate_divergence.py` stampa i percentili da un log. |
 
-Definiti ma non usati da nessun codice: `MIN_EXPECTED_VALUE`, `PIN_RISK_SECONDS`, `DESYNC_Z_SCORE`, `POF_*`, `COOLDOWN_PERIOD_SEC`, `MAX_POSITION_SIZE_USD`.
+Ogni chiave qui sopra è letta dal codice. Le impostazioni che non facevano più niente
+(`MIN_EXPECTED_VALUE`, `PIN_RISK_SECONDS`, `DESYNC_Z_SCORE`, `POF_*`, `COOLDOWN_PERIOD_SEC`,
+`MAX_POSITION_SIZE_USD`, `MIN_ACCEPTABLE_MARGIN_BPS`, `ABSOLUTE_MAX_SLIPPAGE_BPS`,
+`ORACLE_NOISE_BPS`, `MIN_KELLY_THRESHOLD`, `MM_ENABLED`, `HAWKES_KAPPA`, `PRESUMED_STRIKE_PRICE`,
+`EXPIRATION_TIMESTAMP`) sono state rimosse: descrivevano il motore pre-refactor. Lasciarle nel
+`.env` è innocuo, vengono semplicemente ignorate.
 
 ## Script di verifica
 
