@@ -90,11 +90,36 @@ class TestMakerExecution(unittest.TestCase):
         self.assertGreater(short_inv, flat)
 
     def test_spread_calculation(self):
-        sigma_sq = 0.25
+        """Half-spread = buffers + half the risk term, in probability points."""
+        sigma_sq = 1e-5          # points^2 per second, the measured order of magnitude
         tau_sec = 300.0
         delta = self.router.calculate_spread(sigma_sq, tau_sec)
-        expected = 0.005 + 0.5 * self.gamma * sigma_sq * (tau_sec / (365.25 * 24.0 * 3600.0)) + 0.005
+        expected = 0.005 + 0.005 + 0.5 * self.gamma * sigma_sq * tau_sec
         self.assertAlmostEqual(delta, expected)
+
+    def test_risk_term_units_are_shared(self):
+        """The skew and the half-spread must be built from the same quantity, and that
+        quantity must scale with variance and with the horizon."""
+        sigma_sq, tau = 1e-5, 300.0
+        risk = self.router.risk_term(sigma_sq, tau)
+        self.assertAlmostEqual(risk, self.gamma * sigma_sq * tau)
+        # half-spread carries exactly half of it
+        self.assertAlmostEqual(self.router.calculate_spread(sigma_sq, tau) - 0.01, 0.5 * risk)
+        # linear in variance, linear in horizon (below the cap)
+        self.assertAlmostEqual(self.router.risk_term(2 * sigma_sq, tau), 2 * risk)
+        self.assertAlmostEqual(self.router.risk_term(sigma_sq, tau / 2), risk / 2)
+
+    def test_horizon_capped_at_holding_time(self):
+        """A 4h contract must not be quoted as if the inventory were held to settlement."""
+        sigma_sq = 1e-5
+        five_min = self.router.risk_term(sigma_sq, 300.0)
+        four_hours = self.router.risk_term(sigma_sq, 14400.0)
+        self.assertAlmostEqual(five_min, four_hours,
+                               msg="horizon not capped: 4h quotes would be ~48x wider")
+
+    def test_spread_capped_on_variance_spike(self):
+        from src.execution.engine import MAX_HALF_SPREAD
+        self.assertLessEqual(self.router.calculate_spread(1.0, 300.0), MAX_HALF_SPREAD)
 
     def test_regime_a_maker_quoting(self):
         context = MarketContext(

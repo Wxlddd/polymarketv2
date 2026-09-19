@@ -7,43 +7,68 @@ from config.settings import SystemConfig
 import logging
 
 logger = logging.getLogger("MakerExecution")
+# Guardrails on the quoting maths. The mid-price variance has a very long right tail
+# (median ~9e-6, p99 ~1e-2 points^2/s on recorded books), and an unclamped risk term would
+# either pull the quotes off the book or skew the fair value past the spread.
+MAX_HALF_SPREAD = 0.10   # never quote wider than +/- 10 points
+MAX_SKEW = 0.10          # never move the reservation price more than 10 points on inventory
+
+
 class MidPriceVolCalibrator:
     """
-    Time-Sampled Exponentially Weighted Moving Average (EWMA) Volatility Calibrator.
-    Samples the contract's mid-price at fixed time intervals (e.g. 10s) and computes
-    log-return variance. Bypasses tick-by-tick bid-ask bounce noise.
+    EWMA variance of the contract mid, in probability points squared PER SECOND.
+
+    Avellaneda-Stoikov needs price variance per unit time, in the same units as the quotes,
+    so this tracks (delta price)^2 / delta t on the contract price itself. It used to track
+    squared log-returns over whatever the sampling gap happened to be, which is neither a
+    price variance nor per-unit-time: the quoting maths then mixed that number with a
+    horizon in years in one place and used it raw in another.
+
+    Measured on recorded books: median ~9e-6, with a long tail (p99 ~1e-2) around cycle
+    boundaries, hence the outlier guard.
     """
     __slots__ = ('sampling_interval', 'alpha', 'last_sample_time', 'last_sample_price', 'variance')
-    
-    def __init__(self, sampling_interval: float = 10.0, alpha: float = 0.05, initial_vol: float = 0.25):
+
+    # A mid that jumps more than this between samples is a new cycle or a book glitch,
+    # not volatility to quote around.
+    MAX_JUMP = 0.25
+
+    def __init__(self, sampling_interval: float = 10.0, alpha: float = 0.05,
+                 initial_variance_per_sec: float = 1e-5):
         self.sampling_interval = sampling_interval
         self.alpha = alpha
         self.last_sample_time = 0.0
         self.last_sample_price = None
-        self.variance = initial_vol * initial_vol
+        self.variance = initial_variance_per_sec
         
     def update(self, current_price: float, t_now: float) -> float:
         """
-        Conditionally updates the variance using EWMA log-returns if interval elapsed.
-        Returns the current variance (sigma^2).
+        Updates the EWMA variance once the sampling interval has elapsed.
+        Returns sigma^2 in probability points squared per second.
         """
         if current_price is None or current_price <= 0.0:
             return self.variance
-            
+
         if self.last_sample_price is None:
             self.last_sample_price = current_price
             self.last_sample_time = t_now
             return self.variance
-            
+
         dt = t_now - self.last_sample_time
         if dt >= self.sampling_interval:
-            import math
-            log_ret = math.log(current_price / self.last_sample_price)
-            self.variance = self.alpha * (log_ret * log_ret) + (1.0 - self.alpha) * self.variance
+            dp = current_price - self.last_sample_price
+            if abs(dp) <= self.MAX_JUMP:
+                self.variance = self.alpha * (dp * dp / dt) + (1.0 - self.alpha) * self.variance
             self.last_sample_price = current_price
             self.last_sample_time = t_now
-            
+
         return self.variance
+
+    def reset(self) -> None:
+        """Drops the sampling anchor at a cycle boundary; the mid of the new cycle is
+        unrelated to the old one and its jump is not volatility."""
+        self.last_sample_price = None
+        self.last_sample_time = 0.0
 
 
 class ExecutionRouter:
@@ -123,13 +148,30 @@ class ExecutionRouter:
         self.active_ask_qty = 0.0
         self.locked = False
 
+    def risk_term(self, sigma_sq: float, tau_seconds: float) -> float:
+        r"""
+        Inventory risk in probability points: $\gamma \cdot \sigma^2 \cdot h$.
+
+        `sigma_sq` is points^2 per second and `h` is seconds, so the product is points^2
+        and gamma carries 1/points. Both the reservation-price skew and the half-spread
+        are built from this one quantity, so they can no longer disagree on units.
+
+        The horizon is the expected time to turn the inventory over, capped at
+        FIXED_HORIZON_SEC, not the full time to expiry: a maker quoting a 4h contract does
+        not intend to hold to settlement, and using tau there produced a half-spread of
+        ~0.17 (never filled). Near expiry tau is the binding one, since the position is
+        resolved then whether we like it or not.
+        """
+        horizon = self.fixed_horizon_sec if tau_seconds <= 0.0 else min(tau_seconds, self.fixed_horizon_sec)
+        return self.gamma * max(0.0, sigma_sq) * horizon
+
     def calculate_spread(self, sigma_sq: float, tau_seconds: float) -> float:
         r"""
-        Calculates optimal half-spread (delta):
-        $\delta = \text{min\_fee\_buffer} + 0.5 \cdot \gamma \cdot \sigma^2 \cdot \tau + \text{toxicity\_buffer}$
+        Half-spread: $\delta = \text{fee buffer} + \text{toxicity buffer} + \tfrac12 \gamma \sigma^2 h$,
+        capped so a variance spike cannot quote us out of the book entirely.
         """
-        tau_years = tau_seconds / (365.25 * 24.0 * 3600.0) if tau_seconds > 0.0 else (self.fixed_horizon_sec / (365.25 * 24.0 * 3600.0))
-        return self.min_fee_buffer + 0.5 * self.gamma * sigma_sq * tau_years + self.toxicity_buffer
+        delta = self.min_fee_buffer + self.toxicity_buffer + 0.5 * self.risk_term(sigma_sq, tau_seconds)
+        return min(delta, MAX_HALF_SPREAD)
 
     def evaluate_regimes(
         self,
@@ -217,7 +259,8 @@ class ExecutionRouter:
                 q_norm = max(-1.0, min(1.0, q / self.max_inventory))
                 
             # P_res calculation using the pure HFT instant risk formula recommended by the user
-            p_res = p_hat - self.gamma * q_norm * sigma_sq
+            skew = max(-MAX_SKEW, min(MAX_SKEW, q_norm * self.risk_term(sigma_sq, tau_sec)))
+            p_res = p_hat - skew
             if p_res < 0.01:
                 p_res = 0.01
             elif p_res > 0.99:
@@ -260,7 +303,8 @@ class ExecutionRouter:
         tau_sec = context.tau_seconds
         
         # P_res calculation using the pure HFT instant risk formula recommended by the user
-        p_res = p_hat - self.gamma * q_norm * sigma_sq
+        skew = max(-MAX_SKEW, min(MAX_SKEW, q_norm * self.risk_term(sigma_sq, tau_sec)))
+        p_res = p_hat - skew
         if p_res < 0.01:
             p_res = 0.01
         elif p_res > 0.99:
@@ -558,6 +602,8 @@ class ExecutionEngine:
     def reset(self) -> None:
         """Resets the execution router's active orders state (e.g. on market rollover)."""
         self.execution_router.reset_active_orders()
+        # The next cycle's mid is unrelated to this one's: do not count the jump as volatility.
+        self.mid_price_calibrator.reset()
 
     def evaluate_and_route(self, context: MarketContext, p_hat: Optional[float] = None) -> List[OrderInstruction]:
         """
