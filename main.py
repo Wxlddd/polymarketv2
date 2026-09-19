@@ -684,8 +684,6 @@ class LiveOrchestrator:
                         strike=active_strike,
                         model_prob=p_yes,
                         implied_prob=p_mkt_fill if p_mkt_fill is not None else p_yes,
-                        micro_price=getattr(self.engine.execution_router, "latest_micro_price", None) or 0.0,
-                        p_val=getattr(self.engine.execution_router, "latest_p_val", None) or 0.0,
                         kelly_size=result["qty"],
                         status=status_str
                     )
@@ -737,8 +735,6 @@ class LiveOrchestrator:
                     strike=active_strike,
                     model_prob=p_yes,
                     implied_prob=p_mkt_exec if p_mkt_exec is not None else p_yes,
-                    micro_price=getattr(self.engine.execution_router, "latest_micro_price", None) or 0.0,
-                    p_val=getattr(self.engine.execution_router, "latest_p_val", None) or 0.0,
                     kelly_size=res["qty"],
                     status=status_str
                 )
@@ -901,6 +897,9 @@ class LiveOrchestrator:
                                 })
 
                             
+                        # Drop finished tasks first: one settle task is spawned per cycle and
+                        # a long run would otherwise keep every completed one alive.
+                        self._tasks = [t for t in self._tasks if not t.done()]
                         self._tasks.append(asyncio.create_task(settle_at_expiry(old_strike_manager, old_expiry)))
                         
                     # 2. Reset StrikeManager for the new cycle (force presumed_strike to 0.0 to resolve it only via the first spot tick)
