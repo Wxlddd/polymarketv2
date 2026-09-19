@@ -46,59 +46,6 @@ class MidPriceVolCalibrator:
         return self.variance
 
 
-class InventoryManager:
-    r"""
-    Tracks net inventory risk and calculates the skewed Avellaneda-Stoikov Reservation Price.
-    
-    $q_{norm} = \text{clamp}(q / Q_{max}, -1.0, 1.0)$
-    $P_{res} = \hat{P} - \gamma \cdot q_{norm} \cdot \sigma^2$
-    """
-    __slots__ = ('gamma', 'fixed_horizon_sec', 'max_inventory')
-
-    def __init__(self, gamma: float = 0.1, fixed_horizon_sec: float = 300.0, max_inventory: float = 5000.0):
-        self.gamma = gamma
-        self.fixed_horizon_sec = fixed_horizon_sec
-        self.max_inventory = max_inventory
-
-    def get_inventory(self, yes_shares: float, no_shares: float) -> float:
-        """Returns the net inventory risk q."""
-        return yes_shares - no_shares
-
-    def calculate_reservation_price(
-        self, p_hat: float, q: float, sigma_sq: float, tau_seconds: float = 0.0
-    ) -> float:
-        """
-        Calculates the Reservation Price P_res skewed by inventory.
-        Implements asymptotic market making by completely omitting tau.
-        
-        Args:
-            p_hat: Model's internal fair probability of YES [0.0, 1.0].
-            q: Net inventory count (YES - NO).
-            sigma_sq: Mid-price EWMA variance.
-            tau_seconds: Deprecated / unused for asymptotic MM.
-            
-        Returns:
-            Reservation price, clipped to [0.01, 0.99] to prevent illegal probability values.
-        """
-        # Strictly normalize inventory skew with Max Inventory limits and division guard
-        if self.max_inventory > 0.0:
-            q_norm = max(-1.0, min(1.0, q / self.max_inventory))
-        else:
-            q_norm = 0.0
-
-        # Asymptotic MM Reservation Price formula (tau completely removed)
-        skew = self.gamma * q_norm * sigma_sq
-        p_res = p_hat - skew
-        
-        # Clip to valid probability bounds
-        if p_res < 0.01:
-            return 0.01
-        elif p_res > 0.99:
-            return 0.99
-        return p_res
-
-
-
 class ExecutionRouter:
     r"""
     Handles quoting calculations, evaluates execution regimes, and issues cancel/replace/new order routing commands.
@@ -571,11 +518,11 @@ class ExecutionRouter:
 
 class ExecutionEngine:
     """
-    High-Frequency Trading Execution Engine wrapping InventoryManager and ExecutionRouter.
+    High-Frequency Trading Execution Engine wrapping the ExecutionRouter.
     Interfaces with a generic BaseStrategy to extract probability predictions (P_hat)
     and uses the market context to fetch continuous volatility/variance.
     """
-    __slots__ = ('strategy', 'inventory_manager', 'execution_router', 'client', 'mid_price_calibrator', 'divergence_filter')
+    __slots__ = ('strategy', 'execution_router', 'client', 'mid_price_calibrator', 'divergence_filter')
 
     def __init__(
         self,
@@ -587,12 +534,6 @@ class ExecutionEngine:
         self.client = client
         self.divergence_filter = None
 
-        self.inventory_manager = InventoryManager(
-            gamma=config.maker.RISK_AVERSION,
-            fixed_horizon_sec=config.maker.FIXED_HORIZON_SEC,
-            max_inventory=config.maker.MAX_INVENTORY
-        )
-        
         self.execution_router = ExecutionRouter(
             gamma=config.maker.RISK_AVERSION,
             min_fee_buffer=config.maker.MIN_FEE_BUFFER,
@@ -618,13 +559,19 @@ class ExecutionEngine:
         """Resets the execution router's active orders state (e.g. on market rollover)."""
         self.execution_router.reset_active_orders()
 
-    def evaluate_and_route(self, context: MarketContext) -> List[OrderInstruction]:
+    def evaluate_and_route(self, context: MarketContext, p_hat: Optional[float] = None) -> List[OrderInstruction]:
         """
-        Receives raw context ticks, requests strategy predictions, coordinates 
-        inventory skews, and returns the low-overhead list of quoting operations.
+        Coordinates inventory skews and returns the low-overhead list of quoting operations.
+
+        `p_hat` should be the orchestrator's EMA-smoothed probability for this tick. It is
+        only computed here (raw, unsmoothed) when the caller does not supply one. Calling
+        the strategy from both the orchestrator and the router on the same timestamp would
+        apply the tick's OFI shock to the Hawkes intensities twice (dt = 0, no decay), and
+        would route on a value the smoothing was specifically added to tame.
         """
-        # 1. Strategy pricing interface
-        p_hat = self.strategy.get_probability(context)
+        # 1. Model probability
+        if p_hat is None:
+            p_hat = self.strategy.get_probability(context)
         if p_hat is None:
             # If strategy fails to resolve price, immediately cancel active quotes to remain flat and safe
             instructions: List[OrderInstruction] = []

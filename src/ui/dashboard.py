@@ -286,7 +286,7 @@ def build_dashboard(
         # 1. Limit Fill Rate
         vol_touched = hft_metrics["volume_sent_touched"]
         vol_executed = hft_metrics["volume_executed"]
-        fill_rate = vol_executed / vol_touched if vol_touched > 0.0 else (1.0 if config.maker.ENABLED else 0.0)
+        fill_rate = vol_executed / vol_touched if vol_touched > 0.0 else 1.0
         fill_color = "green" if fill_rate >= 0.3 else "yellow" if fill_rate >= 0.2 else "red"
         
         # 2. MTM post fill (5s)

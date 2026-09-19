@@ -4,7 +4,7 @@ from src.core.market_context import MarketContext
 from src.core.base_strategy import BaseStrategy
 from src.core.interfaces import IExecutionClient
 from config.settings import SystemConfig
-from src.execution.engine import InventoryManager, ExecutionRouter, ExecutionEngine
+from src.execution.engine import ExecutionRouter, ExecutionEngine
 from src.core.interfaces import OrderInstruction
 
 class MockStrategy(BaseStrategy):
@@ -48,7 +48,6 @@ class TestMakerExecution(unittest.TestCase):
     
     def setUp(self):
         self.gamma = 0.1
-        self.inv_manager = InventoryManager(gamma=self.gamma, fixed_horizon_sec=300.0)
         self.router = ExecutionRouter(
             gamma=self.gamma,
             min_fee_buffer=0.005,
@@ -62,18 +61,33 @@ class TestMakerExecution(unittest.TestCase):
             kelly_fraction=0.15
         )
 
+    def _quoted_bid(self, yes_shares: float, no_shares: float) -> float:
+        """
+        The router's Regime A bid, which sits at P_res - delta and therefore tracks the
+        inventory skew. The book is deliberately wide (0.30/0.70) so p_hat stays far from
+        the mid (no Regime C unwind) while the target bid stays inside the ask (no Regime B).
+        """
+        ctx = MarketContext(
+            timestamp=1000.0, spot_price=67500.0, strike_price=67500.0, tau_seconds=150.0,
+            volatility=0.5, ofi=0.0, bids_l2=[(0.30, 5000.0)], asks_l2=[(0.70, 5000.0)]
+        )
+        instrs = self.router.evaluate_regimes(
+            p_hat=0.55, sigma_sq=1.0, context=ctx,
+            yes_shares=yes_shares, no_shares=no_shares, cash_balance=100000.0
+        )
+        self.router.reset_active_orders()
+        bids = [i for i in instrs if i.side == "BUY_YES" and i.action in ("NEW", "REPLACE")]
+        self.assertTrue(bids, f"router produced no bid for q={yes_shares - no_shares}: {instrs}")
+        self.assertEqual(bids[0].regime, "A")
+        return bids[0].price
+
     def test_reservation_price_skew(self):
-        p_hat = 0.55
-        sigma_sq = 0.25
-        tau_sec = 150.0
-        p_res_0 = self.inv_manager.calculate_reservation_price(p_hat, q=0.0, sigma_sq=sigma_sq, tau_seconds=tau_sec)
-        self.assertAlmostEqual(p_res_0, 0.55)
-
-        p_res_pos = self.inv_manager.calculate_reservation_price(p_hat, q=100.0, sigma_sq=sigma_sq, tau_seconds=tau_sec)
-        self.assertTrue(p_res_pos < p_hat)
-
-        p_res_neg = self.inv_manager.calculate_reservation_price(p_hat, q=-100.0, sigma_sq=sigma_sq, tau_seconds=tau_sec)
-        self.assertTrue(p_res_neg > p_hat)
+        """Long inventory must skew quotes down, short inventory up (P_res = p_hat - gamma*q_norm*sigma^2)."""
+        flat = self._quoted_bid(yes_shares=0.0, no_shares=0.0)
+        long_inv = self._quoted_bid(yes_shares=250.0, no_shares=0.0)
+        short_inv = self._quoted_bid(yes_shares=0.0, no_shares=250.0)
+        self.assertLess(long_inv, flat)
+        self.assertGreater(short_inv, flat)
 
     def test_spread_calculation(self):
         sigma_sq = 0.25

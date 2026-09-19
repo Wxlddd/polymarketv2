@@ -55,9 +55,22 @@ class DataRecorder(IDataRecorder):
             ('ofi', pa.float64()),
             ('volatility', pa.float64()),
             ('bids_l2', pa.string()),
-            ('asks_l2', pa.string())
+            ('asks_l2', pa.string()),
+            ('is_snapshot', pa.bool_())
         ])
         self.writer = None
+
+        # Exchange trade prints (last_trade_price) — separate file, same buffering
+        self.prints_path = os.path.join(self.log_dir, "prints.parquet")
+        self.print_buffer: List[Dict[str, Any]] = []
+        self._prints_schema = pa.schema([
+            ('timestamp', pa.float64()),      # local receive time
+            ('exchange_ts', pa.float64()),    # exchange timestamp (s), null if absent
+            ('price', pa.float64()),
+            ('size', pa.float64()),
+            ('side', pa.string())             # aggressor side as reported: BUY / SELL
+        ])
+        self.prints_writer = None
         
         # Initialize CSV files with headers
         self._init_csv_files()
@@ -68,17 +81,22 @@ class DataRecorder(IDataRecorder):
         if today_str != self.current_date:
             # 1. Flush any buffered ticks first
             self._flush_ticks_to_parquet()
+            self._flush_prints_to_parquet()
             if self.writer is not None:
                 self.writer.close()
                 self.writer = None
-            
+            if self.prints_writer is not None:
+                self.prints_writer.close()
+                self.prints_writer = None
+
             # 2. Update current date and logging directory
             print(f"[DataRecorder] Midnight rollover detected. Moving from {self.current_date} to {today_str}")
             self.current_date = today_str
             self.log_dir = os.path.join(self.base_log_dir, today_str, self.strategy_name, self.run_id)
             os.makedirs(self.log_dir, exist_ok=True)
-            
+
             self.ticks_path = os.path.join(self.log_dir, "ticks.parquet")
+            self.prints_path = os.path.join(self.log_dir, "prints.parquet")
             self.signals_path = os.path.join(self.log_dir, "signals.csv")
             self.trades_path = os.path.join(self.log_dir, "trades.csv")
             
@@ -121,38 +139,56 @@ class DataRecorder(IDataRecorder):
                 ])
 
     def record_tick(
-        self, 
-        timestamp: float, 
-        spot_price: float, 
-        ofi: float, 
-        volatility: float, 
-        bids_l2: List[Tuple[float, float]], 
-        asks_l2: List[Tuple[float, float]]
+        self,
+        timestamp: float,
+        spot_price: float,
+        ofi: float,
+        volatility: float,
+        bids_l2: List[Tuple[float, float]],
+        asks_l2: List[Tuple[float, float]],
+        top_bid: Optional[Tuple[float, float]] = None,
+        top_ask: Optional[Tuple[float, float]] = None,
+        is_snapshot: bool = False
     ) -> None:
-        """Logs a single market tick. Buffers tick in-memory and flushes periodically."""
+        """
+        Logs a single market tick. bids_l2/asks_l2 are the raw feed update (needed to replay
+        the book); best_* come from the reconciled top of book passed in by the caller.
+        Before top_bid/top_ask existed the best_* columns held the first level of the
+        delta, which is not the top of book — treat those columns in old files as unreliable.
+        """
         self._check_and_rollover_date()
-        best_bid = bids_l2[0][0] if bids_l2 else None
-        best_bid_qty = bids_l2[0][1] if bids_l2 else None
-        best_ask = asks_l2[0][0] if asks_l2 else None
-        best_ask_qty = asks_l2[0][1] if asks_l2 else None
-        
+
         tick = {
             "timestamp": float(timestamp),
             "spot_price": float(spot_price),
-            "best_bid": float(best_bid) if best_bid is not None else None,
-            "best_bid_qty": float(best_bid_qty) if best_bid_qty is not None else None,
-            "best_ask": float(best_ask) if best_ask is not None else None,
-            "best_ask_qty": float(best_ask_qty) if best_ask_qty is not None else None,
+            "best_bid": float(top_bid[0]) if top_bid else None,
+            "best_bid_qty": float(top_bid[1]) if top_bid else None,
+            "best_ask": float(top_ask[0]) if top_ask else None,
+            "best_ask_qty": float(top_ask[1]) if top_ask else None,
             "ofi": float(ofi),
             "volatility": float(volatility),
             "bids_l2": json.dumps(bids_l2),
-            "asks_l2": json.dumps(asks_l2)
+            "asks_l2": json.dumps(asks_l2),
+            "is_snapshot": bool(is_snapshot)
         }
-        
+
         self.tick_buffer.append(tick)
-        
+
         if len(self.tick_buffer) >= self.buffer_size:
             self._flush_ticks_to_parquet()
+
+    def record_print(self, timestamp: float, price: float, size: float, side: str, exchange_ts: Optional[float] = None) -> None:
+        """Logs an exchange trade print for the YES token. Buffered like ticks, written to prints.parquet."""
+        self._check_and_rollover_date()
+        self.print_buffer.append({
+            "timestamp": float(timestamp),
+            "exchange_ts": float(exchange_ts) if exchange_ts is not None else None,
+            "price": float(price),
+            "size": float(size),
+            "side": str(side)
+        })
+        if len(self.print_buffer) >= self.buffer_size:
+            self._flush_prints_to_parquet()
 
     def record_signal(
         self, 
@@ -256,9 +292,35 @@ class DataRecorder(IDataRecorder):
                 print(f"[DataRecorder Error] Tick buffer cleared due to persistent failures to save memory.")
                 self.tick_buffer.clear()
 
+    def _flush_prints_to_parquet(self) -> None:
+        if not self.print_buffer:
+            return
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            data_dict = {col: [row.get(col) for row in self.print_buffer] for col in self._prints_schema.names}
+            table = pa.Table.from_pydict(data_dict, schema=self._prints_schema)
+            if self.prints_writer is None:
+                self.prints_writer = pq.ParquetWriter(self.prints_path, self._prints_schema, compression="zstd")
+                if os.path.exists(self.prints_path) and os.path.getsize(self.prints_path) > 0:
+                    try:
+                        self.prints_writer.write_table(pq.read_table(self.prints_path))
+                    except Exception:
+                        pass
+            self.prints_writer.write_table(table)
+            self.print_buffer.clear()
+        except Exception as e:
+            print(f"[DataRecorder Error] Failed to write prints Parquet log: {e}")
+            if len(self.print_buffer) > self.buffer_size * 5:
+                self.print_buffer.clear()
+
     def flush(self) -> None:
-        """Forces all buffered records to disk and closes the active file writer."""
+        """Forces all buffered records to disk and closes the active file writers."""
         self._flush_ticks_to_parquet()
+        self._flush_prints_to_parquet()
         if self.writer is not None:
             self.writer.close()
             self.writer = None
+        if self.prints_writer is not None:
+            self.prints_writer.close()
+            self.prints_writer = None

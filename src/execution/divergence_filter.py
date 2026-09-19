@@ -1,4 +1,4 @@
-import collections
+import bisect
 import logging
 from typing import Tuple
 from config.settings import SystemConfig
@@ -13,8 +13,11 @@ class DivergenceVelocityFilter:
     """
     def __init__(self, config: SystemConfig):
         self.config = config
-        # Buffer tracks: {"timestamp": t, "divergence": div, "velocity": v}
-        self.buffer = collections.deque()
+        # Rolling history as parallel, time-ordered lists so the lookback reference
+        # can be found by bisection. Ticks arrive in order, so appending keeps them sorted.
+        self._ts: list = []
+        self._div: list = []
+        self._vel: list = []
         self.last_divergence = 0.0
         self.last_velocity = 0.0
         self.last_acceleration = 0.0
@@ -54,24 +57,27 @@ class DivergenceVelocityFilter:
         v_max = self.config.risk.V_MAX
         gamma = self.config.risk.GAMMA
         
-        # 3. Find historical reference observation closest to timestamp - VELOCITY_LOOKBACK_SECONDS
+        # 3. Find the historical observation closest to timestamp - VELOCITY_LOOKBACK_SECONDS.
+        #    Bisection on the time-ordered history (earliest wins on a tie, matching a
+        #    left-to-right scan). A linear scan here was ~85% of backtest runtime.
         target_t = timestamp - lookback_sec
-        closest_obs = None
-        min_diff = float("inf")
-        
-        for obs in self.buffer:
-            diff = abs(obs["timestamp"] - target_t)
-            if diff < min_diff:
-                min_diff = diff
-                closest_obs = obs
-                
+        ref_idx = -1
+        if self._ts:
+            i = bisect.bisect_left(self._ts, target_t)
+            if i == 0:
+                ref_idx = 0
+            elif i == len(self._ts):
+                ref_idx = i - 1
+            else:
+                ref_idx = i - 1 if (target_t - self._ts[i - 1]) <= (self._ts[i] - target_t) else i
+
         # 4. Compute velocity and acceleration
-        if closest_obs is None:
+        if ref_idx < 0:
             # First observation or no history: default to 0
             v_t = 0.0
             a_t = 0.0
         else:
-            dt = timestamp - closest_obs["timestamp"]
+            dt = timestamp - self._ts[ref_idx]
             if dt < 1.0:
                 # If there's less than 1.0s difference between the current tick and the reference tick,
                 # we don't have enough history to make a meaningful/non-noisy calculation.
@@ -79,21 +85,22 @@ class DivergenceVelocityFilter:
                 a_t = 0.0
             else:
                 # v_t in probability points per second
-                v_t = (divergence_t - closest_obs["divergence"]) / dt
+                v_t = (divergence_t - self._div[ref_idx]) / dt
                 # a_t (second derivative of divergence over time)
-                a_t = (v_t - closest_obs["velocity"]) / dt
-                
-        # 5. Append current observation to rolling buffer
-        self.buffer.append({
-            "timestamp": timestamp,
-            "divergence": divergence_t,
-            "velocity": v_t
-        })
-        
-        # 6. Prune buffer of old observations
+                a_t = (v_t - self._vel[ref_idx]) / dt
+
+        # 5. Append current observation to rolling history
+        self._ts.append(timestamp)
+        self._div.append(divergence_t)
+        self._vel.append(v_t)
+
+        # 6. Prune observations older than the window
         cutoff_t = timestamp - window_sec
-        while self.buffer and self.buffer[0]["timestamp"] < cutoff_t:
-            self.buffer.popleft()
+        k = bisect.bisect_left(self._ts, cutoff_t)
+        if k:
+            del self._ts[:k]
+            del self._div[:k]
+            del self._vel[:k]
             
         # 7. Compute continuous Kelly scale factor
         # scale(v_t) = max(0, 1 - (|v_t| / V_max)^gamma)

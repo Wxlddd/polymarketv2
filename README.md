@@ -22,8 +22,32 @@ sends a real order**: execution is a simulated exchange, and every tick, signal 
 | Current `main`, real 128k-tick file (6 cycles) | −3.6 %, max drawdown 9.7 %, inventory capped at 500, panic sweep flattens before expiry. |
 
 PR #3 fixed the mechanical bugs (live start crash, broken backtester, Hawkes horizon amplification, panic sweep never
-re-issued, no cash cap, hard-coded 5-minute cycle). Whether the model has any edge is still open; the tooling below is
-for answering that with data rather than guessing.
+re-issued, no cash cap, hard-coded 5-minute cycle).
+
+### Why the bot is maker-only (2026-09-19)
+
+Replaying all 69 complete recorded cycles through the pricer, sampling model and book every 5 s:
+
+| Test | Result |
+|---|---|
+| Brier score, model vs. book mid | 0.182 vs. 0.220 — the model is better calibrated than the market |
+| Slope of (outcome − mid) on (model − mid) | 0.94, 95% CI [0.73, 1.10] — the divergence predicts the market's error |
+| Buy-and-hold taker, 100 contracts, executed **on the signal tick** | +11.5 per entry, CI [+7.8, +15.8] |
+| Same, executed **one tick later** | **−6.8 per entry**, CI [−12.0, −1.5] |
+| Same, ignoring levels not refreshed in 10 s | unchanged (+11.5) — not stale liquidity |
+
+The model reacts to the Chainlink tick a fraction of a second before the book does, and the book catches up within one
+tick. The information is real; it is not executable at a 150–300 ms order round trip. That is the same adverse selection
+the live taker fills showed (mid moving 0.07 against the fill within 5 s).
+
+So directional crossing is off (`TAKER_ENABLED=False`) and the only taker orders left are the PANIC sweeps that flatten
+inventory before settlement. A fast model that sees the move first is still worth having as a **defensive** signal —
+pulling or repricing a quote before it gets picked off — which is what the remaining work is about.
+
+The open question is now the **fill model**: every maker P&L in this repo comes from a simulator that assumes 40% of any
+depth reduction at your level was a trade, plus a 2%/tick queue decay. Nothing has been calibrated against real
+executions. `prints.parquet` (exchange trade prints, recorded since this branch) is what makes that calibration possible,
+which is why collecting data matters more right now than tuning parameters.
 
 ## Quickstart
 
@@ -66,7 +90,8 @@ Output per session:
 
 ```
 logs/YYYY-MM-DD/merton/live_<unix_ts>/
-├── ticks.parquet   # every CLOB tick with spot, OFI, vol, full L2 (zstd, buffered 1000 rows)
+├── ticks.parquet   # every CLOB update (snapshot/delta + is_snapshot flag) with spot, OFI, vol, reconciled top of book
+├── prints.parquet  # every YES trade print (last_trade_price): price, size, aggressor side, exchange timestamp
 ├── signals.csv     # model vs market probability at each taker signal / maker fill
 └── trades.csv      # every paper fill and settlement with P&L and capital
 ```
@@ -128,7 +153,7 @@ All in `.env`, read by `config/settings.py`.
 |---|---|---|
 | `CYCLE_DURATION_SEC` / `MARKET_SLUG_TYPE` | `300` / `5m` | Series. `14400` / `4h` for the 4-hour market. Change both. |
 | `INITIAL_CAPITAL` | `10000` | Paper cash. |
-| `TAKER_ENABLED` | `True` | `False` = maker only. |
+| `TAKER_ENABLED` | `False` | Directional crossing. Off by default (see Status); PANIC still crosses to flatten. |
 | `MM_TAKER_EDGE_EPSILON` | `0.015` | Edge over the spread before crossing. |
 | `KELLY_FRACTION` | `0.05` | Taker sizing. |
 | `MM_MAX_INVENTORY` | `500` | Hard cap on \|YES − NO\|. |
@@ -142,7 +167,11 @@ All in `.env`, read by `config/settings.py`.
 | `STRATEGY_NAME` | `merton` | or `legacy_merton` (Poisson jumps + OFI logit shift). |
 | `V_MAX`, `GAMMA` | `0.005`, `2` | Divergence filter. `scratch/calibrate_divergence.py` prints percentiles from a log. |
 
-Defined but unused by any code: `MIN_EXPECTED_VALUE`, `PIN_RISK_SECONDS`, `DESYNC_Z_SCORE`, `POF_*`, `COOLDOWN_PERIOD_SEC`, `MAX_POSITION_SIZE_USD`.
+Every key above is read by the code. Settings that no longer did anything (`MIN_EXPECTED_VALUE`,
+`PIN_RISK_SECONDS`, `DESYNC_Z_SCORE`, `POF_*`, `COOLDOWN_PERIOD_SEC`, `MAX_POSITION_SIZE_USD`,
+`MIN_ACCEPTABLE_MARGIN_BPS`, `ABSOLUTE_MAX_SLIPPAGE_BPS`, `ORACLE_NOISE_BPS`, `MIN_KELLY_THRESHOLD`,
+`MM_ENABLED`, `HAWKES_KAPPA`, `PRESUMED_STRIKE_PRICE`, `EXPIRATION_TIMESTAMP`) were removed — they
+described the pre-refactor engine. Leaving them in a `.env` is harmless; they are simply ignored.
 
 ## Validation scripts
 
