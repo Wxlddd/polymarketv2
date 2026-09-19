@@ -9,7 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env
-logs/
+logs*/
 *.log
 
 # backtest sweep outputs

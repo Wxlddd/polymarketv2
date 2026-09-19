@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -14,10 +15,13 @@ from src.strategies.merton_strategy import MertonStrategy
 from src.execution.shadow_book import ShadowOrderBook
 
 # Configure minimalist logging to file so it doesn't pollute terminal output
+_LOG_DIR = os.getenv("LOG_DIR", "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.FileHandler("verify_live_data.log", encoding="utf-8")]
+    handlers=[logging.FileHandler(os.path.join(_LOG_DIR, "verify_live_data.log"), encoding="utf-8")]
 )
 logger = logging.getLogger("VerifyLiveDataAndPricing")
 
