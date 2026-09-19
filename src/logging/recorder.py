@@ -20,7 +20,8 @@ class DataRecorder(IDataRecorder):
         strategy_name: str = "merton", 
         run_id: Optional[str] = None,
         buffer_size: int = 1000,
-        tick_segment_sec: float = 600.0
+        tick_segment_sec: float = 600.0,
+        flush_interval_sec: float = 120.0
     ):
         self.base_log_dir = base_log_dir
         self.strategy_name = strategy_name
@@ -31,6 +32,10 @@ class DataRecorder(IDataRecorder):
         self.tick_segment_sec = tick_segment_sec
         self._segment_index = 1
         self._segment_opened_ts = 0.0
+        # Also flush on buffer age, not just on a full buffer: a 4h market ticks slowly.
+        self.flush_interval_sec = flush_interval_sec
+        self._last_tick_flush_ts = time.time()
+        self._last_print_flush_ts = time.time()
         
         # Resolve today's date (YYYY-MM-DD)
         self.current_date = datetime.now().strftime("%Y-%m-%d")
@@ -183,7 +188,7 @@ class DataRecorder(IDataRecorder):
 
         self.tick_buffer.append(tick)
 
-        if len(self.tick_buffer) >= self.buffer_size:
+        if self._should_flush(self.tick_buffer, self._last_tick_flush_ts):
             self._flush_ticks_to_parquet()
 
     def record_print(self, timestamp: float, price: float, size: float, side: str, exchange_ts: Optional[float] = None) -> None:
@@ -196,7 +201,7 @@ class DataRecorder(IDataRecorder):
             "size": float(size),
             "side": str(side)
         })
-        if len(self.print_buffer) >= self.buffer_size:
+        if self._should_flush(self.print_buffer, self._last_print_flush_ts):
             self._flush_prints_to_parquet()
 
     def record_signal(
@@ -263,6 +268,15 @@ class DataRecorder(IDataRecorder):
         except Exception as e:
             print(f"[DataRecorder Error] Failed to write trade to CSV: {e}")
 
+    def _should_flush(self, buffer: List[Dict[str, Any]], last_flush_ts: float) -> bool:
+        """Flush on a full buffer, or on age: a quiet market (or rare trade prints) would
+        otherwise keep hours of data in RAM, to be lost on a kill or a power cut."""
+        if not buffer:
+            return False
+        if len(buffer) >= self.buffer_size:
+            return True
+        return self.flush_interval_sec > 0 and time.time() - last_flush_ts >= self.flush_interval_sec
+
     def _tick_segment_path(self) -> str:
         """First segment keeps the plain ticks.parquet name; later ones get a suffix.
         A short run is one file exactly as before; the backtester reads the whole directory."""
@@ -313,6 +327,7 @@ class DataRecorder(IDataRecorder):
 
             self.writer.write_table(table)
             self.tick_buffer.clear()
+            self._last_tick_flush_ts = time.time()
         except Exception as e:
             print(f"[DataRecorder Error] CRITICAL failure to write Parquet log: {e}")
             if len(self.tick_buffer) > self.buffer_size * 5:
@@ -336,6 +351,7 @@ class DataRecorder(IDataRecorder):
                         pass
             self.prints_writer.write_table(table)
             self.print_buffer.clear()
+            self._last_print_flush_ts = time.time()
         except Exception as e:
             print(f"[DataRecorder Error] Failed to write prints Parquet log: {e}")
             if len(self.print_buffer) > self.buffer_size * 5:

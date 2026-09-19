@@ -11,6 +11,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+import time
 from types import SimpleNamespace
 
 import polars as pl
@@ -90,6 +91,32 @@ def check_tick_segments():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_age_flush():
+    """A slow market must not keep hours of ticks (or rare trade prints) in RAM."""
+    tmp = tempfile.mkdtemp(prefix="flush_check_")
+    try:
+        rec = DataRecorder(base_log_dir=tmp, strategy_name="merton", run_id="age",
+                           buffer_size=100_000, flush_interval_sec=0.2, tick_segment_sec=0)
+        book = [(0.47, 500.0)], [(0.49, 600.0)]
+        rec.record_tick(1.0, 81_000.0, 0.0, 0.25, *book, top_bid=(0.47, 500.0), top_ask=(0.49, 600.0))
+        rec.record_print(1.0, 0.47, 10.0, "BUY")
+        assert rec.tick_buffer, "flushed before the interval elapsed"
+
+        time.sleep(0.25)
+        rec.record_tick(2.0, 81_001.0, 0.0, 0.25, *book, top_bid=(0.47, 500.0), top_ask=(0.49, 600.0))
+        rec.record_print(2.0, 0.48, 5.0, "SELL")
+        assert not rec.tick_buffer, f"ticks held in RAM past the interval: {len(rec.tick_buffer)}"
+        assert not rec.print_buffer, f"prints held in RAM past the interval: {len(rec.print_buffer)}"
+
+        rec.flush()
+        n_ticks = len(pl.read_parquet(os.path.join(rec.log_dir, "ticks.parquet")))
+        n_prints = len(pl.read_parquet(os.path.join(rec.log_dir, "prints.parquet")))
+        assert n_ticks == 2 and n_prints == 2, f"ticks={n_ticks} prints={n_prints}"
+        print(f"[OK] age-based flush: {n_ticks} ticks and {n_prints} prints on disk without a full buffer")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _readable(path):
     try:
         pl.read_parquet(path)
@@ -128,6 +155,7 @@ def main():
     print("[OK] no spot price -> no tick, no crash")
 
     check_tick_segments()
+    check_age_flush()
 
     print("\n=== Data collection verified ===")
 
