@@ -149,8 +149,8 @@
     }
 
     .right-col {
-      display: flex;
-      flex-direction: column;
+      display: grid;
+      grid-template-rows: 1fr auto;
       gap: 8px;
       min-height: 0;
     }
@@ -188,7 +188,7 @@
       text-align: left;
     }
     th, td {
-      padding: 6px 8px;
+      padding: 4px 8px;
       border-bottom: 1px solid #111111;
     }
     th {
@@ -228,7 +228,7 @@
       text-transform: uppercase;
     }
     .kpi-val {
-      font-size: 18px;
+      font-size: 17px;
       font-weight: bold;
       color: #ffffff;
       margin-top: 2px;
@@ -239,7 +239,7 @@
     .ob-row {
       display: flex;
       justify-content: space-between;
-      padding: 2px 4px;
+      padding: 1px 4px;
     }
     .ob-bar-wrap {
       flex: 1;
@@ -305,7 +305,6 @@
     .chart-container {
       display: flex;
       gap: 8px;
-      margin-top: 8px;
     }
     .chart-box {
       flex: 1;
@@ -423,20 +422,20 @@
         <div class="kpi-val green" id="kpi-cash">—</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-lbl">Position Value</div>
-        <div class="kpi-val" id="kpi-posval">—</div>
-      </div>
-      <div class="kpi-card">
         <div class="kpi-lbl">Cumulative P&amp;L</div>
         <div class="kpi-val" id="kpi-pnl">—</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-lbl">Total Trades</div>
-        <div class="kpi-val white" id="kpi-trades">0</div>
+        <div class="kpi-lbl">Net Inventory (q / Qmax)</div>
+        <div class="kpi-val white" id="kpi-inventory">—</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-lbl">Oracle Status</div>
-        <div class="kpi-val green" id="kpi-oracle" style="font-size:14px;">OFFLINE</div>
+        <div class="kpi-lbl">My Quotes (bid / ask)</div>
+        <div class="kpi-val white" id="kpi-quotes" style="font-size:16px;">—</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Total Trades</div>
+        <div class="kpi-val white" id="kpi-trades">0</div>
       </div>
     </div>
 
@@ -474,9 +473,9 @@
                 </tr>
               </tbody>
             </table>
-            <div style="padding: 6px 8px; font-size:11px; color:#888888; display:flex; justify-content:space-between; border-top:1px solid #111111;">
+            <div style="padding: 5px 8px; font-size:11px; color:#888888; display:flex; justify-content:space-between; border-top:1px solid #111111;">
               <div>Slug: <span id="mkt-slug" class="white">—</span></div>
-              <div>Condition: <span id="mkt-condition" class="white">—</span></div>
+              <div>Regime: <span id="mkt-regime" class="white">—</span></div>
             </div>
           </div>
         </div>
@@ -486,12 +485,12 @@
           <!-- Spot vs Strike -->
           <div class="panel chart-box">
             <div class="panel-header">SPOT PRICE VS STRIKE (RECENT HISTORY)</div>
-            <canvas id="chart-price" height="150"></canvas>
+            <canvas id="chart-price" height="110"></canvas>
           </div>
           <!-- Merton vs Market Implied -->
           <div class="panel chart-box">
             <div class="panel-header">YES VS MARKET YES</div>
-            <canvas id="chart-prob" height="150"></canvas>
+            <canvas id="chart-prob" height="110"></canvas>
           </div>
         </div>
 
@@ -518,48 +517,40 @@
 
         <!-- Risk, Kelly & Position Info -->
         <div class="panel">
-          <div class="panel-header">RISK SIZING &amp; POSITION STATE DETAILS</div>
-          <div class="panel-body">
+          <div class="panel-header">QUOTING STATE</div>
+          <div class="panel-body" style="padding: 6px 8px;">
             <table style="font-size:12px;">
               <tr>
-                <td class="dim">Sizing Side:</td>
-                <td id="eng-side" class="bold">—</td>
-                <td class="dim">Kelly Alloc:</td>
-                <td id="eng-kelly" class="white bold">—</td>
-              </tr>
-              <tr>
-                <td class="dim">Target Price:</td>
-                <td id="eng-vwap" class="white">—</td>
+                <td class="dim">My bid:</td>
+                <td id="eng-my-bid" class="green bold">—</td>
                 <td class="dim">Position YES:</td>
                 <td id="eng-qty-yes" class="green">—</td>
               </tr>
               <tr>
-                <td class="dim">Margin Bps:</td>
-                <td id="eng-margin" class="white">—</td>
+                <td class="dim">My ask:</td>
+                <td id="eng-my-ask" class="red bold">—</td>
                 <td class="dim">Position NO:</td>
                 <td id="eng-qty-no" class="red">—</td>
               </tr>
               <tr>
-                <td class="dim">Engine Status:</td>
-                <td id="eng-reason" class="dim">—</td>
-                <td class="dim">Kelly Scale:</td>
+                <td class="dim" title="Midpoint of my own quotes: the inventory-skewed fair value the router is quoting around.">Reservation:</td>
+                <td id="eng-p-res" class="white bold">—</td>
+                <td class="dim" title="Half the distance between my quotes.">Half-spread:</td>
+                <td id="eng-delta" class="white">—</td>
+              </tr>
+              <tr>
+                <td class="dim" title="Model probability minus market mid.">Divergence:</td>
+                <td id="eng-div" class="white">—</td>
+                <td class="dim" title="Size multiplier from the divergence velocity filter. 0 pulls all quotes.">Size scale:</td>
                 <td id="eng-div-scale" class="bold white">—</td>
               </tr>
               <tr>
-                <td class="dim">Divergence:</td>
-                <td id="eng-div" class="white">—</td>
-                <td class="dim">Div Velocity:</td>
-                <td id="eng-div-velocity" class="white">—</td>
+                <td class="dim">Engine:</td>
+                <td id="eng-reason" class="dim" colspan="3">—</td>
               </tr>
             </table>
-          </div>
-        </div>
-
-        <!-- HFT Performance & Toxicity Metrics Panel -->
-        <div class="panel">
-          <div class="panel-header">HFT EXECUTION &amp; RISK QUALITY METRICS</div>
-          <div class="panel-body">
-            <table style="font-size:12px; line-height: 1.5;">
+            <div style="border-top:1px solid #222222; margin:6px 0 4px; padding-top:4px; font-size:11px; color:#ffb000; font-weight:bold;">EXECUTION QUALITY</div>
+            <table style="font-size:12px;">
               <tr>
                 <td class="dim" title="Ratio of executed limit volume to total sent limit volume at touched prices. Healthy > 30%, Red Flag < 20% (indicates adverse selection).">Limit Fill Rate:</td>
                 <td id="hft-fill-rate" class="bold white">—</td>
@@ -730,7 +721,7 @@
 
   <!-- ══════════════ FOOTER ══════════════ -->
   <footer>
-    <div>Bloomberg Terminal Mode | Style: Stark Brutal Flat | No GPU Acceleration</div>
+    <div>Session: <span id="ft-session" class="white">—</span></div>
     <div>Update throttle: <span id="ft-throttle">4Hz</span></div>
   </footer>
 </div>
@@ -752,10 +743,10 @@
     wsText: document.getElementById('hdr-ws-text'),
     equity: document.getElementById('kpi-equity'),
     cash: document.getElementById('kpi-cash'),
-    posval: document.getElementById('kpi-posval'),
     pnl: document.getElementById('kpi-pnl'),
+    inventory: document.getElementById('kpi-inventory'),
+    quotes: document.getElementById('kpi-quotes'),
     trades: document.getElementById('kpi-trades'),
-    oracle: document.getElementById('kpi-oracle'),
     tblTicker: document.getElementById('tbl-ticker'),
     tblSpot: document.getElementById('tbl-spot'),
     tblStrike: document.getElementById('tbl-strike'),
@@ -765,21 +756,21 @@
     tblVol: document.getElementById('tbl-vol'),
     tblOfi: document.getElementById('tbl-ofi'),
     slug: document.getElementById('mkt-slug'),
-    condition: document.getElementById('mkt-condition'),
+    regime: document.getElementById('mkt-regime'),
     obAsks: document.getElementById('ob-asks'),
     obBids: document.getElementById('ob-bids'),
     obSpread: document.getElementById('ob-spread'),
-    engSide: document.getElementById('eng-side'),
-    engKelly: document.getElementById('eng-kelly'),
-    engVwap: document.getElementById('eng-vwap'),
+    engMyBid: document.getElementById('eng-my-bid'),
+    engMyAsk: document.getElementById('eng-my-ask'),
+    engPRes: document.getElementById('eng-p-res'),
+    engDelta: document.getElementById('eng-delta'),
     engQtyYes: document.getElementById('eng-qty-yes'),
     engQtyNo: document.getElementById('eng-qty-no'),
-    engMargin: document.getElementById('eng-margin'),
     engReason: document.getElementById('eng-reason'),
     engDivScale: document.getElementById('eng-div-scale'),
     engDiv: document.getElementById('eng-div'),
-    engDivVelocity: document.getElementById('eng-div-velocity'),
     logsBox: document.getElementById('logs-box'),
+    ftSession: document.getElementById('ft-session'),
     progressWrap: document.getElementById('bt-progress-wrap'),
     progressBar: document.getElementById('bt-progress-bar')
   };
@@ -848,16 +839,22 @@
     // 2. KPIs
     els.equity.textContent = '$' + fmt(state.equity);
     els.cash.textContent = '$' + fmt(state.cash);
-    els.posval.textContent = '$' + fmt(state.pos_val);
     
     const pnl = state.pnl ?? 0.0;
     els.pnl.textContent = (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl));
     els.pnl.className = 'kpi-val ' + (pnl >= 0 ? 'green' : 'red');
     
     els.trades.textContent = state.total_trades ?? 0;
-    
-    els.oracle.textContent = state.oracle_live ? 'ONLINE' : 'OFFLINE';
-    els.oracle.className = 'kpi-val ' + (state.oracle_live ? 'green' : 'red');
+
+    const qNet = (state.pos_qty_yes ?? 0) - (state.pos_qty_no ?? 0);
+    const qMax = state.max_inventory || 0;
+    els.inventory.textContent = qNet.toFixed(0) + (qMax ? ' / ' + qMax.toFixed(0) : '');
+    const qFrac = qMax ? Math.abs(qNet) / qMax : 0;
+    els.inventory.className = 'kpi-val ' + (qFrac >= 1 ? 'red' : qFrac > 0.5 ? 'amber' : qNet === 0 ? 'dim' : 'white');
+
+    const qb = state.quote_bid, qa = state.quote_ask;
+    els.quotes.textContent = (qb || qa) ? `${qb ? qb.toFixed(2) : '--'} / ${qa ? qa.toFixed(2) : '--'}` : 'none';
+    els.quotes.className = 'kpi-val ' + ((qb || qa) ? 'white' : 'dim');
 
     // 3. Market Details Table
     els.tblTicker.textContent = state.ticker || '—';
@@ -884,20 +881,25 @@
     els.tblOfi.textContent = state.ofi !== undefined ? (state.ofi >= 0 ? '+' : '') + state.ofi.toFixed(1) : '—';
     
     els.slug.textContent = state.slug || '—';
-    els.condition.textContent = state.condition_id || '—';
+    if (state.slug) els.ftSession.textContent = state.slug.replace(/^btc-updown-/, '');
 
     // 4. Order Book Update
     renderOrderBook(state.bids_l2 || [], state.asks_l2 || []);
 
     // 5. Execution stats
     const dec = state.latest_decision || {};
-    els.engSide.textContent = dec.side || 'HOLD';
-    els.engSide.className = 'bold ' + (dec.side === 'BUY_YES' ? 'green' : dec.side === 'BUY_NO' ? 'red' : 'dim');
-    
-    els.engKelly.textContent = (dec.kelly_alloc !== undefined && dec.kelly_alloc !== null) ? (dec.kelly_alloc * 100).toFixed(2) + '%' : '—';
-    els.engVwap.textContent = (dec.vwap !== undefined && dec.vwap !== null && dec.vwap !== 0) ? dec.vwap.toFixed(3) : '—';
-    els.engMargin.textContent = (dec.theoretical_edge_bps !== undefined && dec.theoretical_edge_bps !== null) ? dec.theoretical_edge_bps.toFixed(1) + ' bps' : '—';
+    const bidQty = state.quote_bid_qty, askQty = state.quote_ask_qty;
+    els.engMyBid.textContent = qb ? `${qb.toFixed(2)} x ${(bidQty || 0).toFixed(0)}` : '—';
+    els.engMyAsk.textContent = qa ? `${qa.toFixed(2)} x ${(askQty || 0).toFixed(0)}` : '—';
+    if (qb && qa) {
+      els.engPRes.textContent = ((qb + qa) / 2).toFixed(3);
+      els.engDelta.textContent = ((qa - qb) / 2).toFixed(3);
+    } else {
+      els.engPRes.textContent = '—';
+      els.engDelta.textContent = '—';
+    }
     els.engReason.textContent = dec.reason || 'NO_SIGNAL';
+    els.regime.textContent = dec.regime || (qb || qa ? 'A (maker)' : 'flat');
     els.engQtyYes.textContent = state.pos_qty_yes ? state.pos_qty_yes.toFixed(1) : '0.0';
     els.engQtyNo.textContent = state.pos_qty_no ? state.pos_qty_no.toFixed(1) : '0.0';
 
@@ -908,8 +910,6 @@
     const divVal = state.divergence !== undefined ? state.divergence : 0.0;
     els.engDiv.textContent = (divVal >= 0 ? '+' : '') + (divVal * 100).toFixed(2) + '%';
 
-    const divVel = state.divergence_velocity !== undefined ? state.divergence_velocity : 0.0;
-    els.engDivVelocity.textContent = (divVel >= 0 ? '+' : '') + (divVel * 100).toFixed(3) + ' pts/s';
 
     // 5.5 HFT quality and toxicity metrics update
     if (state.hft_metrics) {

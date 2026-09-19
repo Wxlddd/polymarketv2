@@ -397,6 +397,8 @@ class LiveOrchestrator:
         total_msgs = self.hft_metrics["total_orders_sent"] + self.hft_metrics["total_orders_cancelled"]
         otr = total_msgs / self.total_trades if self.total_trades > 0 else 0.0
         
+        router = self.engine.execution_router
+
         hft_payload = {
             "fill_rate": fill_rate,
             "avg_mtm_1s": avg_mtm_1s,
@@ -440,6 +442,13 @@ class LiveOrchestrator:
             "divergence_velocity": self.divergence_filter.last_velocity,
             "divergence_acceleration": self.divergence_filter.last_acceleration,
             "divergence_scale": self.divergence_filter.last_scale,
+            # The bot's own resting quotes: what a maker actually needs to watch.
+            # Their midpoint is the reservation price and their half-width is delta.
+            "quote_bid": router.active_bid_price or None,
+            "quote_bid_qty": router.active_bid_qty or None,
+            "quote_ask": router.active_ask_price or None,
+            "quote_ask_qty": router.active_ask_qty or None,
+            "max_inventory": self.config.maker.MAX_INVENTORY,
             "hft_metrics": hft_payload
         }
         self.web_server.update_state(state)
@@ -732,11 +741,15 @@ class LiveOrchestrator:
         # Format diagnostic decision for the dashboard
         bid_p = self.engine.execution_router.active_bid_price
         ask_p = self.engine.execution_router.active_ask_price
+        # Regime of this tick's instructions (A maker / B taker / C unwind / REDUCE / PANIC).
+        # Nothing to do means the router left the quotes as they were.
+        regimes = [i.regime for i in instructions if getattr(i, "regime", None)]
         decision = {
             "side": "QUOTING",
             "size": self.engine.execution_router.active_bid_qty,
             "vwap": bid_p if bid_p > 0.0 else ask_p,
             "reason": f"Bid: {bid_p:.2f} Ask: {ask_p:.2f}",
+            "regime": regimes[0] if regimes else None,
             "expected_slippage_bps": 0.0,
             "ev": 0.0
         }
