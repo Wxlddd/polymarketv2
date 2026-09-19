@@ -248,7 +248,7 @@ class LiveOrchestrator:
             
         # Re-initialize CLOB Order book feed only if tokens are valid
         if self.market_manager.yes_token_id and self.market_manager.no_token_id:
-            self.clob_feed = ClobOrderBookFeed(self.config, self._clob_callback)
+            self.clob_feed = ClobOrderBookFeed(self.config, self._clob_callback, trade_callback=self._print_callback)
             await self.clob_feed.start()
         else:
             self.clob_feed = None
@@ -465,6 +465,11 @@ class LiveOrchestrator:
                 "message": message
             })
 
+    def _print_callback(self, price: float, size: float, side: str, exchange_ts: Optional[float]) -> None:
+        """Persists every YES trade print; the only ground truth for calibrating the maker fill model."""
+        if self.is_running:
+            self.recorder.record_print(time.time(), price, size, side, exchange_ts)
+
     async def _clob_callback(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], is_snapshot: bool) -> None:
         """Callback triggered on each CLOB Order book tick arrival."""
         if not self.is_running:
@@ -639,8 +644,9 @@ class LiveOrchestrator:
         else:
             p_yes = None
         
-        # Record tick in Parquet database
-        self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks)
+        # Record tick: raw update (for replay) + reconciled top of book + snapshot flag
+        self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks,
+                                  top_bid=top_b_mtm, top_ask=top_a_mtm, is_snapshot=is_snapshot)
         
         p_mkt = self._get_market_implied_price(p_yes)
         
@@ -678,8 +684,6 @@ class LiveOrchestrator:
                         strike=active_strike,
                         model_prob=p_yes,
                         implied_prob=p_mkt_fill if p_mkt_fill is not None else p_yes,
-                        micro_price=getattr(self.engine.execution_router, "latest_micro_price", None) or 0.0,
-                        p_val=getattr(self.engine.execution_router, "latest_p_val", None) or 0.0,
                         kelly_size=result["qty"],
                         status=status_str
                     )
@@ -691,8 +695,10 @@ class LiveOrchestrator:
                             "signal": {"side": result["side"], "size": result["qty"], "vwap": result["price"], "ev": 0.0}
                         })
         
-        # 2. Generate and process new quoting instructions
-        instructions = self.engine.evaluate_and_route(context)
+        # 2. Generate and process new quoting instructions. The router gets the raw
+        #    probability already computed above (one pricing per tick); the EMA is
+        #    for logging, the UI and the divergence filter.
+        instructions = self.engine.evaluate_and_route(context, p_hat=p_yes_raw)
         
         # Format diagnostic decision for the dashboard
         bid_p = self.engine.execution_router.active_bid_price
@@ -729,8 +735,6 @@ class LiveOrchestrator:
                     strike=active_strike,
                     model_prob=p_yes,
                     implied_prob=p_mkt_exec if p_mkt_exec is not None else p_yes,
-                    micro_price=getattr(self.engine.execution_router, "latest_micro_price", None) or 0.0,
-                    p_val=getattr(self.engine.execution_router, "latest_p_val", None) or 0.0,
                     kelly_size=res["qty"],
                     status=status_str
                 )
@@ -893,6 +897,9 @@ class LiveOrchestrator:
                                 })
 
                             
+                        # Drop finished tasks first: one settle task is spawned per cycle and
+                        # a long run would otherwise keep every completed one alive.
+                        self._tasks = [t for t in self._tasks if not t.done()]
                         self._tasks.append(asyncio.create_task(settle_at_expiry(old_strike_manager, old_expiry)))
                         
                     # 2. Reset StrikeManager for the new cycle (force presumed_strike to 0.0 to resolve it only via the first spot tick)

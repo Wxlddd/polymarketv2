@@ -137,6 +137,15 @@ class BacktestRunner:
                 item = x
             asks_l2_parsed.append([(float(p), float(q)) for p, q in item])
 
+        # Snapshot flags: recorded explicitly by newer recorders. Older files lack the
+        # column, and their first tick of a cycle is often a delta from the previous
+        # market's feed rather than the new book; a raw update carrying >= 5 levels on
+        # both sides is a book snapshot, price_change deltas carry a handful at most.
+        if "is_snapshot" in df.columns:
+            snapshot_flags = [bool(x) for x in df["is_snapshot"].fill_null(False).to_list()]
+        else:
+            snapshot_flags = [len(b) >= 5 and len(a) >= 5 for b, a in zip(bids_l2_parsed, asks_l2_parsed)]
+
         total_ticks = len(df)
         capital_history = []
         trade_count = 0
@@ -187,9 +196,10 @@ class BacktestRunner:
                 client.cancel_all_orders()
             
             # 3. Update shadow order book proxy.
-            # First tick of each cycle: full snapshot (clears stale residuals from old cycle).
-            # Subsequent ticks: delta updates so paper_execute depletions are preserved.
-            is_snap = not cycle_snapshot_sent
+            # First tick of each cycle and every recorded/detected snapshot replace the book
+            # (clearing stale levels from the previous market); everything else is a delta,
+            # so paper_execute depletions are preserved between snapshots.
+            is_snap = (not cycle_snapshot_sent) or snapshot_flags[i]
             shadow_book.update_book(bids_l2, asks_l2, is_snapshot=is_snap, timestamp=t)
             cycle_snapshot_sent = True
             
@@ -317,7 +327,7 @@ class BacktestRunner:
                     bids_l2=shadow_book.get_sorted_bids(),
                     asks_l2=shadow_book.get_sorted_asks()
                 )
-                instructions = engine.evaluate_and_route(context)
+                instructions = engine.evaluate_and_route(context, p_hat=p_yes_raw)
 
                 last_evaluated_p_yes = p_yes
                 last_evaluated_best_bid = cur_best_bid

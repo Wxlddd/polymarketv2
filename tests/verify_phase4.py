@@ -1,7 +1,13 @@
 import asyncio
+import os
 import random
 import time
 from typing import Optional
+
+# This script exercises the Regime B taker path, which ships disabled (TAKER_ENABLED=False).
+# Set it before SystemConfig reads the environment.
+os.environ["TAKER_ENABLED"] = "True"
+
 from config.settings import SystemConfig
 from src.core.base_strategy import BaseStrategy
 from src.core.market_context import MarketContext
@@ -132,6 +138,28 @@ async def main():
         print("[OK] Position settlement and cash balances are mathematically exact.")
     else:
         print(f"[FAIL] Settlement mismatch! Actual: ${client.cash_balance:.6f}, Expected: ${expected_cash:.6f}")
+
+    # 5. Shipping default: the same edge must quote, not cross
+    print("\n--- Testing Maker-Only Default (TAKER_ENABLED=False) ---")
+    os.environ["TAKER_ENABLED"] = "False"
+    maker_cfg = SystemConfig()
+    maker_book = ShadowOrderBook()
+    maker_book.update_book(bids_snap, asks_snap, is_snapshot=True)
+    maker_client = MockExecutionClient(maker_cfg, recorder, maker_book)
+    maker_engine = ExecutionEngine(FixedProbabilityStrategy(p_hat=0.60), maker_client, maker_cfg)
+    maker_ctx = MarketContext(
+        timestamp=time.time(), spot_price=spot, strike_price=strike, tau_seconds=200.0,
+        volatility=0.25, ofi=0.0,
+        bids_l2=maker_book.get_sorted_bids(), asks_l2=maker_book.get_sorted_asks()
+    )
+    maker_instructions = maker_engine.evaluate_and_route(maker_ctx)
+    print(f"Router instructions: {maker_instructions}")
+    if any(i.regime == "B" for i in maker_instructions):
+        print("[FAIL] Taker crossing fired with TAKER_ENABLED=False!")
+    elif any(i.action == "NEW" and i.regime == "A" for i in maker_instructions):
+        print("[OK] Same edge quotes as a maker instead of crossing.")
+    else:
+        print("[FAIL] Expected a Regime A maker quote and got none.")
 
     recorder.flush()
 
