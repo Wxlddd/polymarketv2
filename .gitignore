@@ -15,3 +15,6 @@ logs/
 # backtest sweep outputs
 scratch/sweep_runs/
 scratch/sweep_results.csv
+
+# ad-hoc backtest output written by scratch runs
+scratch/maker_check/
