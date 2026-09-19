@@ -75,7 +75,9 @@ class ArbitrageConfig:
     ABSOLUTE_MAX_SLIPPAGE_BPS: float = field(default_factory=lambda: float(os.getenv("ABSOLUTE_MAX_SLIPPAGE_BPS", "150.0")))
     MAX_POSITION_SIZE_USD: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_USD", "250.0")))
     MIN_ORDER_USD: float = field(default_factory=lambda: float(os.getenv("MIN_ORDER_USD", "1.0")))
-    TAKER_ENABLED: bool = field(default_factory=lambda: os.getenv("TAKER_ENABLED", "True").lower() == "true")
+    # Maker-only by default: on recorded data the model's information is real but not
+    # executable — a signal traded one tick after it appears loses money (see README).
+    TAKER_ENABLED: bool = field(default_factory=lambda: os.getenv("TAKER_ENABLED", "False").lower() == "true")
     PANIC_CONCESSION: float = field(default_factory=lambda: float(os.getenv("PANIC_CONCESSION", "0.15")))
 
 @dataclass(frozen=True)

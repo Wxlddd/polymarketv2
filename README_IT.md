@@ -22,8 +22,33 @@ ordine reale**: l'esecuzione è un exchange simulato e ogni tick, segnale e fill
 | `main` attuale, file reale da 128k tick (6 cicli) | −3.6 %, max drawdown 9.7 %, inventario cappato a 500, il panic sweep appiattisce prima della scadenza. |
 
 La PR #3 ha sistemato i bug meccanici (crash all'avvio live, backtester rotto, amplificazione dell'orizzonte Hawkes, panic
-sweep mai riemesso, nessun cap di cassa, ciclo 5 minuti hardcoded). Se il modello abbia un edge è ancora aperto; gli
-strumenti sotto servono a rispondere con i dati invece che a indovinare.
+sweep mai riemesso, nessun cap di cassa, ciclo 5 minuti hardcoded).
+
+### Perché il bot è solo maker (19-09-2026)
+
+Replay di tutti i 69 cicli completi registrati attraverso il pricer, campionando modello e book ogni 5 s:
+
+| Test | Risultato |
+|---|---|
+| Brier score, modello vs mid di mercato | 0.182 vs 0.220 — il modello è meglio calibrato del mercato |
+| Pendenza di (esito − mid) su (modello − mid) | 0.94, IC 95% [0.73, 1.10] — la divergenza predice l'errore del mercato |
+| Taker buy-and-hold, 100 contratti, eseguito **sul tick del segnale** | +11.5 per entrata, IC [+7.8, +15.8] |
+| Idem, eseguito **un tick dopo** | **−6.8 per entrata**, IC [−12.0, −1.5] |
+| Idem, scartando livelli non aggiornati da 10 s | invariato (+11.5) — non è liquidità stale |
+
+Il modello reagisce al tick Chainlink una frazione di secondo prima del book, e il book recupera entro un tick.
+L'informazione è reale; non è eseguibile con un round trip d'ordine di 150–300 ms. È la stessa adverse selection che
+mostravano i fill taker live (il mid si muove di 0.07 contro il fill entro 5 s).
+
+Quindi il crossing direzionale è spento (`TAKER_ENABLED=False`) e gli unici ordini taker rimasti sono gli sweep PANIC che
+appiattiscono l'inventario prima del settlement. Un modello veloce che vede il movimento per primo resta utile come
+segnale **difensivo** — ritirare o riprezzare una quota prima che venga raccolta — ed è di questo che tratta il lavoro
+rimanente.
+
+La domanda aperta ora è il **modello di fill**: tutto il P&L maker di questo repo viene da un simulatore che assume che il
+40% di ogni riduzione di profondità al tuo livello sia stato eseguito, più un decadimento della coda del 2% per tick.
+Niente è mai stato calibrato su esecuzioni reali. `prints.parquet` (i trade print dell'exchange, registrati da questo
+branch) è ciò che rende possibile quella calibrazione: per questo adesso raccogliere dati conta più che tarare parametri.
 
 ## Avvio rapido
 
@@ -129,7 +154,7 @@ Tutti in `.env`, letti da `config/settings.py`.
 |---|---|---|
 | `CYCLE_DURATION_SEC` / `MARKET_SLUG_TYPE` | `300` / `5m` | Serie. `14400` / `4h` per il mercato a 4 ore. Cambiali insieme. |
 | `INITIAL_CAPITAL` | `10000` | Cassa paper. |
-| `TAKER_ENABLED` | `True` | `False` = solo maker. |
+| `TAKER_ENABLED` | `False` | Crossing direzionale. Spento di default (vedi Stato); il PANIC incrocia comunque per appiattire. |
 | `MM_TAKER_EDGE_EPSILON` | `0.015` | Edge oltre lo spread prima di attraversare. |
 | `KELLY_FRACTION` | `0.05` | Sizing taker. |
 | `MM_MAX_INVENTORY` | `500` | Cap duro su \|YES − NO\|. |

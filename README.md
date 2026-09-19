@@ -22,8 +22,32 @@ sends a real order**: execution is a simulated exchange, and every tick, signal 
 | Current `main`, real 128k-tick file (6 cycles) | −3.6 %, max drawdown 9.7 %, inventory capped at 500, panic sweep flattens before expiry. |
 
 PR #3 fixed the mechanical bugs (live start crash, broken backtester, Hawkes horizon amplification, panic sweep never
-re-issued, no cash cap, hard-coded 5-minute cycle). Whether the model has any edge is still open; the tooling below is
-for answering that with data rather than guessing.
+re-issued, no cash cap, hard-coded 5-minute cycle).
+
+### Why the bot is maker-only (2026-09-19)
+
+Replaying all 69 complete recorded cycles through the pricer, sampling model and book every 5 s:
+
+| Test | Result |
+|---|---|
+| Brier score, model vs. book mid | 0.182 vs. 0.220 — the model is better calibrated than the market |
+| Slope of (outcome − mid) on (model − mid) | 0.94, 95% CI [0.73, 1.10] — the divergence predicts the market's error |
+| Buy-and-hold taker, 100 contracts, executed **on the signal tick** | +11.5 per entry, CI [+7.8, +15.8] |
+| Same, executed **one tick later** | **−6.8 per entry**, CI [−12.0, −1.5] |
+| Same, ignoring levels not refreshed in 10 s | unchanged (+11.5) — not stale liquidity |
+
+The model reacts to the Chainlink tick a fraction of a second before the book does, and the book catches up within one
+tick. The information is real; it is not executable at a 150–300 ms order round trip. That is the same adverse selection
+the live taker fills showed (mid moving 0.07 against the fill within 5 s).
+
+So directional crossing is off (`TAKER_ENABLED=False`) and the only taker orders left are the PANIC sweeps that flatten
+inventory before settlement. A fast model that sees the move first is still worth having as a **defensive** signal —
+pulling or repricing a quote before it gets picked off — which is what the remaining work is about.
+
+The open question is now the **fill model**: every maker P&L in this repo comes from a simulator that assumes 40% of any
+depth reduction at your level was a trade, plus a 2%/tick queue decay. Nothing has been calibrated against real
+executions. `prints.parquet` (exchange trade prints, recorded since this branch) is what makes that calibration possible,
+which is why collecting data matters more right now than tuning parameters.
 
 ## Quickstart
 
@@ -129,7 +153,7 @@ All in `.env`, read by `config/settings.py`.
 |---|---|---|
 | `CYCLE_DURATION_SEC` / `MARKET_SLUG_TYPE` | `300` / `5m` | Series. `14400` / `4h` for the 4-hour market. Change both. |
 | `INITIAL_CAPITAL` | `10000` | Paper cash. |
-| `TAKER_ENABLED` | `True` | `False` = maker only. |
+| `TAKER_ENABLED` | `False` | Directional crossing. Off by default (see Status); PANIC still crosses to flatten. |
 | `MM_TAKER_EDGE_EPSILON` | `0.015` | Edge over the spread before crossing. |
 | `KELLY_FRACTION` | `0.05` | Taker sizing. |
 | `MM_MAX_INVENTORY` | `500` | Hard cap on \|YES − NO\|. |
