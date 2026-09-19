@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import time
@@ -18,8 +19,19 @@ from src.logging.recorder import DataRecorder
 from src.ui.dashboard import run_terminal_dashboard
 from src.ui.web_server import WebServer
 
-# Configure core console logging
-handlers = [logging.FileHandler("system_run.log", encoding="utf-8")]
+# Configure core console logging.
+# The run log goes under LOG_DIR and rotates: an unrotated handler in the repo root
+# grew past 8 MB and never stopped. 5 files x 10 MB caps it at 50 MB.
+_LOG_DIR = os.getenv("LOG_DIR", "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+handlers = [
+    RotatingFileHandler(
+        os.path.join(_LOG_DIR, "system_run.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=4,
+        encoding="utf-8",
+    )
+]
 if "--term" in sys.argv:
     log_level = logging.WARNING
 else:
