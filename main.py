@@ -691,8 +691,10 @@ class LiveOrchestrator:
                             "signal": {"side": result["side"], "size": result["qty"], "vwap": result["price"], "ev": 0.0}
                         })
         
-        # 2. Generate and process new quoting instructions
-        instructions = self.engine.evaluate_and_route(context)
+        # 2. Generate and process new quoting instructions. The router gets the raw
+        #    probability already computed above (one pricing per tick); the EMA is
+        #    for logging, the UI and the divergence filter.
+        instructions = self.engine.evaluate_and_route(context, p_hat=p_yes_raw)
         
         # Format diagnostic decision for the dashboard
         bid_p = self.engine.execution_router.active_bid_price

@@ -618,13 +618,19 @@ class ExecutionEngine:
         """Resets the execution router's active orders state (e.g. on market rollover)."""
         self.execution_router.reset_active_orders()
 
-    def evaluate_and_route(self, context: MarketContext) -> List[OrderInstruction]:
+    def evaluate_and_route(self, context: MarketContext, p_hat: Optional[float] = None) -> List[OrderInstruction]:
         """
-        Receives raw context ticks, requests strategy predictions, coordinates 
-        inventory skews, and returns the low-overhead list of quoting operations.
+        Coordinates inventory skews and returns the low-overhead list of quoting operations.
+
+        `p_hat` should be the orchestrator's EMA-smoothed probability for this tick. It is
+        only computed here (raw, unsmoothed) when the caller does not supply one. Calling
+        the strategy from both the orchestrator and the router on the same timestamp would
+        apply the tick's OFI shock to the Hawkes intensities twice (dt = 0, no decay), and
+        would route on a value the smoothing was specifically added to tame.
         """
-        # 1. Strategy pricing interface
-        p_hat = self.strategy.get_probability(context)
+        # 1. Model probability
+        if p_hat is None:
+            p_hat = self.strategy.get_probability(context)
         if p_hat is None:
             # If strategy fails to resolve price, immediately cancel active quotes to remain flat and safe
             instructions: List[OrderInstruction] = []
