@@ -37,9 +37,12 @@ def get_overlapping_files(data_dir: str, start_time: float, end_time: float):
             # Try to extract timestamp from filename (e.g. ticks_rec_1716892345.parquet or tick_data_1779562304.parquet)
             ts = None
             try:
-                # Try last part before extension
+                # Try last part before extension. Rotated segments (ticks_002.parquet) carry a
+                # sequence number, not a timestamp — fall through to the session directory.
                 parts = basename.split(".")[0].split("_")
                 ts = float(parts[-1])
+                if ts < 1e6:
+                    raise ValueError("sequence number, not a timestamp")
             except (ValueError, IndexError):
                 # Fallback: Try to extract from parent directory name (e.g. live_1779837496/)
                 parent_dir = os.path.basename(os.path.dirname(file_path))

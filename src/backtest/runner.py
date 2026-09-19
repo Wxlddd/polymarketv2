@@ -38,9 +38,15 @@ class BacktestRunner:
         if os.path.isdir(file_path):
             # Load all parquet files in directory (handles chunked/recovery files)
             import glob
-            files = glob.glob(os.path.join(file_path, "*.parquet"))
+            # Only tick segments (ticks.parquet, ticks_002.parquet, ...). A session directory
+            # also holds prints.parquet, whose schema would break the concat.
+            files = glob.glob(os.path.join(file_path, "ticks*.parquet"))
+            if not files:
+                files = [f for f in glob.glob(os.path.join(file_path, "*.parquet"))
+                         if os.path.basename(f) != "prints.parquet"]
             if not files:
                 raise FileNotFoundError(f"No parquet files found in directory: {file_path}")
+            files.sort()
             logger.info(f"[BacktestRunner] Found {len(files)} parquet files in directory. Merging...")
             dfs = []
             for f in files:

@@ -18,12 +18,19 @@ class DataRecorder(IDataRecorder):
         self, 
         base_log_dir: str = "logs", 
         strategy_name: str = "merton", 
-        run_id: Optional[str] = None, 
-        buffer_size: int = 1000
+        run_id: Optional[str] = None,
+        buffer_size: int = 1000,
+        tick_segment_sec: float = 600.0
     ):
         self.base_log_dir = base_log_dir
         self.strategy_name = strategy_name
         self.buffer_size = buffer_size
+        # A ParquetWriter only writes its footer on close(), so a file still being written
+        # is unreadable: a kill or a power cut loses the whole session. Rotating to a new
+        # segment every tick_segment_sec caps that loss at one segment. 0 disables rotation.
+        self.tick_segment_sec = tick_segment_sec
+        self._segment_index = 1
+        self._segment_opened_ts = 0.0
         
         # Resolve today's date (YYYY-MM-DD)
         self.current_date = datetime.now().strftime("%Y-%m-%d")
@@ -99,6 +106,8 @@ class DataRecorder(IDataRecorder):
             self.prints_path = os.path.join(self.log_dir, "prints.parquet")
             self.signals_path = os.path.join(self.log_dir, "signals.csv")
             self.trades_path = os.path.join(self.log_dir, "trades.csv")
+            # New day, new directory: segment numbering restarts at ticks.parquet
+            self._segment_index = 1
             
             # 3. Re-initialize CSV files in the new directory
             self._init_csv_files()
@@ -254,6 +263,14 @@ class DataRecorder(IDataRecorder):
         except Exception as e:
             print(f"[DataRecorder Error] Failed to write trade to CSV: {e}")
 
+    def _tick_segment_path(self) -> str:
+        """First segment keeps the plain ticks.parquet name; later ones get a suffix.
+        A short run is one file exactly as before; the backtester reads the whole directory."""
+        if self._segment_index <= 1:
+            return self.ticks_path
+        base, ext = os.path.splitext(self.ticks_path)
+        return f"{base}_{self._segment_index:03d}{ext}"
+
     def _flush_ticks_to_parquet(self) -> None:
         """Writes buffered ticks into a compressed Parquet database file using PyArrow ParquetWriter."""
         if not self.tick_buffer:
@@ -270,20 +287,30 @@ class DataRecorder(IDataRecorder):
                     data_dict[col].append(tick.get(col, None))
             
             table = pa.Table.from_pydict(data_dict, schema=self._arrow_schema)
-            
+
+            # Close the current segment once it is old enough, so it gets its footer and
+            # becomes readable. The next flush starts a new segment file.
+            if (self.writer is not None and self.tick_segment_sec > 0
+                    and time.time() - self._segment_opened_ts >= self.tick_segment_sec):
+                self.writer.close()
+                self.writer = None
+                self._segment_index += 1
+
             if self.writer is None:
+                path = self._tick_segment_path()
                 # If file exists at startup, load existing data to initialize writer cleanly
-                if os.path.exists(self.ticks_path) and os.path.getsize(self.ticks_path) > 0:
+                if os.path.exists(path) and os.path.getsize(path) > 0:
                     try:
-                        existing_table = pq.read_table(self.ticks_path)
-                        self.writer = pq.ParquetWriter(self.ticks_path, self._arrow_schema, compression="zstd")
+                        existing_table = pq.read_table(path)
+                        self.writer = pq.ParquetWriter(path, self._arrow_schema, compression="zstd")
                         self.writer.write_table(existing_table)
                     except Exception as e:
                         # Fail-safe fallback if the file is corrupted
-                        self.writer = pq.ParquetWriter(self.ticks_path, self._arrow_schema, compression="zstd")
+                        self.writer = pq.ParquetWriter(path, self._arrow_schema, compression="zstd")
                 else:
-                    self.writer = pq.ParquetWriter(self.ticks_path, self._arrow_schema, compression="zstd")
-            
+                    self.writer = pq.ParquetWriter(path, self._arrow_schema, compression="zstd")
+                self._segment_opened_ts = time.time()
+
             self.writer.write_table(table)
             self.tick_buffer.clear()
         except Exception as e:

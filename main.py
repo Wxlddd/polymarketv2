@@ -501,6 +501,23 @@ class LiveOrchestrator:
                 self.log_message("info", f"[Reset] New expiry cycle detected in CLOB callback: {current_expiry}. Resetting smoothed probability and strategy state.")
 
         if self.waiting_for_first_rollover:
+            # Keep recording while waiting for the first cycle boundary: with 4h cycles
+            # that wait is up to 4 hours of book and spot data that used to be dropped.
+            # Book and vol calibrator are updated too, so trading starts warm.
+            # No pricing here — get_probability must run exactly once per tick.
+            spot_wait = self.spot_feed.price
+            if spot_wait is not None:
+                if is_snapshot:
+                    if t_now - self._last_snapshot_ts < 1.0:
+                        is_snapshot = False
+                    else:
+                        self._last_snapshot_ts = t_now
+                ofi_wait = self.shadow_book.update_book(bids, asks, is_snapshot, timestamp=t_now)
+                self.strategy.vol_calibrator.add_tick(spot_wait, t_now)
+                vol_wait = self.strategy.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
+                top_b_wait, top_a_wait = self.shadow_book.get_market_top_of_book()
+                self.recorder.record_tick(t_now, spot_wait, ofi_wait, vol_wait, bids, asks,
+                                          top_bid=top_b_wait, top_ask=top_a_wait, is_snapshot=is_snapshot)
             if t_now - getattr(self, "_last_wait_log_time", 0.0) >= 15.0:
                 self._last_wait_log_time = t_now
                 self.log_message("info", "Ok, aspetto il prossimo ciclo...")
