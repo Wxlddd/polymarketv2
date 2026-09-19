@@ -11,10 +11,10 @@ async def main():
     print("=== Verification of Web Server & Bloomberg UI Endpoint ===")
     config = SystemConfig()
     
-    # Override settings for verification
-    config.polymarket.__dict__["WEB_SERVER_HOST"] = "127.0.0.1"
-    config.polymarket.__dict__["WEB_SERVER_PORT"] = 8888
-    config.polymarket.__dict__["WEB_SERVER_ENABLED"] = True
+    # Override settings for verification (WebServerConfig is frozen, so write through __dict__)
+    config.web_server.__dict__["HOST"] = "127.0.0.1"
+    config.web_server.__dict__["PORT"] = 8888
+    config.web_server.__dict__["ENABLED"] = True
     
     dummy_orch = DummyOrchestrator()
     server = WebServer(config, dummy_orch)

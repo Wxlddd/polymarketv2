@@ -22,11 +22,13 @@ class WebServer:
     def __init__(self, config: SystemConfig, orchestrator: Any):
         self.config = config
         self.orchestrator = orchestrator
-        self.host = config.polymarket.__dict__.get("WEB_SERVER_HOST", "localhost")
-        self.port = int(config.polymarket.__dict__.get("WEB_SERVER_PORT", 8080))
-        
+        # These live on WebServerConfig; reading them off PolymarketConfig always fell back
+        # to the defaults, so WEB_SERVER_HOST / WEB_SERVER_PORT in .env did nothing.
+        self.host = config.web_server.HOST
+        self.port = int(config.web_server.PORT)
+
         # UI Broadcast throttling rate (Hz)
-        self.throttle_hz = float(config.polymarket.__dict__.get("UI_BROADCAST_THROTTLE_HZ", 4.0))
+        self.throttle_hz = float(config.web_server.UI_BROADCAST_THROTTLE_HZ)
         self.broadcast_interval = 1.0 / self.throttle_hz
         
         self.app = web.Application()
