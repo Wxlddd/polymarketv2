@@ -1,3 +1,0 @@
-timestamp,spot_price,strike,model_prob,implied_prob,kelly_size,status
-1789683655.7796445,67440.5,67500.0,0.45,0.47,0.05,BUY_YES
-1789683655.780264,67441.5,67500.0,0.42,0.48,0.0,HOLD
