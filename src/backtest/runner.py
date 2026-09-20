@@ -84,6 +84,25 @@ class BacktestRunner:
         logger.info(f"[BacktestRunner] Successfully loaded {len(df)} historical ticks.")
         return df
 
+    def load_prints(self, file_path: str) -> Optional[pl.DataFrame]:
+        """Exchange trade prints for the same session, if recorded. Maker fills are granted
+        from these: a resting order can only be filled by volume that actually traded."""
+        if not os.path.isdir(file_path):
+            file_path = os.path.dirname(file_path)
+        import glob
+        files = sorted(glob.glob(os.path.join(file_path, "prints*.parquet")))
+        parts = []
+        for f in files:
+            try:
+                parts.append(pl.read_parquet(f).select("timestamp", "price", "size", "side"))
+            except Exception as e:
+                logger.warning(f"[BacktestRunner] Could not read {f}: {e}")
+        if not parts:
+            return None
+        out = pl.concat(parts, how="diagonal").sort("timestamp")
+        logger.info(f"[BacktestRunner] Loaded {len(out):,} trade prints for fill simulation.")
+        return out
+
     def _apply_oracle_nowcast(self, df: pl.DataFrame) -> pl.DataFrame:
         """Replace spot_price with the oracle carried forward by the external spot move
         since the oracle last printed — the same quantity the live orchestrator prices with.
@@ -208,6 +227,18 @@ class BacktestRunner:
             snapshot_flags = [bool(x) for x in df["is_snapshot"].fill_null(False).to_list()]
         else:
             snapshot_flags = [len(b) >= 5 and len(a) >= 5 for b, a in zip(bids_l2_parsed, asks_l2_parsed)]
+
+        prints = getattr(self, "_prints", None)
+        if prints is not None and len(prints):
+            print_ts = prints["timestamp"].to_numpy()
+            print_px = prints["price"].to_numpy()
+            print_sz = prints["size"].to_numpy()
+            print_side = prints["side"].to_numpy()
+        else:
+            print_ts = print_px = print_sz = print_side = None
+            logger.warning("[BacktestRunner] No trade prints for this session: maker fills "
+                           "cannot be simulated and the replay will only show taker activity.")
+        print_i = 0
 
         total_ticks = len(df)
         capital_history = []
@@ -341,6 +372,15 @@ class BacktestRunner:
             fills = await client.process_market_data(
                 shadow_book.get_sorted_bids(), shadow_book.get_sorted_asks(), context_state
             )
+
+            # Replay every print that happened since the previous tick: these, not the
+            # book touching our price, are what can fill a resting quote.
+            if print_ts is not None:
+                while print_i < len(print_ts) and print_ts[print_i] <= t:
+                    fills.extend(await client.process_print(
+                        float(print_px[print_i]), float(print_sz[print_i]),
+                        str(print_side[print_i]), context_state))
+                    print_i += 1
             fill_occurred = False
             for result in fills:
                 if result.get("success"):

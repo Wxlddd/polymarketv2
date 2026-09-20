@@ -297,7 +297,9 @@ class LiveOrchestrator:
         
         # Fallbacks
         if spot is None:
-            spot = self.spot_feed.price
+            # Same quantity the router prices with, so the dashboard cannot disagree
+            # with the engine about what spot is.
+            spot = self._pricing_spot(self.spot_feed.price)
         if strike is None:
             strike = self.strike_manager.get_strike(t_now, spot) if self.strike_manager and spot is not None else None
         if ofi is None:
@@ -425,7 +427,7 @@ class LiveOrchestrator:
             "oracle_live": self.spot_feed.is_connected,
             "spot_price": spot,
             # what the pricing spot is made of: oracle print + external move since it
-            "oracle_price": oracle_spot,
+            "oracle_price": self.spot_feed.price,
             "ext_price": self.binance_feed.price if self.binance_feed else None,
             "ext_live": bool(self.binance_feed and self.binance_feed.is_fresh),
             "strike": strike,
@@ -492,9 +494,44 @@ class LiveOrchestrator:
             })
 
     def _print_callback(self, price: float, size: float, side: str, exchange_ts: Optional[float]) -> None:
-        """Persists every YES trade print; the only ground truth for calibrating the maker fill model."""
-        if self.is_running:
-            self.recorder.record_print(time.time(), price, size, side, exchange_ts)
+        """Every YES trade print: recorded, and used to fill our resting quotes.
+
+        A maker can only be filled by volume that actually traded, so this is what grants
+        fills. The book feed only maintains queue position.
+        """
+        if not self.is_running:
+            return
+        t_now = time.time()
+        self.recorder.record_print(t_now, price, size, side, exchange_ts)
+        if self.strike_manager is None or self.waiting_for_first_rollover:
+            return
+        context_state = {"timestamp": t_now,
+                         "strike_price": self.strike_manager.presumed_strike,
+                         "volatility": self.strategy.vol_calibrator.calculate_volatility(
+                             self.config.merton.DEFAULT_SIGMA)}
+        asyncio.create_task(self._apply_print_fills(price, size, side, context_state))
+
+    async def _apply_print_fills(self, price: float, size: float, side: str,
+                                 context_state: Dict[str, Any]) -> None:
+        try:
+            fills = await self.client.process_print(price, size, side, context_state)
+        except Exception as e:
+            self.log_message("error", f"[PrintFill] {e}")
+            return
+        for result in fills:
+            if not result.get("success"):
+                continue
+            self.total_trades += 1
+            self.recorder.record_signal(
+                timestamp=context_state["timestamp"],
+                spot_price=self.spot_feed.price or 0.0,
+                strike=context_state["strike_price"] or 0.0,
+                model_prob=getattr(self, "_smoothed_p_yes", None) or 0.0,
+                implied_prob=result["price"],
+                kelly_size=result["qty"],
+                status="MAKER_FILL_BUY" if "BUY" in result["side"] else "MAKER_FILL_SELL")
+            self.log_message("info",
+                             f"[MAKER FILL] {result['side']} {result['qty']:.1f} @ {result['price']:.4f}")
 
     async def _clob_callback(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], is_snapshot: bool) -> None:
         """Callback triggered on each CLOB Order book tick arrival."""

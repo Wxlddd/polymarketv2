@@ -193,6 +193,7 @@ async def main():
                 
         try:
             raw_df = runner.load_ticks_file(file_path)
+            runner._prints = runner.load_prints(file_path)
         except Exception as e:
             print(f"[Error] Failed to load ticks file: {e}")
             return

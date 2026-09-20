@@ -631,84 +631,100 @@ class MockExecutionClient(IExecutionClient):
                     order["queue_ahead"] = max(0.0, order["queue_ahead"] - stoch_decay)
                     order["prev_depth"] = cur_depth
 
-        # 3. Process Fills
-        # Buy Fill
-        if self.active_maker_orders["bid"]:
-            order = self.active_maker_orders["bid"]
-            instr = order["instruction"]
-            if best_ask_p is not None:
-                is_crossed = best_ask_p < instr.price
-                is_touched_and_front = best_ask_p == instr.price and order["queue_ahead"] <= 0.0
-                if is_crossed or is_touched_and_front:
-                    # Execute fill
-                    fill_result = await self._execute_trade_internal(
-                        side=instr.side,
-                        qty=instr.qty,
-                        price=instr.price,
-                        ev=0.0,
-                        expected_slippage_bps=0.0,
-                        context_state=context_state,
-                        is_maker=True
-                    )
-                    fill_result["instruction"] = instr
-                    fills.append(fill_result)
-                    self.active_maker_orders["bid"] = None
+        # 3. Fills are NOT granted here.
+        # This used to fill the entire resting order the moment the book crossed our
+        # price, with no volume limit at all: measured against the exchange's own prints,
+        # 46% of those fills happened at a price where nothing traded, and fills of 100+
+        # contracts claimed a median of 240 against 5 actually printed. A maker can only
+        # be filled by volume that really traded, so fills now come from process_print().
 
-        # Sell Fill
-        if self.active_maker_orders["ask"]:
-            order = self.active_maker_orders["ask"]
-            instr = order["instruction"]
-            if best_bid_p is not None:
-                is_crossed = best_bid_p > instr.price
-                is_touched_and_front = best_bid_p == instr.price and order["queue_ahead"] <= 0.0
-                if is_crossed or is_touched_and_front:
-                    # We might need to split into SELL_YES and BUY_NO if yes_shares are insufficient.
-                    # This logic should be here.
-                    yes_shares = self.get_position_size("YES")
-                    exec_qty = instr.qty
-                    exec_price = instr.price
-                    
-                    if yes_shares >= exec_qty:
-                        fill_result = await self._execute_trade_internal(
-                            side="SELL_YES",
-                            qty=exec_qty,
-                            price=exec_price,
-                            ev=0.0,
-                            expected_slippage_bps=0.0,
-                            context_state=context_state,
-                            is_maker=True
-                        )
-                        fill_result["instruction"] = instr
-                        fills.append(fill_result)
-                    else:
-                        if yes_shares > 0.0:
-                            fill1 = await self._execute_trade_internal(
-                                side="SELL_YES",
-                                qty=yes_shares,
-                                price=exec_price,
-                                ev=0.0,
-                                expected_slippage_bps=0.0,
-                                context_state=context_state,
-                                is_maker=True
-                            )
-                            fill1["instruction"] = instr
-                            fills.append(fill1)
-                            
-                        rem_q = exec_qty - yes_shares
-                        no_price = 1.0 - exec_price
-                        fill2 = await self._execute_trade_internal(
-                            side="BUY_NO",
-                            qty=rem_q,
-                            price=no_price,
-                            ev=0.0,
-                            expected_slippage_bps=0.0,
-                            context_state=context_state,
-                            is_maker=True
-                        )
-                        fill2["instruction"] = instr
-                        fill2["is_split"] = True
-                        fills.append(fill2)
-                        
-                    self.active_maker_orders["ask"] = None
+        return fills
 
+    async def process_print(self, price: float, size: float, side: str,
+                            context_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Fill resting orders from a real exchange trade print.
+
+        A print at `price` for `size` can only reach us if it would have executed against
+        our quote, and only for whatever is left after the queue ahead of us is consumed.
+        This replaces the old "the book touched our price so we are fully filled" rule,
+        which invented volume that never traded.
+        """
+        fills: List[Dict[str, Any]] = []
+        if size <= 0.0 or price <= 0.0:
+            return fills
+
+        for side_key in ("bid", "ask"):
+            order = self.active_maker_orders.get(side_key)
+            if not order:
+                continue
+            instr = order["instruction"]
+            # A sell print at or below our bid hits us; a buy print at or above our ask does.
+            reaches = price <= instr.price if side_key == "bid" else price >= instr.price
+            if not reaches:
+                continue
+
+            remaining = float(size)
+            ahead = order.get("queue_ahead", 0.0)
+            if ahead > 0.0:
+                consumed = min(ahead, remaining)
+                order["queue_ahead"] = ahead - consumed
+                remaining -= consumed
+            if remaining <= 1e-9:
+                continue
+
+            qty = min(instr.qty, remaining)
+            if qty * instr.price < self.config.arbitrage.MIN_ORDER_USD:
+                continue
+
+            result = await self._fill_resting(side_key, order, qty, context_state)
+            if result:
+                fills.extend(result)
+        return fills
+
+    async def _fill_resting(self, side_key: str, order: Dict[str, Any], qty: float,
+                            context_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Executes `qty` of a resting order, leaving any remainder in the book."""
+        fills: List[Dict[str, Any]] = []
+        instr = order["instruction"]
+        if side_key == "bid":
+            fill_result = await self._execute_trade_internal(
+                side=instr.side, qty=qty, price=instr.price, ev=0.0,
+                expected_slippage_bps=0.0, context_state=context_state, is_maker=True)
+            fill_result["instruction"] = instr
+            fills.append(fill_result)
+        else:
+            fills.extend(await self._fill_resting_ask(order, qty, context_state))
+
+        # Partial fills leave the rest resting; a full fill removes the order.
+        if qty >= instr.qty - 1e-9:
+            self.active_maker_orders[side_key] = None
+        else:
+            instr.qty -= qty
+        return fills
+
+    async def _fill_resting_ask(self, order: Dict[str, Any], exec_qty: float,
+                                context_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Sells YES we hold; anything beyond the position becomes a NO purchase, which is
+        the same exposure and is how the venue's one-sided book works."""
+        fills: List[Dict[str, Any]] = []
+        instr = order["instruction"]
+        exec_price = instr.price
+        yes_shares = self.get_position_size("YES")
+
+        sell_qty = min(yes_shares, exec_qty)
+        if sell_qty > 0.0:
+            fill = await self._execute_trade_internal(
+                side="SELL_YES", qty=sell_qty, price=exec_price, ev=0.0,
+                expected_slippage_bps=0.0, context_state=context_state, is_maker=True)
+            fill["instruction"] = instr
+            fills.append(fill)
+
+        rem_q = exec_qty - sell_qty
+        if rem_q > 1e-9:
+            fill = await self._execute_trade_internal(
+                side="BUY_NO", qty=rem_q, price=1.0 - exec_price, ev=0.0,
+                expected_slippage_bps=0.0, context_state=context_state, is_maker=True)
+            fill["instruction"] = instr
+            fill["is_split"] = True
+            fills.append(fill)
         return fills
