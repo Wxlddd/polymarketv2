@@ -32,6 +32,8 @@ class DataRecorder(IDataRecorder):
         self.tick_segment_sec = tick_segment_sec
         self._segment_index = 1
         self._segment_opened_ts = 0.0
+        self._print_segment_index = 1
+        self._print_segment_opened_ts = 0.0
         # Also flush on buffer age, not just on a full buffer: a 4h market ticks slowly.
         self.flush_interval_sec = flush_interval_sec
         self._last_tick_flush_ts = time.time()
@@ -113,6 +115,7 @@ class DataRecorder(IDataRecorder):
             self.trades_path = os.path.join(self.log_dir, "trades.csv")
             # New day, new directory: segment numbering restarts at ticks.parquet
             self._segment_index = 1
+            self._print_segment_index = 1
             
             # 3. Re-initialize CSV files in the new directory
             self._init_csv_files()
@@ -277,13 +280,20 @@ class DataRecorder(IDataRecorder):
             return True
         return self.flush_interval_sec > 0 and time.time() - last_flush_ts >= self.flush_interval_sec
 
+    @staticmethod
+    def _segment_path(base_path: str, index: int) -> str:
+        """First segment keeps the plain name; later ones get a suffix. A short run is one
+        file exactly as before; readers glob the whole directory."""
+        if index <= 1:
+            return base_path
+        base, ext = os.path.splitext(base_path)
+        return f"{base}_{index:03d}{ext}"
+
     def _tick_segment_path(self) -> str:
-        """First segment keeps the plain ticks.parquet name; later ones get a suffix.
-        A short run is one file exactly as before; the backtester reads the whole directory."""
-        if self._segment_index <= 1:
-            return self.ticks_path
-        base, ext = os.path.splitext(self.ticks_path)
-        return f"{base}_{self._segment_index:03d}{ext}"
+        return self._segment_path(self.ticks_path, self._segment_index)
+
+    def _print_segment_path(self) -> str:
+        return self._segment_path(self.prints_path, self._print_segment_index)
 
     def _flush_ticks_to_parquet(self) -> None:
         """Writes buffered ticks into a compressed Parquet database file using PyArrow ParquetWriter."""
@@ -342,13 +352,22 @@ class DataRecorder(IDataRecorder):
             import pyarrow.parquet as pq
             data_dict = {col: [row.get(col) for row in self.print_buffer] for col in self._prints_schema.names}
             table = pa.Table.from_pydict(data_dict, schema=self._prints_schema)
+
+            if (self.prints_writer is not None and self.tick_segment_sec > 0
+                    and time.time() - self._print_segment_opened_ts >= self.tick_segment_sec):
+                self.prints_writer.close()
+                self.prints_writer = None
+                self._print_segment_index += 1
+
             if self.prints_writer is None:
-                self.prints_writer = pq.ParquetWriter(self.prints_path, self._prints_schema, compression="zstd")
-                if os.path.exists(self.prints_path) and os.path.getsize(self.prints_path) > 0:
+                path = self._print_segment_path()
+                self.prints_writer = pq.ParquetWriter(path, self._prints_schema, compression="zstd")
+                if os.path.exists(path) and os.path.getsize(path) > 0:
                     try:
-                        self.prints_writer.write_table(pq.read_table(self.prints_path))
+                        self.prints_writer.write_table(pq.read_table(path))
                     except Exception:
                         pass
+                self._print_segment_opened_ts = time.time()
             self.prints_writer.write_table(table)
             self.print_buffer.clear()
             self._last_print_flush_ts = time.time()

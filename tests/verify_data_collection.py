@@ -83,6 +83,15 @@ def check_tick_segments():
         assert len(readable) >= 2, f"segments unreadable after kill: {segments}"
         print(f"[OK] {len(segments)} segments, {len(readable)} readable after a kill: {segments}")
 
+        # Trade prints are the ground truth for the fill model: they must survive a kill too.
+        for i in range(6):
+            rec.record_print(1_000_000.0 + i, 0.47, 10.0, "BUY")
+        rec.prints_writer = None
+        print_files = sorted(f for f in os.listdir(session) if f.startswith("prints"))
+        assert len(print_files) >= 2, f"prints never rotated: {print_files}"
+        assert all(_readable(os.path.join(session, f)) for f in print_files[:-1]), print_files
+        print(f"[OK] {len(print_files)} print segments, closed ones readable: {print_files}")
+
         merged = BacktestRunner(SystemConfig()).load_ticks_file(session)
         assert len(merged) >= 4, f"merged only {len(merged)} ticks from {segments}"
         assert merged["timestamp"].is_sorted(), "merged segments not in time order"
