@@ -424,6 +424,10 @@ class LiveOrchestrator:
             "total_trades": self.total_trades,
             "oracle_live": self.spot_feed.is_connected,
             "spot_price": spot,
+            # what the pricing spot is made of: oracle print + external move since it
+            "oracle_price": oracle_spot,
+            "ext_price": self.binance_feed.price if self.binance_feed else None,
+            "ext_live": bool(self.binance_feed and self.binance_feed.is_fresh),
             "strike": strike,
             "p_fair": p_yes,
             "p_market": p_mkt,

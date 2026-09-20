@@ -67,8 +67,63 @@ class BacktestRunner:
                 df = pl.read_csv(file_path)
             
         df = df.sort("timestamp")
+
+        # An ext_spot.parquet next to the segments (written by scratch/backfill_binance.py)
+        # supplies the external spot for windows recorded before the feed existed, so the
+        # oracle nowcast can be replayed instead of only run forward.
+        if os.path.isdir(file_path):
+            ext_path = os.path.join(file_path, "ext_spot.parquet")
+            if os.path.exists(ext_path):
+                ext = pl.read_parquet(ext_path).sort("timestamp")
+                if "ext_price" in df.columns:
+                    df = df.drop("ext_price")
+                df = df.join_asof(ext, on="timestamp", strategy="backward")
+                logger.info(f"[BacktestRunner] Joined {len(ext):,} external spot rows from ext_spot.parquet.")
+
+        df = self._apply_oracle_nowcast(df)
         logger.info(f"[BacktestRunner] Successfully loaded {len(df)} historical ticks.")
         return df
+
+    def _apply_oracle_nowcast(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Replace spot_price with the oracle carried forward by the external spot move
+        since the oracle last printed — the same quantity the live orchestrator prices with.
+
+        No external column, or the feature switched off, leaves the frame untouched, so a
+        replay without Binance data behaves exactly as before.
+        """
+        if not self.config.binance.USE_FOR_PRICING or "ext_price" not in df.columns:
+            return df
+        if df["ext_price"].null_count() == len(df):
+            return df
+
+        oracle = (pl.col("oracle_price") if "oracle_price" in df.columns
+                  else pl.col("spot_price"))
+        df = df.with_columns(oracle.fill_null(strategy="forward").alias("_oracle"))
+        # timestamp of the last oracle print: where the oracle value changed
+        df = df.with_columns(
+            pl.when(pl.col("_oracle") != pl.col("_oracle").shift(1))
+              .then(pl.col("timestamp"))
+              .otherwise(None)
+              .fill_null(strategy="forward")
+              .alias("_print_ts")
+        )
+        ref = (df.select(pl.col("timestamp").alias("_print_ts"), pl.col("ext_price").alias("_ext_at_print"))
+                 .unique(subset="_print_ts", keep="first")
+                 .sort("_print_ts"))
+        df = df.sort("_print_ts").join_asof(ref, on="_print_ts", strategy="backward").sort("timestamp")
+
+        df = df.with_columns(
+            pl.when(pl.col("_ext_at_print").is_not_null()
+                    & (pl.col("_ext_at_print") > 0)
+                    & pl.col("ext_price").is_not_null())
+              .then(pl.col("_oracle") * pl.col("ext_price") / pl.col("_ext_at_print"))
+              .otherwise(pl.col("_oracle"))
+              .alias("spot_price")
+        )
+        moved = (df["spot_price"] - df["_oracle"]).abs()
+        logger.info(f"[BacktestRunner] Oracle nowcast applied: mean shift {moved.mean():.2f}, "
+                    f"max {moved.max():.2f} USD")
+        return df.drop(["_oracle", "_print_ts", "_ext_at_print"])
 
     async def run(self, df: pl.DataFrame, strategy_name: str = "merton", progress_callback=None) -> Dict[str, Any]:
         """

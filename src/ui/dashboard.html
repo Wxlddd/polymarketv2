@@ -451,7 +451,9 @@
               <thead>
                 <tr>
                   <th>Ticker</th>
-                  <th class="num">Spot Price</th>
+                  <th class="num">Spot (priced)</th>
+                  <th class="num">Oracle</th>
+                  <th class="num">Binance</th>
                   <th class="num">Strike Price (K)</th>
                   <th class="num">YES</th>
                   <th class="num">Market YES</th>
@@ -464,6 +466,8 @@
                 <tr>
                   <td id="tbl-ticker" class="white bold">—</td>
                   <td id="tbl-spot" class="num amber bold">—</td>
+                  <td id="tbl-oracle" class="num dim">—</td>
+                  <td id="tbl-ext" class="num white">—</td>
                   <td id="tbl-strike" class="num white">—</td>
                   <td id="tbl-pfair" class="num green bold">—</td>
                   <td id="tbl-pmarket" class="num num white">—</td>
@@ -749,6 +753,8 @@
     trades: document.getElementById('kpi-trades'),
     tblTicker: document.getElementById('tbl-ticker'),
     tblSpot: document.getElementById('tbl-spot'),
+    tblOracle: document.getElementById('tbl-oracle'),
+    tblExt: document.getElementById('tbl-ext'),
     tblStrike: document.getElementById('tbl-strike'),
     tblPFair: document.getElementById('tbl-pfair'),
     tblPMarket: document.getElementById('tbl-pmarket'),
@@ -860,6 +866,18 @@
     // 3. Market Details Table
     els.tblTicker.textContent = state.ticker || '—';
     els.tblSpot.textContent = state.spot_price ? '$' + fmt(state.spot_price, 2) : '—';
+    els.tblOracle.textContent = state.oracle_price ? '$' + fmt(state.oracle_price, 2) : '—';
+    // The lead the nowcast is carrying: how far the external spot has moved since the
+    // oracle printed. Zero means we are pricing exactly on the oracle.
+    if (state.ext_price) {
+      const lead = (state.spot_price ?? 0) - (state.oracle_price ?? 0);
+      els.tblExt.textContent = '$' + fmt(state.ext_price, 2) + (Math.abs(lead) >= 0.01 ? ` (${lead >= 0 ? '+' : ''}${lead.toFixed(2)})` : '');
+      els.tblExt.className = 'num ' + (state.ext_live ? (Math.abs(lead) >= 0.01 ? (lead > 0 ? 'green' : 'red') : 'white') : 'dim');
+      els.tblExt.title = state.ext_live ? 'external spot live; the bracket is the lead over the oracle' : 'external feed stale: pricing on the raw oracle';
+    } else {
+      els.tblExt.textContent = '—';
+      els.tblExt.className = 'num dim';
+    }
     els.tblStrike.textContent = state.strike ? '$' + fmt(state.strike, 2) : 'WAIT ROLLOVER';
     els.tblStrike.className = state.strike ? 'num white' : 'num amber';
 
