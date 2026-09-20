@@ -31,7 +31,7 @@ class PolymarketConfig:
     # The CLOB feed switches to the next cycle this many seconds before expiry, which also
     # means the expiring contract can no longer be traded from that moment on. Any
     # liquidation has to be finished before it.
-    ROLLOVER_PREEMPT_SEC: float = field(default_factory=lambda: float(os.getenv("ROLLOVER_PREEMPT_SEC", "15.0")))
+    ROLLOVER_PREEMPT_SEC: float = field(default_factory=lambda: float(os.getenv("ROLLOVER_PREEMPT_SEC", "5.0")))
 
 @dataclass(frozen=True)
 class MertonJumpDiffusionConfig:
@@ -104,7 +104,7 @@ class MarketMakerConfig:
     # Seconds of sweeping time the panic liquidation gets BEFORE the rollover preemption
     # cuts the feed to the expiring contract. Panic therefore starts at
     # ROLLOVER_PREEMPT_SEC + PANIC_LEAD_SEC before expiry.
-    PANIC_LEAD_SEC: float = field(default_factory=lambda: float(os.getenv("MM_PANIC_LEAD_SEC", "15.0")))
+    PANIC_LEAD_SEC: float = field(default_factory=lambda: float(os.getenv("MM_PANIC_LEAD_SEC", "10.0")))
     REDUCE_SEC: float = field(default_factory=lambda: float(os.getenv("MM_REDUCE_SEC", "45.0")))
 
 @dataclass(frozen=True)

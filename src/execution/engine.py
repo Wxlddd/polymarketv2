@@ -282,7 +282,10 @@ class ExecutionRouter:
         # sweep would otherwise leave the whole inventory riding into settlement.
         # The sweep must FINISH before the feed rolls to the next cycle, otherwise the
         # expiring contract can no longer be traded and the inventory rides into settlement.
-        is_panic = (tau_sec <= self.panic_sec) or (tau_sec <= self.reduce_sec and current_spread > 0.10)
+        # Flat inventory has nothing to liquidate, so the sweep window costs nothing and
+        # must not stop us quoting: locking while q == 0 threw away the last seconds of
+        # every cycle for no reason.
+        is_panic = ((tau_sec <= self.panic_sec) or (tau_sec <= self.reduce_sec and current_spread > 0.10)) and q != 0.0
         if is_panic:
             self._cancel_bid(instructions, "PANIC")
             self._cancel_ask(instructions, "PANIC")

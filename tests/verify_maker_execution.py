@@ -136,6 +136,27 @@ class TestMakerExecution(unittest.TestCase):
         self.assertGreaterEqual(router.reduce_sec, router.panic_sec,
                                 "reduce-only must start no later than panic")
 
+    def test_panic_does_not_lock_a_flat_book(self):
+        """With no inventory there is nothing to sweep, so the last seconds of the cycle
+        must still be quoted."""
+        ctx = MarketContext(
+            timestamp=1000.0, spot_price=67500.0, strike_price=67500.0,
+            tau_seconds=self.router.panic_sec - 1.0,
+            volatility=0.5, ofi=0.0, bids_l2=[(0.30, 5000.0)], asks_l2=[(0.70, 5000.0)]
+        )
+        instrs = self.router.evaluate_regimes(p_hat=0.55, sigma_sq=1e-5, context=ctx,
+                                              yes_shares=0.0, no_shares=0.0, cash_balance=100000.0)
+        self.assertFalse(self.router.locked, "locked the router with no inventory to liquidate")
+        self.assertFalse([i for i in instrs if i.regime == "PANIC"], instrs)
+
+        # ...but with inventory the sweep still fires.
+        self.router.reset_active_orders()
+        instrs = self.router.evaluate_regimes(p_hat=0.55, sigma_sq=1e-5, context=ctx,
+                                              yes_shares=300.0, no_shares=0.0, cash_balance=100000.0)
+        sweeps = [i for i in instrs if i.regime == "PANIC" and i.action == "NEW"]
+        self.assertTrue(sweeps, f"no sweep with 300 contracts at tau={ctx.tau_seconds}s: {instrs}")
+        self.assertEqual(sweeps[0].side, "SELL_YES")
+
     # ── liquidity-aware inventory cap ────────────────────────────────────────────
     @staticmethod
     def _book(total_depth):
