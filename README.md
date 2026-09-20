@@ -40,6 +40,22 @@ The model reacts to the Chainlink tick a fraction of a second before the book do
 tick. The information is real; it is not executable at a 150–300 ms order round trip. That is the same adverse selection
 the live taker fills showed (mid moving 0.07 against the fill within 5 s).
 
+**Correction (2026-09-20).** Cross-correlating Binance BTCUSDT 1s closes against the recorded oracle and book over two
+independent live windows (7,199 and 4,319 aligned seconds) reverses that picture. The order of events is:
+
+| Pair | Best lag | Correlation |
+|---|---|---|
+| Binance leads the Chainlink oracle | +4s | 0.39 / 0.31 |
+| Binance leads the Polymarket mid | +1 to +2s | 0.20 / 0.30 |
+| Polymarket mid leads the oracle | 2s | 0.21 / 0.21 |
+
+The book moves about two seconds **before** the oracle prints, not after. Regressing the next second of the mid on the
+current move gives R² 0.0001 for the oracle alone and 0.017–0.040 once the Binance move is added: priced off the oracle
+alone, the fair value carries essentially no information about where the book goes next, because the book has already
+been there. This is the mechanism behind the −0.021 markout at one second on 83% of maker fills: the bot quotes on the
+last link of the chain. Chainlink still decides settlement, so it remains the right target — but Binance is what
+predicts it, four seconds early.
+
 So directional crossing is off (`TAKER_ENABLED=False`) and the only taker orders left are the PANIC sweeps that flatten
 inventory before settlement. A fast model that sees the move first is still worth having as a **defensive** signal —
 pulling or repricing a quote before it gets picked off — which is what the remaining work is about.

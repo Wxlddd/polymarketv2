@@ -40,6 +40,22 @@ Il modello reagisce al tick Chainlink una frazione di secondo prima del book, e 
 L'informazione è reale; non è eseguibile con un round trip d'ordine di 150–300 ms. È la stessa adverse selection che
 mostravano i fill taker live (il mid si muove di 0.07 contro il fill entro 5 s).
 
+**Correzione (20-09-2026).** La cross-correlazione fra i close a 1 s di Binance BTCUSDT, l'oracolo registrato e il book,
+su due finestre live indipendenti (7.199 e 4.319 secondi allineati), ribalta il quadro. L'ordine degli eventi è:
+
+| Coppia | Lag migliore | Correlazione |
+|---|---|---|
+| Binance anticipa l'oracolo Chainlink | +4 s | 0,39 / 0,31 |
+| Binance anticipa il mid di Polymarket | +1 / +2 s | 0,20 / 0,30 |
+| Il mid di Polymarket anticipa l'oracolo | 2 s | 0,21 / 0,21 |
+
+Il book si muove circa due secondi **prima** che l'oracolo pubblichi, non dopo. Regredendo il secondo successivo del mid
+sul movimento corrente si ottiene R² 0,0001 con il solo oracolo e 0,017–0,040 aggiungendo il movimento di Binance:
+prezzato sul solo oracolo, il fair value non porta praticamente informazione su dove andrà il book, perché il book c'è
+già stato. È il meccanismo dietro il markout di −0,021 a un secondo sull'83% dei fill maker: il bot quota sull'ultimo
+anello della catena. Chainlink resta il riferimento giusto, perché decide il settlement, ma è Binance a predirlo, con
+quattro secondi di anticipo.
+
 Quindi il crossing direzionale è spento (`TAKER_ENABLED=False`) e gli unici ordini taker rimasti sono gli sweep PANIC che
 appiattiscono l'inventario prima del settlement. Un modello veloce che vede il movimento per primo resta utile come
 segnale **difensivo** — ritirare o riprezzare una quota prima che venga raccolta — ed è di questo che tratta il lavoro
