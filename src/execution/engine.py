@@ -92,7 +92,7 @@ class ExecutionRouter:
         '_order_counter', 'min_order_usd', 'locked', 'panic_concession', 'taker_enabled',
         # Liquidity-aware inventory cap
         'liquidity_fraction', 'cap_depth_ticks', 'exit_depth_ewma',
-        'panic_sec', 'reduce_sec'
+        'panic_sec', 'reduce_sec', 'min_quote_price'
     )
 
     def __init__(
@@ -116,7 +116,8 @@ class ExecutionRouter:
         liquidity_fraction: float = 0.33,
         cap_depth_ticks: int = 3,
         panic_sec: float = 30.0,
-        reduce_sec: float = 45.0
+        reduce_sec: float = 45.0,
+        min_quote_price: float = 0.10
     ):
         self.gamma = gamma
         self.min_fee_buffer = min_fee_buffer
@@ -139,6 +140,7 @@ class ExecutionRouter:
         self.cap_depth_ticks = cap_depth_ticks
         self.panic_sec = panic_sec
         self.reduce_sec = max(reduce_sec, panic_sec)
+        self.min_quote_price = min_quote_price
         self.exit_depth_ewma: Optional[float] = None
 
         # State memory
@@ -200,6 +202,22 @@ class ExecutionRouter:
         step = max(1.0, self.maker_size / 2.0)
         cap = round((self.liquidity_fraction * self.exit_depth_ewma) / step) * step
         return max(self.maker_size, min(self.max_inventory, cap))
+
+    def may_open_at(self, price: float, q: float) -> bool:
+        """Whether a NEW position may be opened at this price.
+
+        Below min_quote_price the 0.01 tick is tens of percent of the contract's value, so
+        the market cannot quote it finely and a fat-tailed model always finds value that is
+        not there. Recorded: 33 settled positions entered under 0.10, none ever paid, the
+        model priced those fills at 5.4x the market, and they are also the ones the panic
+        sweep cannot sell because nothing bids for them.
+
+        Reducing an existing position is never blocked; `q` is the inventory this trade
+        would move away from zero.
+        """
+        if self.min_quote_price <= 0.0 or q < 0.0:
+            return True
+        return price >= self.min_quote_price
 
     def risk_term(self, sigma_sq: float, tau_seconds: float) -> float:
         r"""
@@ -417,6 +435,13 @@ class ExecutionRouter:
             taker_buy_yes = self.taker_enabled and p_bid_target > best_ask + self.taker_edge_epsilon
             taker_buy_no = self.taker_enabled and p_ask_target < best_bid - self.taker_edge_epsilon
             
+            if taker_buy_yes and not self.may_open_at(best_ask, q):
+                taker_buy_yes = False
+
+            # Buying NO at (1 - best_bid) is the mirror image of buying YES cheap.
+            if taker_buy_no and yes_shares <= 0.0 and not self.may_open_at(1.0 - best_bid, -q):
+                taker_buy_no = False
+
             if taker_buy_yes:
                 # Massive edge buying YES shares
                 regime = "B"
@@ -540,8 +565,19 @@ class ExecutionRouter:
         cash_balance: float,
         divergence_scale: float = 1.0
     ) -> None:
-        # Enforce maximum total inventory capacity constraint (max_inventory)
         q = yes_shares - no_shares
+
+        # Do not buy lottery tickets. At a 0.01 tick, a contract worth 0.003 is quoted
+        # 0.01 and anything below ~0.10 cannot be priced finer than tens of percent, so a
+        # jump-diffusion's fat tail always "finds value" there. Recorded: 33 settled
+        # positions entered under 0.10, zero of them ever paid, and they are also the ones
+        # the panic sweep cannot sell because nothing bids for them. Reducing an existing
+        # position is never blocked; only opening more.
+        if not self.may_open_at(p_bid_target, q):
+            self._cancel_bid(instructions, regime)
+            return
+
+        # Enforce maximum total inventory capacity constraint (max_inventory)
         target_qty = max(0.0, self.effective_max_inventory() - q)
         
         # Scale target quantity by divergence scale for toxic flow protection
@@ -660,7 +696,8 @@ class ExecutionEngine:
             liquidity_fraction=config.maker.LIQUIDITY_FRACTION,
             cap_depth_ticks=config.maker.LIQUIDITY_DEPTH_TICKS,
             panic_sec=config.polymarket.ROLLOVER_PREEMPT_SEC + config.maker.PANIC_LEAD_SEC,
-            reduce_sec=config.maker.REDUCE_SEC
+            reduce_sec=config.maker.REDUCE_SEC,
+            min_quote_price=config.maker.MIN_QUOTE_PRICE
         )
         # Time-sampled EWMA mid-price variance calibrator (10s sampling, alpha=0.05)
         self.mid_price_calibrator = MidPriceVolCalibrator(sampling_interval=10.0, alpha=0.05)

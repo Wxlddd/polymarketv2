@@ -119,6 +119,10 @@ class MarketMakerConfig:
     # ROLLOVER_PREEMPT_SEC + PANIC_LEAD_SEC before expiry.
     PANIC_LEAD_SEC: float = field(default_factory=lambda: float(os.getenv("MM_PANIC_LEAD_SEC", "10.0")))
     REDUCE_SEC: float = field(default_factory=lambda: float(os.getenv("MM_REDUCE_SEC", "45.0")))
+    # Never open a long below this price. Below ~0.10 the 0.01 tick is tens of percent of
+    # the contract's value, so the market cannot quote it finely and a fat-tailed model
+    # always sees value that is not there. 0 disables the floor.
+    MIN_QUOTE_PRICE: float = field(default_factory=lambda: float(os.getenv("MM_MIN_QUOTE_PRICE", "0.10")))
 
 @dataclass(frozen=True)
 class WebServerConfig:

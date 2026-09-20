@@ -157,6 +157,26 @@ class TestMakerExecution(unittest.TestCase):
         self.assertTrue(sweeps, f"no sweep with 300 contracts at tau={ctx.tau_seconds}s: {instrs}")
         self.assertEqual(sweeps[0].side, "SELL_YES")
 
+    def test_no_new_longs_below_the_price_floor(self):
+        """Recorded: 33 settled positions entered under 0.10, none of them ever paid, and
+        the model priced those fills at 5.4x the market. Opening more must be refused;
+        reducing an existing short must not be."""
+        deep = MarketContext(
+            timestamp=1000.0, spot_price=67500.0, strike_price=67500.0, tau_seconds=150.0,
+            volatility=0.5, ofi=0.0, bids_l2=[(0.01, 5000.0)], asks_l2=[(0.05, 5000.0)]
+        )
+        instrs = self.router.evaluate_regimes(p_hat=0.09, sigma_sq=1e-5, context=deep,
+                                              yes_shares=0.0, no_shares=0.0, cash_balance=100000.0)
+        opens = [i for i in instrs if i.side == "BUY_YES" and i.action in ("NEW", "REPLACE")]
+        self.assertFalse(opens, f"opened a long below the floor: {opens}")
+
+        # Same book, but short: buying here reduces the position and stays allowed.
+        self.router.reset_active_orders()
+        instrs = self.router.evaluate_regimes(p_hat=0.09, sigma_sq=1e-5, context=deep,
+                                              yes_shares=0.0, no_shares=300.0, cash_balance=100000.0)
+        covers = [i for i in instrs if i.side == "BUY_YES" and i.action in ("NEW", "REPLACE")]
+        self.assertTrue(covers, "price floor blocked a position-reducing buy")
+
     # ── liquidity-aware inventory cap ────────────────────────────────────────────
     @staticmethod
     def _book(total_depth):
