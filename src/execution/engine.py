@@ -91,7 +91,8 @@ class ExecutionRouter:
         # Order counter for mock ID generation
         '_order_counter', 'min_order_usd', 'locked', 'panic_concession', 'taker_enabled',
         # Liquidity-aware inventory cap
-        'liquidity_fraction', 'cap_depth_ticks', 'exit_depth_ewma'
+        'liquidity_fraction', 'cap_depth_ticks', 'exit_depth_ewma',
+        'panic_sec', 'reduce_sec'
     )
 
     def __init__(
@@ -113,7 +114,9 @@ class ExecutionRouter:
         panic_concession: float = 0.15,
         taker_enabled: bool = True,
         liquidity_fraction: float = 0.33,
-        cap_depth_ticks: int = 3
+        cap_depth_ticks: int = 3,
+        panic_sec: float = 30.0,
+        reduce_sec: float = 45.0
     ):
         self.gamma = gamma
         self.min_fee_buffer = min_fee_buffer
@@ -134,6 +137,8 @@ class ExecutionRouter:
         self.taker_enabled = taker_enabled
         self.liquidity_fraction = liquidity_fraction
         self.cap_depth_ticks = cap_depth_ticks
+        self.panic_sec = panic_sec
+        self.reduce_sec = max(reduce_sec, panic_sec)
         self.exit_depth_ewma: Optional[float] = None
 
         # State memory
@@ -275,7 +280,9 @@ class ExecutionRouter:
         # Evaluated BEFORE the lock check and re-issued on every tick while q != 0:
         # an IOC sweep can be rejected or only partially filled, and a fire-once
         # sweep would otherwise leave the whole inventory riding into settlement.
-        is_panic = (tau_sec <= 15.0) or (tau_sec <= 45.0 and current_spread > 0.10)
+        # The sweep must FINISH before the feed rolls to the next cycle, otherwise the
+        # expiring contract can no longer be traded and the inventory rides into settlement.
+        is_panic = (tau_sec <= self.panic_sec) or (tau_sec <= self.reduce_sec and current_spread > 0.10)
         if is_panic:
             self._cancel_bid(instructions, "PANIC")
             self._cancel_ask(instructions, "PANIC")
@@ -301,7 +308,7 @@ class ExecutionRouter:
             return instructions
 
         # Phase 1: Soft Unwind (Reduce-Only Regime)
-        is_reduce_only = (tau_sec <= 45.0)
+        is_reduce_only = (tau_sec <= self.reduce_sec)
         if is_reduce_only:
             # 1. reservation price calculation
             # Skew target reservation price by inventory
@@ -648,7 +655,9 @@ class ExecutionEngine:
             panic_concession=config.arbitrage.PANIC_CONCESSION,
             taker_enabled=config.arbitrage.TAKER_ENABLED,
             liquidity_fraction=config.maker.LIQUIDITY_FRACTION,
-            cap_depth_ticks=config.maker.LIQUIDITY_DEPTH_TICKS
+            cap_depth_ticks=config.maker.LIQUIDITY_DEPTH_TICKS,
+            panic_sec=config.polymarket.ROLLOVER_PREEMPT_SEC + config.maker.PANIC_LEAD_SEC,
+            reduce_sec=config.maker.REDUCE_SEC
         )
         # Time-sampled EWMA mid-price variance calibrator (10s sampling, alpha=0.05)
         self.mid_price_calibrator = MidPriceVolCalibrator(sampling_interval=10.0, alpha=0.05)

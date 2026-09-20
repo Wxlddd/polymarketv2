@@ -28,6 +28,10 @@ class PolymarketConfig:
     # CYCLE_DURATION_SEC must be a divisor of 86400 (aligned to Unix epoch).
     CYCLE_DURATION_SEC: int = field(default_factory=lambda: int(os.getenv("CYCLE_DURATION_SEC", "300")))
     MARKET_SLUG_TYPE: str = field(default_factory=lambda: os.getenv("MARKET_SLUG_TYPE", "5m"))
+    # The CLOB feed switches to the next cycle this many seconds before expiry, which also
+    # means the expiring contract can no longer be traded from that moment on. Any
+    # liquidation has to be finished before it.
+    ROLLOVER_PREEMPT_SEC: float = field(default_factory=lambda: float(os.getenv("ROLLOVER_PREEMPT_SEC", "15.0")))
 
 @dataclass(frozen=True)
 class MertonJumpDiffusionConfig:
@@ -97,6 +101,11 @@ class MarketMakerConfig:
     # MAX_INVENTORY stays as the hard ceiling. 0 disables and keeps the fixed cap.
     LIQUIDITY_FRACTION: float = field(default_factory=lambda: float(os.getenv("MM_LIQUIDITY_FRACTION", "0.33")))
     LIQUIDITY_DEPTH_TICKS: int = field(default_factory=lambda: int(os.getenv("MM_LIQUIDITY_DEPTH_TICKS", "3")))
+    # Seconds of sweeping time the panic liquidation gets BEFORE the rollover preemption
+    # cuts the feed to the expiring contract. Panic therefore starts at
+    # ROLLOVER_PREEMPT_SEC + PANIC_LEAD_SEC before expiry.
+    PANIC_LEAD_SEC: float = field(default_factory=lambda: float(os.getenv("MM_PANIC_LEAD_SEC", "15.0")))
+    REDUCE_SEC: float = field(default_factory=lambda: float(os.getenv("MM_REDUCE_SEC", "45.0")))
 
 @dataclass(frozen=True)
 class WebServerConfig:

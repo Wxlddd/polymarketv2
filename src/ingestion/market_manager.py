@@ -22,6 +22,7 @@ class MarketManager:
         self.ticker = config.TICKER.lower()
         self.cycle_duration_sec = config.polymarket.CYCLE_DURATION_SEC
         self.slug_type = config.polymarket.MARKET_SLUG_TYPE
+        self.preempt_sec = config.polymarket.ROLLOVER_PREEMPT_SEC
 
         self.current_expiry: Optional[int] = None
         self.current_slug: Optional[str] = None
@@ -42,7 +43,7 @@ class MarketManager:
         Preempts the rollover by 15 seconds so the bot subscribes to the next cycle early.
         """
         cycle = self.cycle_duration_sec
-        t_int = int(current_time + 15.0)
+        t_int = int(current_time + self.preempt_sec)
         return t_int - (t_int % cycle) + cycle
 
     def get_slug_for_expiry(self, expiry: int) -> str:

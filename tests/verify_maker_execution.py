@@ -121,6 +121,21 @@ class TestMakerExecution(unittest.TestCase):
         from src.execution.engine import MAX_HALF_SPREAD
         self.assertLessEqual(self.router.calculate_spread(1.0, 300.0), MAX_HALF_SPREAD)
 
+    def test_panic_finishes_before_the_feed_rolls(self):
+        """The CLOB feed switches to the next cycle ROLLOVER_PREEMPT_SEC before expiry, and
+        the expiring contract cannot be traded after that. A panic sweep starting at or
+        after that moment has no book to sweep: recorded live, this left inventory riding
+        into settlement on 76 cycles, losing 59 of them."""
+        from config.settings import SystemConfig
+        cfg = SystemConfig()
+        preempt = cfg.polymarket.ROLLOVER_PREEMPT_SEC
+        router = ExecutionEngine(None, None, cfg).execution_router
+        self.assertGreater(
+            router.panic_sec, preempt,
+            f"panic starts at tau={router.panic_sec}s but the feed rolls at tau={preempt}s: zero sweep time")
+        self.assertGreaterEqual(router.reduce_sec, router.panic_sec,
+                                "reduce-only must start no later than panic")
+
     # ── liquidity-aware inventory cap ────────────────────────────────────────────
     @staticmethod
     def _book(total_depth):
