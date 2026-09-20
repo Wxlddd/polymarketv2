@@ -109,6 +109,10 @@ async def main():
     args = parse_args()
     print("=== Polymarket V2 Backtest Replay ===")
 
+    # A long replay (or a sweep of them) must not be cut short by the machine suspending.
+    from src.core.keep_awake import keep_awake
+    keep_awake()
+
     # Optional determinism for parameter sweeps (stochastic rejection + taker latency use RNG)
     seed = os.getenv("BACKTEST_SEED")
     if seed is not None:

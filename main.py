@@ -15,6 +15,7 @@ from src.execution.shadow_book import ShadowOrderBook
 from src.execution.clients import MockExecutionClient
 from src.execution.engine import ExecutionEngine
 from src.execution.divergence_filter import DivergenceVelocityFilter
+from src.core.keep_awake import keep_awake
 from src.logging.recorder import DataRecorder
 from src.ui.dashboard import run_terminal_dashboard
 from src.ui.web_server import WebServer
@@ -133,9 +134,8 @@ class LiveOrchestrator:
         self.is_running = True
         self.log_message("info", "Initializing Live Orchestrator...")
         
-        # 1. Start keep-awake loop to prevent Windows from sleeping
-        if os.name == 'nt':
-            self._tasks.append(asyncio.create_task(self._keep_awake_loop()))
+        # 1. Prevent Windows from sleeping (the display is left to time out normally)
+        keep_awake()
         
         # 1. Start Spot Feed Websocket (runs in background)
         await self.spot_feed.start()
@@ -224,30 +224,6 @@ class LiveOrchestrator:
         # Final buffer flushes
         self.recorder.flush()
         logger.info("Orchestrator stopped cleanly.")
-
-    async def _keep_awake_loop(self) -> None:
-        """
-        Periodically refreshes the Windows thread execution state every 30 seconds
-        to prevent the system from sleeping while the bot is running.
-        A single SetThreadExecutionState call is not sufficient — Windows resets
-        the state if it is not refreshed by the calling thread.
-        """
-        try:
-            import ctypes
-            ES_CONTINUOUS = 0x80000000
-            ES_SYSTEM_REQUIRED = 0x00000001
-            ES_DISPLAY_REQUIRED = 0x00000002
-            flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
-        except Exception:
-            return  # Not on Windows or ctypes unavailable
-
-        while self.is_running:
-            try:
-                ctypes.windll.kernel32.SetThreadExecutionState(flags)
-                logger.debug("[KeepAwake] Windows execution state refreshed.")
-            except Exception as e:
-                logger.warning(f"[KeepAwake] Failed to refresh execution state: {e}")
-            await asyncio.sleep(30.0)
 
     async def _restart_clob_feed(self) -> None:
         """Starts or restarts the CLOB WS feed, subscribing to the newly active token IDs."""
