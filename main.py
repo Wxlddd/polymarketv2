@@ -448,7 +448,9 @@ class LiveOrchestrator:
             "quote_bid_qty": router.active_bid_qty or None,
             "quote_ask": router.active_ask_price or None,
             "quote_ask_qty": router.active_ask_qty or None,
-            "max_inventory": self.config.maker.MAX_INVENTORY,
+            # Effective cap for this book, not the configured ceiling.
+            "max_inventory": router.effective_max_inventory(),
+            "exit_depth": router.exit_depth_ewma,
             "hft_metrics": hft_payload
         }
         self.web_server.update_state(state)

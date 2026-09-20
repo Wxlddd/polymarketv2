@@ -849,6 +849,7 @@
     const qNet = (state.pos_qty_yes ?? 0) - (state.pos_qty_no ?? 0);
     const qMax = state.max_inventory || 0;
     els.inventory.textContent = qNet.toFixed(0) + (qMax ? ' / ' + qMax.toFixed(0) : '');
+    els.inventory.title = state.exit_depth ? `cap follows the book: ${state.exit_depth.toFixed(0)} contracts resting within 3 ticks of the top` : '';
     const qFrac = qMax ? Math.abs(qNet) / qMax : 0;
     els.inventory.className = 'kpi-val ' + (qFrac >= 1 ? 'red' : qFrac > 0.5 ? 'amber' : qNet === 0 ? 'dim' : 'white');
 

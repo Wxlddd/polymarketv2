@@ -92,6 +92,11 @@ class MarketMakerConfig:
     FIXED_HORIZON_SEC: float = field(default_factory=lambda: float(os.getenv("MM_FIXED_HORIZON_SEC", "300.0")))
     TICK_SIZE: float = field(default_factory=lambda: float(os.getenv("MM_TICK_SIZE", "0.01")))
     REQUOTE_THRESHOLD: float = field(default_factory=lambda: float(os.getenv("MM_REQUOTE_THRESHOLD", "0.01")))
+    # Inventory cap follows the book: a fraction of the resting size within
+    # LIQUIDITY_DEPTH_TICKS of the top, on the side we would have to exit through.
+    # MAX_INVENTORY stays as the hard ceiling. 0 disables and keeps the fixed cap.
+    LIQUIDITY_FRACTION: float = field(default_factory=lambda: float(os.getenv("MM_LIQUIDITY_FRACTION", "0.33")))
+    LIQUIDITY_DEPTH_TICKS: int = field(default_factory=lambda: int(os.getenv("MM_LIQUIDITY_DEPTH_TICKS", "3")))
 
 @dataclass(frozen=True)
 class WebServerConfig:

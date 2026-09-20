@@ -121,6 +121,68 @@ class TestMakerExecution(unittest.TestCase):
         from src.execution.engine import MAX_HALF_SPREAD
         self.assertLessEqual(self.router.calculate_spread(1.0, 300.0), MAX_HALF_SPREAD)
 
+    # ── liquidity-aware inventory cap ────────────────────────────────────────────
+    @staticmethod
+    def _book(total_depth):
+        """Book with total_depth resting within 3 ticks of the top on each side,
+        plus a far level that must not be counted."""
+        per = total_depth / 3.0
+        bids = [(0.47, per), (0.46, per), (0.45, per), (0.30, 9999.0)]
+        asks = [(0.49, per), (0.50, per), (0.51, per), (0.70, 9999.0)]
+        return bids, asks
+
+    def _cap_for(self, depth):
+        self.router.exit_depth_ewma = None
+        self.router.update_exit_depth(*self._book(depth))
+        return self.router.effective_max_inventory()
+
+    def test_cap_tracks_book_depth(self):
+        """A thin book must cap inventory harder than a thick one."""
+        thin, mid, thick = self._cap_for(260), self._cap_for(1000), self._cap_for(2500)
+        self.assertLess(thin, mid)
+        self.assertLess(mid, thick)
+        self.assertAlmostEqual(mid, 350.0)          # 0.33 * 1000, quantised to half a clip
+
+    def test_cap_respects_floor_and_ceiling(self):
+        """Never below one clip (we could not quote), never above the configured ceiling."""
+        self.assertEqual(self._cap_for(1.0), self.router.maker_size)
+        self.assertEqual(self._cap_for(100_000.0), self.router.max_inventory)
+
+    def test_cap_ignores_liquidity_beyond_the_band(self):
+        """Only size within cap_depth_ticks of the top counts: the far level is 9999."""
+        self.assertEqual(self._cap_for(900), 300.0)
+
+    def test_cap_drops_fast_and_recovers_slowly(self):
+        """Thinning is believed at once; thickening is not."""
+        self.router.exit_depth_ewma = 1000.0
+        self.router.update_exit_depth(*self._book(200))
+        dropped = self.router.exit_depth_ewma
+
+        self.router.exit_depth_ewma = 1000.0
+        self.router.update_exit_depth(*self._book(3000))
+        raised = self.router.exit_depth_ewma
+
+        self.assertLess(1000.0 - dropped * 1.0, 1000.0)
+        self.assertGreater(1000.0 - dropped, raised - 1000.0,
+                           "cap must react to a thinning book faster than to a thickening one")
+
+    def test_cap_is_quantised(self):
+        """Tiny depth wobbles must not resize the quote: a REPLACE costs queue position."""
+        self.assertEqual(self._cap_for(1000), self._cap_for(1010))
+
+    def test_cap_resets_on_rollover(self):
+        """The next cycle is a different contract with a different book."""
+        self._cap_for(1000)
+        self.assertIsNotNone(self.router.exit_depth_ewma)
+        self.router.reset_active_orders()
+        self.assertIsNone(self.router.exit_depth_ewma)
+        self.assertEqual(self.router.effective_max_inventory(), self.router.max_inventory)
+
+    def test_cap_can_be_disabled(self):
+        """liquidity_fraction=0 keeps the old fixed behaviour."""
+        self.router.liquidity_fraction = 0.0
+        self.assertEqual(self._cap_for(100), self.router.max_inventory)
+
     def test_regime_a_maker_quoting(self):
         context = MarketContext(
             timestamp=1000.0,

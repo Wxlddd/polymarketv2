@@ -12,6 +12,8 @@ logger = logging.getLogger("MakerExecution")
 # either pull the quotes off the book or skew the fair value past the spread.
 MAX_HALF_SPREAD = 0.10   # never quote wider than +/- 10 points
 MAX_SKEW = 0.10          # never move the reservation price more than 10 points on inventory
+# Replacing an order loses queue position, so ignore size changes smaller than this.
+MIN_REQUOTE_QTY = 1.0
 
 
 class MidPriceVolCalibrator:
@@ -87,7 +89,9 @@ class ExecutionRouter:
         'active_bid_id', 'active_bid_price', 'active_bid_qty',
         'active_ask_id', 'active_ask_price', 'active_ask_qty',
         # Order counter for mock ID generation
-        '_order_counter', 'min_order_usd', 'locked', 'panic_concession', 'taker_enabled'
+        '_order_counter', 'min_order_usd', 'locked', 'panic_concession', 'taker_enabled',
+        # Liquidity-aware inventory cap
+        'liquidity_fraction', 'cap_depth_ticks', 'exit_depth_ewma'
     )
 
     def __init__(
@@ -107,7 +111,9 @@ class ExecutionRouter:
         taker_fee_multiplier: float = 0.072,
         min_order_usd: float = 1.0,
         panic_concession: float = 0.15,
-        taker_enabled: bool = True
+        taker_enabled: bool = True,
+        liquidity_fraction: float = 0.33,
+        cap_depth_ticks: int = 3
     ):
         self.gamma = gamma
         self.min_fee_buffer = min_fee_buffer
@@ -126,6 +132,9 @@ class ExecutionRouter:
         self.locked = False
         self.panic_concession = panic_concession
         self.taker_enabled = taker_enabled
+        self.liquidity_fraction = liquidity_fraction
+        self.cap_depth_ticks = cap_depth_ticks
+        self.exit_depth_ewma: Optional[float] = None
 
         # State memory
         self.active_bid_id: str = ""
@@ -147,6 +156,45 @@ class ExecutionRouter:
         self.active_ask_price = 0.0
         self.active_ask_qty = 0.0
         self.locked = False
+        # New cycle, new contract: its book is unrelated to the one just expired.
+        self.exit_depth_ewma = None
+
+    def update_exit_depth(self, bids_l2, asks_l2) -> None:
+        """Tracks the liquidity available to get OUT: resting size within cap_depth_ticks of
+        the top, on the thinner of the two sides, since the side we will need is not known
+        in advance.
+
+        Thinning is believed immediately and thickening slowly, because the cost of holding
+        more inventory than the book can absorb is paid in the one moment we are forced to
+        sell (the panic sweep into settlement), not on average.
+        """
+        if not bids_l2 or not asks_l2:
+            return
+        best_bid = bids_l2[0][0]
+        best_ask = asks_l2[0][0]
+        band = self.cap_depth_ticks * self.tick_size
+        bid_depth = sum(q for p, q in bids_l2 if p >= best_bid - band)
+        ask_depth = sum(q for p, q in asks_l2 if p <= best_ask + band)
+        depth = min(bid_depth, ask_depth)
+
+        if self.exit_depth_ewma is None:
+            self.exit_depth_ewma = depth
+        else:
+            alpha = 0.20 if depth < self.exit_depth_ewma else 0.02
+            self.exit_depth_ewma = alpha * depth + (1.0 - alpha) * self.exit_depth_ewma
+
+    def effective_max_inventory(self) -> float:
+        """Inventory cap for this tick: a fraction of the exit liquidity, never above the
+        configured hard ceiling and never below one clip (otherwise we could not quote).
+
+        Quantised to half a clip so the quoted size, and therefore our queue position, does
+        not churn on every tick: a REPLACE is issued on any size change.
+        """
+        if self.exit_depth_ewma is None or self.liquidity_fraction <= 0.0:
+            return self.max_inventory
+        step = max(1.0, self.maker_size / 2.0)
+        cap = round((self.liquidity_fraction * self.exit_depth_ewma) / step) * step
+        return max(self.maker_size, min(self.max_inventory, cap))
 
     def risk_term(self, sigma_sq: float, tau_seconds: float) -> float:
         r"""
@@ -204,6 +252,10 @@ class ExecutionRouter:
         if not context.bids_l2 or not context.asks_l2:
             return instructions
 
+        # Inventory capacity is whatever this book can absorb on the way out.
+        self.update_exit_depth(context.bids_l2, context.asks_l2)
+        q_max = self.effective_max_inventory()
+
         # Toxic Flow Guard: if divergence velocity is high, cancel quotes and do not trade
         if divergence_scale <= 0.01:
             self._cancel_bid(instructions, "SAFE")
@@ -255,8 +307,8 @@ class ExecutionRouter:
             # Skew target reservation price by inventory
             # Normalize q
             q_norm = 0.0
-            if self.max_inventory > 0.0:
-                q_norm = max(-1.0, min(1.0, q / self.max_inventory))
+            if q_max > 0.0:
+                q_norm = max(-1.0, min(1.0, q / q_max))
                 
             # P_res calculation using the pure HFT instant risk formula recommended by the user
             skew = max(-MAX_SKEW, min(MAX_SKEW, q_norm * self.risk_term(sigma_sq, tau_sec)))
@@ -299,7 +351,7 @@ class ExecutionRouter:
         
         # 1. Calculate net inventory and reservation price
         q = yes_shares - no_shares
-        q_norm = q / self.max_inventory if self.max_inventory > 0.0 else q
+        q_norm = q / q_max if q_max > 0.0 else q
         tau_sec = context.tau_seconds
         
         # P_res calculation using the pure HFT instant risk formula recommended by the user
@@ -332,7 +384,7 @@ class ExecutionRouter:
         # REGIME DETERMINATION
         abs_q = abs(q)
         realigned = abs(p_mid - p_hat) < self.unwind_threshold
-        should_unwind = (abs_q > self.max_inventory) or (realigned and abs_q > 0.0)
+        should_unwind = (abs_q > q_max) or (realigned and abs_q > 0.0)
         
         if should_unwind:
             # REGIME C: Unwind / Take Profit
@@ -370,7 +422,7 @@ class ExecutionRouter:
                     cost_per_share = best_ask * (1.0 + self.taker_fee_multiplier * (1.0 - best_ask))
                     max_qty_by_cash = max(0.0, (cash_balance - self.gas_fee_usd) / cost_per_share)
                     
-                    max_add_by_inventory = max(0.0, self.max_inventory - q)
+                    max_add_by_inventory = max(0.0, q_max - q)
                     if max_qty_by_cash < self.maker_size:
                         target_qty = 0.0
                     else:
@@ -399,7 +451,7 @@ class ExecutionRouter:
                     # Clip target quantity by available cash balance (if buying NO)
                     if yes_shares < target_qty:
                         rem_qty = target_qty - yes_shares
-                        max_rem_by_inventory = max(0.0, self.max_inventory)
+                        max_rem_by_inventory = max(0.0, q_max)
                         rem_qty = min(rem_qty, max_rem_by_inventory)
                         
                         no_price = 1.0 - best_bid
@@ -412,7 +464,7 @@ class ExecutionRouter:
                             target_qty = yes_shares + min(rem_qty, max_rem_by_cash)
                             
                     if yes_shares == 0.0:
-                        max_add_by_inventory = max(0.0, self.max_inventory + q)
+                        max_add_by_inventory = max(0.0, q_max + q)
                         target_qty = min(target_qty, max_add_by_inventory)
                         
                     if target_qty < self.maker_size and yes_shares == 0.0:
@@ -480,7 +532,7 @@ class ExecutionRouter:
     ) -> None:
         # Enforce maximum total inventory capacity constraint (max_inventory)
         q = yes_shares - no_shares
-        target_qty = max(0.0, self.max_inventory - q)
+        target_qty = max(0.0, self.effective_max_inventory() - q)
         
         # Scale target quantity by divergence scale for toxic flow protection
         scaled_target = target_qty * divergence_scale
@@ -510,7 +562,7 @@ class ExecutionRouter:
             self.active_bid_price = p_bid_target
             self.active_bid_qty = qty
         else:
-            if abs(self.active_bid_price - p_bid_target) >= self.requote_threshold or abs(self.active_bid_qty - qty) > 1e-5:
+            if abs(self.active_bid_price - p_bid_target) >= self.requote_threshold or abs(self.active_bid_qty - qty) > MIN_REQUOTE_QTY:
                 self._order_counter += 1
                 new_id = f"mock_bid_{self._order_counter}"
                 instructions.append(OrderInstruction("REPLACE", "BUY_YES", p_bid_target, qty, self.active_bid_id, regime))
@@ -551,7 +603,7 @@ class ExecutionRouter:
             self.active_ask_price = p_ask_target
             self.active_ask_qty = qty
         else:
-            if abs(self.active_ask_price - p_ask_target) >= self.requote_threshold or abs(self.active_ask_qty - qty) > 1e-5:
+            if abs(self.active_ask_price - p_ask_target) >= self.requote_threshold or abs(self.active_ask_qty - qty) > MIN_REQUOTE_QTY:
                 self._order_counter += 1
                 new_id = f"mock_ask_{self._order_counter}"
                 instructions.append(OrderInstruction("REPLACE", "SELL_YES", p_ask_target, qty, self.active_ask_id, regime))
@@ -594,7 +646,9 @@ class ExecutionEngine:
             taker_fee_multiplier=config.arbitrage.TAKER_FEE_MULTIPLIER,
             min_order_usd=config.arbitrage.MIN_ORDER_USD,
             panic_concession=config.arbitrage.PANIC_CONCESSION,
-            taker_enabled=config.arbitrage.TAKER_ENABLED
+            taker_enabled=config.arbitrage.TAKER_ENABLED,
+            liquidity_fraction=config.maker.LIQUIDITY_FRACTION,
+            cap_depth_ticks=config.maker.LIQUIDITY_DEPTH_TICKS
         )
         # Time-sampled EWMA mid-price variance calibrator (10s sampling, alpha=0.05)
         self.mid_price_calibrator = MidPriceVolCalibrator(sampling_interval=10.0, alpha=0.05)
