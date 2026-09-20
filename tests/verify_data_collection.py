@@ -32,9 +32,11 @@ class CountingRecorder:
         self.ticks = []
 
     def record_tick(self, timestamp, spot_price, ofi, volatility, bids_l2, asks_l2,
-                    top_bid=None, top_ask=None, is_snapshot=False):
+                    top_bid=None, top_ask=None, is_snapshot=False,
+                    oracle_price=None, ext_price=None):
         self.ticks.append({"spot": spot_price, "top_bid": top_bid, "top_ask": top_ask,
-                           "is_snapshot": is_snapshot, "vol": volatility})
+                           "is_snapshot": is_snapshot, "vol": volatility,
+                           "oracle": oracle_price, "ext": ext_price})
 
 
 def make_waiting_orchestrator(recorder):
@@ -52,7 +54,8 @@ def make_waiting_orchestrator(recorder):
         strike_manager=None,
         waiting_for_first_rollover=True,
         _last_snapshot_ts=0.0,
-        spot_feed=SimpleNamespace(price=81199.98),
+        spot_feed=SimpleNamespace(price=81199.98, last_updated=0.0),
+        binance_feed=None,
         shadow_book=ShadowOrderBook(),
         strategy=strategy,
         config=config,

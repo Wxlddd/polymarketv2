@@ -56,7 +56,9 @@ class BacktestRunner:
                     logger.warning(f"[BacktestRunner] Failed to read {f}: {e}")
             if not dfs:
                  raise ValueError(f"Failed to load any valid parquet files from {file_path}")
-            df = pl.concat(dfs)
+            # diagonal: older sessions lack the oracle_price/ext_price columns added
+            # when the external spot feed arrived; missing ones come back as null.
+            df = pl.concat(dfs, how="diagonal")
         else:
             ext = os.path.splitext(file_path)[1].lower()
             if ext == ".parquet":

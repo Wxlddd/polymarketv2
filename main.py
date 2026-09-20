@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from config.settings import SystemConfig
 from src.ingestion.market_manager import MarketManager
 from src.ingestion.live_feeds import ChainlinkSpotFeed, ClobOrderBookFeed
+from src.ingestion.binance_feed import BinanceSpotFeed
 from src.core.strike_manager import StrikeManager
 from src.core.market_context import MarketContext
 from src.strategies.factory import StrategyFactory
@@ -68,6 +69,8 @@ class LiveOrchestrator:
         # Initialize strategy & execution
         self.market_manager = MarketManager(config)
         self.spot_feed = ChainlinkSpotFeed(config)
+        # External spot, used only to nowcast the oracle: the oracle still settles.
+        self.binance_feed = BinanceSpotFeed(config) if config.binance.ENABLED else None
         self.shadow_book = ShadowOrderBook()
         self.strategy = StrategyFactory.get_strategy(config.STRATEGY_NAME, config)
         self.client = MockExecutionClient(config, self.recorder, self.shadow_book)
@@ -139,6 +142,8 @@ class LiveOrchestrator:
         
         # 1. Start Spot Feed Websocket (runs in background)
         await self.spot_feed.start()
+        if self.binance_feed:
+            await self.binance_feed.start()
         
         # Wait a brief moment to capture initial spot prices
         self.log_message("info", "Waiting for initial Spot ticks...")
@@ -214,6 +219,8 @@ class LiveOrchestrator:
             
         # Stop background feeds
         await self.spot_feed.stop()
+        if self.binance_feed:
+            await self.binance_feed.stop()
         if self.clob_feed:
             await self.clob_feed.stop()
             
@@ -224,6 +231,22 @@ class LiveOrchestrator:
         # Final buffer flushes
         self.recorder.flush()
         logger.info("Orchestrator stopped cleanly.")
+
+    def _pricing_spot(self, oracle_spot: Optional[float]) -> Optional[float]:
+        """Spot to price with: the oracle carried forward by the Binance move since the
+        oracle last printed.
+
+        The oracle lags Binance by ~4s and the Polymarket book by ~2s, so quoting on the
+        raw oracle means quoting on a level the book has already left. Settlement is still
+        decided by the oracle, which is why this is a nowcast OF the oracle and not a
+        different price: with no Binance move since the print it returns the oracle
+        unchanged, and it does the same whenever the feed is stale or disabled.
+        """
+        if oracle_spot is None or not self.binance_feed:
+            return oracle_spot
+        if not self.config.binance.USE_FOR_PRICING:
+            return oracle_spot
+        return self.binance_feed.nowcast(oracle_spot, self.spot_feed.last_updated)
 
     async def _restart_clob_feed(self) -> None:
         """Starts or restarts the CLOB WS feed, subscribing to the newly active token IDs."""
@@ -504,7 +527,9 @@ class LiveOrchestrator:
                 vol_wait = self.strategy.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
                 top_b_wait, top_a_wait = self.shadow_book.get_market_top_of_book()
                 self.recorder.record_tick(t_now, spot_wait, ofi_wait, vol_wait, bids, asks,
-                                          top_bid=top_b_wait, top_ask=top_a_wait, is_snapshot=is_snapshot)
+                                          top_bid=top_b_wait, top_ask=top_a_wait, is_snapshot=is_snapshot,
+                                          oracle_price=self.spot_feed.price,
+                                          ext_price=self.binance_feed.price if self.binance_feed else None)
             if t_now - getattr(self, "_last_wait_log_time", 0.0) >= 15.0:
                 self._last_wait_log_time = t_now
                 self.log_message("info", "Ok, aspetto il prossimo ciclo...")
@@ -528,7 +553,8 @@ class LiveOrchestrator:
                 self.log_message("warning", status_msg)
             return
             
-        spot = self.spot_feed.price
+        oracle_spot = self.spot_feed.price
+        spot = self._pricing_spot(oracle_spot)
         
         # Deduplicate rapid-fire CLOB snapshot bursts (reconnect storms).
         # Multiple book_snapshot events within 1s each reset q_shadow to full
@@ -662,7 +688,9 @@ class LiveOrchestrator:
         
         # Record tick: raw update (for replay) + reconciled top of book + snapshot flag
         self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks,
-                                  top_bid=top_b_mtm, top_ask=top_a_mtm, is_snapshot=is_snapshot)
+                                  top_bid=top_b_mtm, top_ask=top_a_mtm, is_snapshot=is_snapshot,
+                                  oracle_price=oracle_spot,
+                                  ext_price=self.binance_feed.price if self.binance_feed else None)
         
         p_mkt = self._get_market_implied_price(p_yes)
         

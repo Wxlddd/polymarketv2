@@ -63,6 +63,19 @@ class MertonJumpDiffusionConfig:
     USE_LOCAL_INFORMED_DRIFT: bool = field(default_factory=lambda: os.getenv("USE_LOCAL_INFORMED_DRIFT", "False").lower() == "true")
 
 @dataclass(frozen=True)
+class BinanceConfig:
+    """External spot feed used to nowcast the Chainlink oracle (see src/ingestion/binance_feed.py).
+    Public market data stream: no API key, no account."""
+    ENABLED: bool = field(default_factory=lambda: os.getenv("BINANCE_ENABLED", "True").lower() == "true")
+    # False keeps the feed recording but prices off the raw oracle, so the two can be compared.
+    USE_FOR_PRICING: bool = field(default_factory=lambda: os.getenv("BINANCE_USE_FOR_PRICING", "True").lower() == "true")
+    WS_URL: str = field(default_factory=lambda: os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:9443/ws"))
+    SYMBOL: str = field(default_factory=lambda: os.getenv("BINANCE_SYMBOL", "btcusdt"))
+    # Older than this and the nowcast falls back to the plain oracle price.
+    MAX_AGE_SEC: float = field(default_factory=lambda: float(os.getenv("BINANCE_MAX_AGE_SEC", "5.0")))
+
+
+@dataclass(frozen=True)
 class ArbitrageConfig:
     """Trading and capital sizing configurations."""
     INITIAL_CAPITAL: float = field(default_factory=lambda: float(os.getenv("INITIAL_CAPITAL", "10000.0")))
@@ -123,6 +136,7 @@ class SystemConfig:
     STRATEGY_NAME: str = field(default_factory=lambda: os.getenv("STRATEGY_NAME", "merton"))
     
     polymarket: PolymarketConfig = field(default_factory=PolymarketConfig)
+    binance: BinanceConfig = field(default_factory=BinanceConfig)
     merton: MertonJumpDiffusionConfig = field(default_factory=MertonJumpDiffusionConfig)
     arbitrage: ArbitrageConfig = field(default_factory=ArbitrageConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)

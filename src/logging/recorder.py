@@ -70,7 +70,10 @@ class DataRecorder(IDataRecorder):
             ('volatility', pa.float64()),
             ('bids_l2', pa.string()),
             ('asks_l2', pa.string()),
-            ('is_snapshot', pa.bool_())
+            ('is_snapshot', pa.bool_()),
+            # spot_price is what we priced with; these two say where it came from.
+            ('oracle_price', pa.float64()),   # raw Chainlink print
+            ('ext_price', pa.float64())       # external spot (Binance mid), null if absent
         ])
         self.writer = None
 
@@ -165,7 +168,9 @@ class DataRecorder(IDataRecorder):
         asks_l2: List[Tuple[float, float]],
         top_bid: Optional[Tuple[float, float]] = None,
         top_ask: Optional[Tuple[float, float]] = None,
-        is_snapshot: bool = False
+        is_snapshot: bool = False,
+        oracle_price: Optional[float] = None,
+        ext_price: Optional[float] = None
     ) -> None:
         """
         Logs a single market tick. bids_l2/asks_l2 are the raw feed update (needed to replay
@@ -186,7 +191,9 @@ class DataRecorder(IDataRecorder):
             "volatility": float(volatility),
             "bids_l2": json.dumps(bids_l2),
             "asks_l2": json.dumps(asks_l2),
-            "is_snapshot": bool(is_snapshot)
+            "is_snapshot": bool(is_snapshot),
+            "oracle_price": float(oracle_price) if oracle_price is not None else None,
+            "ext_price": float(ext_price) if ext_price is not None else None
         }
 
         self.tick_buffer.append(tick)

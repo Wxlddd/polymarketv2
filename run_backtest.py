@@ -174,7 +174,7 @@ async def main():
             print("[Error] Failed to load any tick log files.")
             return
             
-        raw_df = pl.concat(dfs).sort("timestamp")
+        raw_df = pl.concat(dfs, how="diagonal").sort("timestamp")
         raw_df = raw_df.filter((pl.col("timestamp") >= start_ts) & (pl.col("timestamp") <= end_ts))
         
         if raw_df.is_empty():
