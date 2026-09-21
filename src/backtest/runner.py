@@ -16,6 +16,7 @@ from src.execution.clients import MockExecutionClient
 from src.execution.engine import ExecutionEngine
 from src.execution.divergence_filter import DivergenceVelocityFilter
 from src.logging.recorder import DataRecorder
+from src.core.twap import strike_price as twap_strike, settlement_price as twap_settlement, contract_terms, oracle_twap
 
 logger = logging.getLogger("BacktestRunner")
 
@@ -115,8 +116,9 @@ class BacktestRunner:
         if df["ext_price"].null_count() == len(df):
             return df
 
-        oracle = (pl.col("oracle_price") if "oracle_price" in df.columns
-                  else pl.col("spot_price"))
+        if "oracle_price" not in df.columns:
+            df = df.with_columns(pl.col("spot_price").alias("oracle_price"))
+        oracle = pl.col("oracle_price")
         df = df.with_columns(oracle.fill_null(strategy="forward").alias("_oracle"))
         # timestamp of the last oracle print: where the oracle value changed
         df = df.with_columns(
@@ -228,6 +230,14 @@ class BacktestRunner:
         else:
             snapshot_flags = [len(b) >= 5 and len(a) >= 5 for b, a in zip(bids_l2_parsed, asks_l2_parsed)]
 
+        # The contract settles on oracle TWAPs, so keep the raw oracle series (distinct
+        # prints only) separate from the spot we price with.
+        oracle_col = "oracle_price" if "oracle_price" in df.columns else "spot_price"
+        _o = df.select("timestamp", oracle_col).drop_nulls()
+        _o = _o.filter(pl.col(oracle_col) != pl.col(oracle_col).shift(1))
+        oracle_times = _o["timestamp"].to_list()
+        oracle_ticks = list(zip(oracle_times, _o[oracle_col].to_list()))
+
         prints = getattr(self, "_prints", None)
         if prints is not None and len(prints):
             print_ts = prints["timestamp"].to_numpy()
@@ -269,17 +279,19 @@ class BacktestRunner:
             # 2. Rollover boundary checks
             if current_expiry is None or t >= current_expiry:
                 if current_expiry is not None and strike_manager is not None:
-                    # Settle active positions using the rollover spot price
+                    # Settle on the oracle TWAP of the final minute, as the venue does
                     settlement_strike = strike_manager.get_strike(t, spot)
-                    client.settle_positions(settlement_price=spot, strike_price=settlement_strike, timestamp=t)
+                    settle_px = twap_settlement(oracle_ticks, current_expiry, oracle_times) or spot
+                    client.settle_positions(settlement_price=settle_px, strike_price=settlement_strike, timestamp=t)
 
                 # Roll to next cycle expiration (CYCLE_DURATION_SEC-aligned, e.g. 300s for 5m or 14400s for 4h)
                 cycle = self.config.polymarket.CYCLE_DURATION_SEC
                 current_expiry = int(t) - (int(t) % cycle) + cycle
-                # First tick price serves as the new cycle's strike K (ATM)
-                strike_manager = StrikeManager(presumed_strike=spot, expiration_timestamp=current_expiry)
+                # Strike = oracle TWAP of the minute before the cycle starts (priceToBeat)
+                cycle_strike = twap_strike(oracle_ticks, current_expiry - cycle, oracle_times) or spot
+                strike_manager = StrikeManager(presumed_strike=cycle_strike, expiration_timestamp=current_expiry)
                 strike_manager.get_strike(t, spot)
-                logger.info(f"[BacktestRunner] Rollover to cycle expiration: {current_expiry} | Strike K: ${spot:,.2f}")
+                logger.info(f"[BacktestRunner] Rollover to cycle expiration: {current_expiry} | Strike K: ${cycle_strike:,.2f}")
                 
                 # New cycle → force a full snapshot for the shadow book and reset EMA
                 cycle_snapshot_sent = False
@@ -333,7 +345,12 @@ class BacktestRunner:
             )
             
             if should_eval:
-                p_yes_raw = strategy.get_probability(context)
+                realized = (oracle_twap(oracle_ticks, current_expiry - 60.0, t, oracle_times)
+                            if tau_sec < 60.0 else None)
+                k_eff, tau_eff = contract_terms(active_strike, spot, tau_sec, realized)
+                p_yes_raw = strategy.get_probability(MarketContext(
+                    timestamp=t, spot_price=spot, strike_price=k_eff, tau_seconds=tau_eff,
+                    volatility=vol, ofi=ofi, bids_l2=[], asks_l2=[]))
                 last_p_yes_raw = p_yes_raw
                 last_eval_spot = spot
                 last_eval_time = t
@@ -483,7 +500,8 @@ class BacktestRunner:
             last_spot = float(spot_prices[-1])
             last_time = float(timestamps[-1])
             settlement_strike = strike_manager.get_strike(last_time, last_spot)
-            client.settle_positions(settlement_price=last_spot, strike_price=settlement_strike, timestamp=last_time)
+            settle_px = twap_settlement(oracle_ticks, min(current_expiry, last_time), oracle_times) or last_spot
+            client.settle_positions(settlement_price=settle_px, strike_price=settlement_strike, timestamp=last_time)
             capital_history.append(client.cash_balance)
             recorder.flush()
  

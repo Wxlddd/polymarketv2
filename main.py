@@ -17,6 +17,7 @@ from src.execution.clients import MockExecutionClient
 from src.execution.engine import ExecutionEngine
 from src.execution.divergence_filter import DivergenceVelocityFilter
 from src.core.keep_awake import keep_awake
+from src.core.twap import strike_price as twap_strike, settlement_price as twap_settlement, contract_terms, oracle_twap
 from src.logging.recorder import DataRecorder
 from src.ui.dashboard import run_terminal_dashboard
 from src.ui.web_server import WebServer
@@ -231,6 +232,35 @@ class LiveOrchestrator:
         # Final buffer flushes
         self.recorder.flush()
         logger.info("Orchestrator stopped cleanly.")
+
+    async def _reconcile_settlement(self, slug: str, booked_up: bool, qty_yes: float,
+                                    qty_no: float, strike: float) -> None:
+        """Poll Polymarket until the cycle resolves, then correct our booking if it differs.
+
+        A YES contract pays 1 on Up and a NO contract pays 1 on Down, so flipping the outcome
+        moves cash by (qty_yes - qty_no) in the direction of the official result.
+        """
+        for _ in range(40):                       # ~20 minutes at 30s
+            await asyncio.sleep(30.0)
+            if not self.is_running:
+                return
+            official_up, ptb = await self.market_manager.fetch_resolution(slug)
+            if official_up is None:
+                continue
+            ptb_note = f" official strike {ptb:,.2f} vs ours {strike:,.2f}." if ptb else ""
+            if official_up == booked_up:
+                self.log_message("info", f"[Reconcile] {slug} booked {'UP' if booked_up else 'DOWN'}, "
+                                         f"venue agrees.{ptb_note}")
+                return
+            delta = (1.0 if official_up else -1.0) * (qty_yes - qty_no)
+            self.client.adjust_settlement(
+                delta, time.time(), strike, official_up,
+                reason=f"{slug}: booked {'UP' if booked_up else 'DOWN'}, venue paid "
+                       f"{'UP' if official_up else 'DOWN'}.{ptb_note}")
+            self.log_message("warning", f"[Reconcile] {slug} booked {'UP' if booked_up else 'DOWN'} but "
+                                        f"venue paid {'UP' if official_up else 'DOWN'}: {delta:+.2f} USD.{ptb_note}")
+            return
+        self.log_message("warning", f"[Reconcile] {slug} still unresolved after 20 min; booking left as is.")
 
     def _record_without_trading(self, t_now: float, bids, asks, is_snapshot: bool) -> None:
         """Records a book update in the states where we cannot trade it: before the first
@@ -670,13 +700,12 @@ class LiveOrchestrator:
             if self.market_manager.current_expiry is not None:
                 cycle_start_time = self.market_manager.current_expiry - self.market_manager.cycle_duration_sec
                 if t_now >= cycle_start_time:
-                    strike_tick = self.spot_feed.get_first_tick_after(cycle_start_time)
-                    if strike_tick is not None:
-                        _, strike_price_val = strike_tick
+                    strike_price_val = twap_strike(self.spot_feed.ticks, cycle_start_time)
+                    if strike_price_val is not None:
                         self.strike_manager.presumed_strike = strike_price_val
                         self.log_message(
                             "info",
-                            f"[StrikeManager] Active Strike resolved via 1st Chainlink tick after cycle start: ${strike_price_val:,.2f}"
+                            f"[StrikeManager] Strike = oracle TWAP of the 60s before cycle start: ${strike_price_val:,.2f}"
                         )
                     
         active_strike = self.strike_manager.get_strike(t_now, spot)
@@ -713,8 +742,24 @@ class LiveOrchestrator:
             asks_l2=self.shadow_book.get_sorted_asks()
         )
         
+        # Price the contract that actually settles: the oracle TWAP of the final minute,
+        # not the spot at expiry. Inside that minute part of the average is already fixed,
+        # so the pricer sees an adjusted strike and the (smaller) variance of the rest.
+        # The engine keeps the real tau: its REDUCE/PANIC windows are wall-clock rules.
+        realized = None
+        if active_strike is not None and tau_sec < 60.0 and self.market_manager.current_expiry:
+            realized = oracle_twap(self.spot_feed.ticks,
+                                   self.market_manager.current_expiry - 60.0, t_now)
+        if active_strike is not None:
+            k_eff, tau_eff = contract_terms(active_strike, spot, tau_sec, realized)
+            pricing_context = MarketContext(
+                timestamp=t_now, spot_price=spot, strike_price=k_eff, tau_seconds=tau_eff,
+                volatility=vol, ofi=ofi, bids_l2=context.bids_l2, asks_l2=context.asks_l2)
+        else:
+            pricing_context = context
+
         # Calculate Merton probability
-        p_yes_raw = self.strategy.get_probability(context)
+        p_yes_raw = self.strategy.get_probability(pricing_context)
         
         # Apply time-based EMA smoothing to p_yes.
         # A fixed alpha (e.g. 0.05) was designed for 1 tick/s but CLOB delivers
@@ -911,12 +956,15 @@ class LiveOrchestrator:
 
                             t_settle = time.time()
 
-                            # ── Settlement price: LAST oracle tick BEFORE expiry ──────────
-                            # get_last_tick_before() gives the final confirmed Chainlink
-                            # price of the expiring cycle, uncontaminated by the first tick
-                            # of the new cycle (which may already reflect the new round).
+                            # ── Settlement price: oracle TWAP of the minute before expiry ──
+                            # Polymarket resolves on Chainlink's 60s TWAP stream, and a cycle's
+                            # settlement is the next cycle's priceToBeat. The last point print
+                            # booked the wrong outcome on 14 of 83 settlements in one session.
+                            settle_twap = twap_settlement(self.spot_feed.ticks, expiry_time)
                             settle_tick = self.spot_feed.get_last_tick_before(expiry_time)
-                            if settle_tick is not None:
+                            if settle_twap is not None:
+                                settle_ts, settle_spot = expiry_time, settle_twap
+                            elif settle_tick is not None:
                                 settle_ts, settle_spot = settle_tick
                             else:
                                 # Fallback: first tick at/after expiry if nothing before is cached
@@ -944,6 +992,13 @@ class LiveOrchestrator:
                             )
 
                             resolved_yes = settle_spot >= settlement_strike
+
+                            # Fail-safe: whatever we reconstructed, the venue's own resolution
+                            # is the truth. Check it once it is published and correct the book.
+                            if has_position:
+                                asyncio.create_task(self._reconcile_settlement(
+                                    self.market_manager.get_slug_for_expiry(int(expiry_time)),
+                                    resolved_yes, qty_yes_open, qty_no_open, settlement_strike))
 
                             # ── Build rich log message ────────────────────────────────────────
                             verdict = "YES WON ✓" if resolved_yes else "YES LOST ✗"
@@ -1063,13 +1118,13 @@ class LiveOrchestrator:
                     if self.strike_manager.presumed_strike is None or self.strike_manager.presumed_strike == 0.0:
                         if self.market_manager.current_expiry is not None:
                             cycle_start_time = self.market_manager.current_expiry - self.market_manager.cycle_duration_sec
-                            strike_tick = self.spot_feed.get_first_tick_after(cycle_start_time)
-                            if strike_tick is not None:
-                                _, strike_price_val = strike_tick
+                            strike_price_val = (twap_strike(self.spot_feed.ticks, cycle_start_time)
+                                                if t_now >= cycle_start_time else None)
+                            if strike_price_val is not None:
                                 self.strike_manager.presumed_strike = strike_price_val
                                 self.log_message(
                                     "info",
-                                    f"[StrikeManager] Active Strike resolved via 2nd Chainlink tick after cycle start: ${strike_price_val:,.2f}"
+                                    f"[StrikeManager] Strike = oracle TWAP of the 60s before cycle start: ${strike_price_val:,.2f}"
                                 )
                                 
                     # Updates resolved strike if t_now >= expiration_timestamp

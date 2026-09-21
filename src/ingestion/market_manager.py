@@ -46,6 +46,40 @@ class MarketManager:
         t_int = int(current_time + self.preempt_sec)
         return t_int - (t_int % cycle) + cycle
 
+    async def fetch_resolution(self, slug: str):
+        """Official outcome of a cycle: True for Up, False for Down, None while unresolved.
+
+        Also returns the published strike (event.eventMetadata.priceToBeat), which is where
+        Polymarket actually keeps it; the market object never carries it.
+        """
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=10.0) as resp:
+                    if resp.status != 200:
+                        return None, None
+                    events = await resp.json()
+        except Exception as e:
+            logger.warning(f"[MarketManager] Resolution lookup failed for {slug}: {e}")
+            return None, None
+        if isinstance(events, dict):
+            events = [events]
+        if not events:
+            return None, None
+        event = events[0]
+        ptb = (event.get("eventMetadata") or {}).get("priceToBeat")
+        markets = event.get("markets") or []
+        if not markets or not markets[0].get("closed"):
+            return None, ptb
+        try:
+            prices = json.loads(markets[0].get("outcomePrices") or "[]")
+            outcomes = json.loads(markets[0].get("outcomes") or '["Up","Down"]')
+            up_idx = [o.lower() for o in outcomes].index("up")
+            return float(prices[up_idx]) > 0.5, ptb
+        except (ValueError, IndexError, TypeError):
+            return None, ptb
+
     def get_slug_for_expiry(self, expiry: int) -> str:
         """Generates the deterministic Polymarket event slug for the target expiration."""
         # Polymarket event slugs use the start time of the cycle (expiry - cycle_duration)

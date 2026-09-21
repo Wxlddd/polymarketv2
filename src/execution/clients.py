@@ -367,6 +367,40 @@ class MockExecutionClient(IExecutionClient):
         val += self.positions["NO"] * (1.0 - current_yes_price)
         return val
 
+    def adjust_settlement(self, delta_cash: float, timestamp: float, strike: float,
+                          official_up: bool, reason: str = "") -> None:
+        """Correct a booked settlement to what the venue actually paid.
+
+        Settlement is booked the moment the cycle expires, from our own reconstruction of
+        the resolution price. The venue resolves a little later. When the two disagree the
+        venue is right by definition, so the difference is applied to cash and written as
+        its own SETTLE_ADJUST row, leaving the original booking visible in the ledger.
+        """
+        if abs(delta_cash) < 1e-12:
+            return
+        self._cash_balance += delta_cash
+        self.recorder.record_trade(
+            timestamp=timestamp,
+            side="SETTLE_ADJUST",
+            qty=abs(delta_cash),
+            vwap=1.0 if official_up else 0.0,
+            p_market=1.0 if official_up else 0.0,
+            expected_slippage_bps=0.0,
+            realized_slippage_bps=0.0,
+            ev=0.0,
+            strike=strike,
+            resolved_won=official_up,
+            pnl=delta_cash,
+            capital=self._cash_balance
+        )
+        self.realized_trades.append({
+            "timestamp": timestamp, "side": "SETTLE_ADJUST", "qty": abs(delta_cash),
+            "entry_price": 0.0, "exit_price": 1.0 if official_up else 0.0,
+            "pnl": delta_cash, "won": delta_cash > 0, "reason": reason,
+        })
+        logger.warning(f"[MockClient] Settlement corrected to the official outcome "
+                       f"({'UP' if official_up else 'DOWN'}): {delta_cash:+.2f} USD. {reason}")
+
     def settle_positions(self, settlement_price: float, strike_price: float, timestamp: float) -> dict:
         """
         Settles all remaining holdings at expiration and resets contracts to zero.
