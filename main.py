@@ -232,6 +232,30 @@ class LiveOrchestrator:
         self.recorder.flush()
         logger.info("Orchestrator stopped cleanly.")
 
+    def _record_without_trading(self, t_now: float, bids, asks, is_snapshot: bool) -> None:
+        """Records a book update in the states where we cannot trade it: before the first
+        cycle boundary, and whenever the strike or the spot feed is missing.
+
+        Pricing is deliberately not run here — get_probability is once-per-tick by
+        contract — but the book, the shadow book and the vol calibrator all stay current.
+        """
+        spot = self.spot_feed.price
+        if spot is None:
+            return
+        if is_snapshot:
+            if t_now - self._last_snapshot_ts < 1.0:
+                is_snapshot = False
+            else:
+                self._last_snapshot_ts = t_now
+        ofi = self.shadow_book.update_book(bids, asks, is_snapshot, timestamp=t_now)
+        self.strategy.vol_calibrator.add_tick(spot, t_now)
+        vol = self.strategy.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
+        top_b, top_a = self.shadow_book.get_market_top_of_book()
+        self.recorder.record_tick(t_now, spot, ofi, vol, bids, asks,
+                                  top_bid=top_b, top_ask=top_a, is_snapshot=is_snapshot,
+                                  oracle_price=spot,
+                                  ext_price=self.binance_feed.price if self.binance_feed else None)
+
     def _pricing_spot(self, oracle_spot: Optional[float]) -> Optional[float]:
         """Spot to price with: the oracle carried forward by the Binance move since the
         oracle last printed.
@@ -556,21 +580,7 @@ class LiveOrchestrator:
             # that wait is up to 4 hours of book and spot data that used to be dropped.
             # Book and vol calibrator are updated too, so trading starts warm.
             # No pricing here — get_probability must run exactly once per tick.
-            spot_wait = self.spot_feed.price
-            if spot_wait is not None:
-                if is_snapshot:
-                    if t_now - self._last_snapshot_ts < 1.0:
-                        is_snapshot = False
-                    else:
-                        self._last_snapshot_ts = t_now
-                ofi_wait = self.shadow_book.update_book(bids, asks, is_snapshot, timestamp=t_now)
-                self.strategy.vol_calibrator.add_tick(spot_wait, t_now)
-                vol_wait = self.strategy.vol_calibrator.calculate_volatility(self.config.merton.DEFAULT_SIGMA)
-                top_b_wait, top_a_wait = self.shadow_book.get_market_top_of_book()
-                self.recorder.record_tick(t_now, spot_wait, ofi_wait, vol_wait, bids, asks,
-                                          top_bid=top_b_wait, top_ask=top_a_wait, is_snapshot=is_snapshot,
-                                          oracle_price=self.spot_feed.price,
-                                          ext_price=self.binance_feed.price if self.binance_feed else None)
+            self._record_without_trading(t_now, bids, asks, is_snapshot)
             if t_now - getattr(self, "_last_wait_log_time", 0.0) >= 15.0:
                 self._last_wait_log_time = t_now
                 self.log_message("info", "Ok, aspetto il prossimo ciclo...")
@@ -592,6 +602,10 @@ class LiveOrchestrator:
                     f"Strike Manager is {'None' if self.strike_manager is None else 'OK'}"
                 )
                 self.log_message("warning", status_msg)
+            # The book is still perfectly good data even when we cannot price it. A dead
+            # spot feed once left the strike unresolved for 99 minutes and every one of
+            # those book updates was thrown away.
+            self._record_without_trading(t_now, bids, asks, is_snapshot)
             return
             
         oracle_spot = self.spot_feed.price

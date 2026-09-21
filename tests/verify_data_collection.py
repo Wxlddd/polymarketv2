@@ -48,7 +48,7 @@ def make_waiting_orchestrator(recorder):
         get_probability=lambda ctx: priced.append(ctx),
         reset=lambda: None,
     )
-    return SimpleNamespace(
+    orch = SimpleNamespace(
         is_running=True,
         _tick_count_tps=0,
         strike_manager=None,
@@ -61,7 +61,10 @@ def make_waiting_orchestrator(recorder):
         config=config,
         recorder=recorder,
         log_message=lambda *a, **k: None,
-    ), priced
+    )
+    # the waiting branch delegates to this real method
+    orch._record_without_trading = lambda *a, **k: LiveOrchestrator._record_without_trading(orch, *a, **k)
+    return orch, priced
 
 
 def check_tick_segments():
@@ -165,6 +168,17 @@ def main():
     asyncio.run(LiveOrchestrator._clob_callback(orch2, BIDS, ASKS, True))
     assert not recorder2.ticks, "recorded a tick with no spot price"
     print("[OK] no spot price -> no tick, no crash")
+
+    # The other non-trading state: feeds up, but no strike yet. A dead spot feed once
+    # left the strike unresolved for 99 minutes and every book update was discarded.
+    recorder3 = CountingRecorder()
+    orch3, priced3 = make_waiting_orchestrator(recorder3)
+    orch3.waiting_for_first_rollover = False
+    orch3.strike_manager = None
+    asyncio.run(LiveOrchestrator._clob_callback(orch3, BIDS, ASKS, True))
+    assert recorder3.ticks, "book update discarded while the strike was unknown"
+    assert not priced3, "priced without a strike"
+    print("[OK] no strike yet -> book still recorded, still not priced")
 
     check_tick_segments()
     check_age_flush()
